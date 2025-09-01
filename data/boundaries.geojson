@@ -1,0 +1,380 @@
+{
+  "type": "FeatureCollection",
+  "name": "Springfield Urban Boundaries",
+  "description": "Spatial data for neighborhoods, routes, and points of interest",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "EPSG:4326"
+    }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 1,
+        "name": "Downtown District",
+        "type": "neighborhood",
+        "population": 15420,
+        "area_sq_km": 2.8,
+        "median_income": 52000,
+        "zoning": "mixed_use"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-89.66, 39.78],
+            [-89.64, 39.78],
+            [-89.64, 39.795],
+            [-89.66, 39.795],
+            [-89.66, 39.78]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 2,
+        "name": "Oak Hill",
+        "type": "neighborhood",
+        "population": 8750,
+        "area_sq_km": 4.2,
+        "median_income": 65000,
+        "zoning": "residential"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-89.68, 39.76],
+            [-89.65, 39.76],
+            [-89.65, 39.78],
+            [-89.68, 39.78],
+            [-89.68, 39.76]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 3,
+        "name": "University Heights",
+        "type": "neighborhood",
+        "population": 12300,
+        "area_sq_km": 3.1,
+        "median_income": 38000,
+        "zoning": "residential"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-89.62, 39.74],
+            [-89.59, 39.74],
+            [-89.59, 39.765],
+            [-89.62, 39.765],
+            [-89.62, 39.74]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 4,
+        "name": "Industrial Park",
+        "type": "neighborhood",
+        "population": 2100,
+        "area_sq_km": 6.5,
+        "median_income": 48000,
+        "zoning": "industrial"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-89.72, 39.8],
+            [-89.68, 39.8],
+            [-89.68, 39.83],
+            [-89.72, 39.83],
+            [-89.72, 39.8]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 101,
+        "name": "Main Street Corridor",
+        "type": "transit_route",
+        "route_id": "101",
+        "length_km": 12.5,
+        "frequency_minutes": 15,
+        "daily_ridership": 2800
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-89.65, 39.77],
+          [-89.648, 39.775],
+          [-89.645, 39.78],
+          [-89.642, 39.785],
+          [-89.64, 39.79],
+          [-89.638, 39.795],
+          [-89.635, 39.8]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 102,
+        "name": "Cross-Town Express",
+        "type": "transit_route",
+        "route_id": "102",
+        "length_km": 8.7,
+        "frequency_minutes": 20,
+        "daily_ridership": 1950
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-89.68, 39.765],
+          [-89.67, 39.768],
+          [-89.66, 39.772],
+          [-89.65, 39.775],
+          [-89.64, 39.778],
+          [-89.63, 39.78],
+          [-89.62, 39.782]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 103,
+        "name": "University Loop",
+        "type": "transit_route",
+        "route_id": "103",
+        "length_km": 6.2,
+        "frequency_minutes": 12,
+        "daily_ridership": 3200
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-89.61, 39.75],
+          [-89.605, 39.755],
+          [-89.6, 39.76],
+          [-89.605, 39.765],
+          [-89.61, 39.76],
+          [-89.615, 39.755],
+          [-89.61, 39.75]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 201,
+        "name": "Central Station",
+        "type": "transit_hub",
+        "capacity": 500,
+        "amenities": ["covered_waiting", "restrooms", "food_court", "parking"],
+        "accessibility": "full_ada_compliant"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.65, 39.78]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 202,
+        "name": "University Campus",
+        "type": "education",
+        "students": 18500,
+        "staff": 1200,
+        "campus_area_hectares": 85,
+        "parking_spaces": 3200
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.605, 39.758]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 203,
+        "name": "Springfield General Hospital",
+        "type": "healthcare",
+        "beds": 320,
+        "emergency_services": true,
+        "specialties": ["cardiology", "oncology", "pediatrics", "surgery"],
+        "trauma_level": 2
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.642, 39.775]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 204,
+        "name": "Central Park",
+        "type": "recreation",
+        "area_hectares": 12,
+        "facilities": [
+          "playground",
+          "sports_fields",
+          "walking_trails",
+          "pavilion"
+        ],
+        "annual_visitors": 125000
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.66, 39.785]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 205,
+        "name": "Springfield Mall",
+        "type": "commercial",
+        "stores": 85,
+        "anchor_tenants": ["Department Store", "Grocery", "Electronics"],
+        "parking_spaces": 2800,
+        "daily_visitors": 8500
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.63, 39.765]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 206,
+        "name": "City Hall",
+        "type": "government",
+        "departments": [
+          "planning",
+          "permits",
+          "tax_collection",
+          "mayor_office"
+        ],
+        "public_hours": "08:00-17:00",
+        "parking_validation": true
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.648, 39.782]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 207,
+        "name": "Springfield Public Library",
+        "type": "education",
+        "books": 125000,
+        "digital_resources": true,
+        "meeting_rooms": 8,
+        "weekly_programs": 15
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.652, 39.778]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 301,
+        "name": "Riverside Park Trail",
+        "type": "recreation_path",
+        "length_km": 4.8,
+        "surface_type": "paved",
+        "lighting": "partial",
+        "bike_friendly": true
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-89.68, 39.75],
+          [-89.675, 39.752],
+          [-89.67, 39.755],
+          [-89.665, 39.758],
+          [-89.66, 39.762],
+          [-89.655, 39.765],
+          [-89.65, 39.768]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 401,
+        "name": "Downtown Parking District",
+        "type": "parking_zone",
+        "spaces": 1250,
+        "hourly_rate": 2.5,
+        "max_duration_hours": 4,
+        "enforcement_hours": "08:00-18:00"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-89.655, 39.778],
+            [-89.645, 39.778],
+            [-89.645, 39.788],
+            [-89.655, 39.788],
+            [-89.655, 39.778]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 501,
+        "name": "Fire Station 1",
+        "type": "emergency_services",
+        "staff_count": 24,
+        "apparatus": ["engine", "ladder_truck", "rescue_vehicle"],
+        "response_area_sq_km": 15.2,
+        "avg_response_time_minutes": 4.2
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.665, 39.79]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": 502,
+        "name": "Police Station Central",
+        "type": "emergency_services",
+        "officers": 45,
+        "patrol_cars": 12,
+        "specialties": ["traffic", "community_policing", "investigations"],
+        "jurisdiction": "downtown_district"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [-89.647, 39.784]
+      }
+    }
+  ]
+}

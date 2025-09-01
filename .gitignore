@@ -1,0 +1,100 @@
+# PostgreSQL Polaris - Git Ignore Rules
+# Location: /.gitignore
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.staging
+docker/.env
+
+# Database files
+*.sql~
+*.backup
+*.dump
+pg_data/
+postgres_data/
+backups/
+*.log
+
+# Docker volumes
+docker/data/
+docker/logs/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# Test output
+test-results/
+test-reports/
+
+# Generated documentation
+docs/generated/
+
+# Local development
+local/
+scratch/
+playground/
+
+# Performance test results
+benchmark-results/
+performance-reports/
+
+# Database exports (keep examples, ignore personal exports)
+exports/*.sql
+exports/*.csv
+!exports/example_*
+
+# IDE specific
+.vscode/settings.json
+.vscode/launch.json
+.vscode/extensions.json
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# Windows
+ehthumbs.db
+Thumbs.db

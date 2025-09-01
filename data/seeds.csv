@@ -1,0 +1,54 @@
+# Location: /data/seeds.csv
+# Core relational seed data for citizens, orders, trips
+
+# CITIZENS DATA
+citizen_id,name,email,phone,birth_date,registration_date,address_line,city,state,zip_code,latitude,longitude
+1,Alice Johnson,alice.johnson@email.com,555-0101,1985-03-15,2020-01-15,"123 Oak Street",Springfield,IL,62701,39.7817,-89.6501
+2,Bob Martinez,bob.martinez@email.com,555-0102,1978-07-22,2019-05-20,"456 Elm Avenue",Springfield,IL,62702,39.7889,-89.6445
+3,Carol Chen,carol.chen@email.com,555-0103,1990-11-08,2021-03-10,"789 Pine Road",Springfield,IL,62703,39.7756,-89.6298
+4,David Kumar,david.kumar@email.com,555-0104,1982-12-03,2020-08-25,"321 Maple Drive",Springfield,IL,62704,39.7923,-89.6712
+5,Emma Wilson,emma.wilson@email.com,555-0105,1995-05-17,2022-01-12,"654 Cedar Lane",Springfield,IL,62705,39.7645,-89.6156
+6,Frank Thompson,frank.thompson@email.com,555-0106,1987-09-14,2020-11-30,"987 Birch Court",Springfield,IL,62706,39.8034,-89.6823
+7,Grace Lee,grace.lee@email.com,555-0107,1983-01-25,2019-12-05,"147 Walnut Street",Springfield,IL,62707,39.7567,-89.6089
+8,Henry Garcia,henry.garcia@email.com,555-0108,1991-04-12,2021-07-18,"258 Cherry Avenue",Springfield,IL,62708,39.8145,-89.6934
+9,Iris Patel,iris.patel@email.com,555-0109,1988-10-30,2020-04-22,"369 Spruce Drive",Springfield,IL,62709,39.7489,-89.5978
+10,Jack Anderson,jack.anderson@email.com,555-0110,1979-06-07,2019-09-15,"741 Hickory Lane",Springfield,IL,62710,39.8256,-89.7045
+
+# MERCHANTS DATA
+merchant_id,business_name,owner_name,category,address,phone,registration_date,tax_id,status
+1,Springfield Coffee Co,Alice Johnson,Restaurant,"123 Main Street",555-1001,2019-03-01,12-3456789,active
+2,Tech Repair Hub,Bob Martinez,Electronics,"456 Tech Plaza",555-1002,2020-01-15,12-3456790,active
+3,Green Garden Market,Carol Chen,Grocery,"789 Market Square",555-1003,2018-07-10,12-3456791,active
+4,Metro Fitness,David Kumar,Health,"321 Gym Avenue",555-1004,2021-05-20,12-3456792,active
+5,Bookworm Cafe,Emma Wilson,Books,"654 Literary Lane",555-1005,2019-11-12,12-3456793,active
+6,Auto Fix Central,Frank Thompson,Automotive,"987 Mechanic Road",555-1006,2020-08-30,12-3456794,active
+7,Fashion Forward,Grace Lee,Clothing,"147 Style Street",555-1007,2018-12-05,12-3456795,active
+8,Pizza Palace,Henry Garcia,Restaurant,"258 Italian Way",555-1008,2021-02-14,12-3456796,active
+9,Mobile Mart,Iris Patel,Electronics,"369 Phone Plaza",555-1009,2020-06-18,12-3456797,active
+10,Home & Garden,Jack Anderson,Hardware,"741 Builder Boulevard",555-1010,2019-09-25,12-3456798,active
+
+# ORDERS DATA
+order_id,customer_id,merchant_id,order_date,total_amount,status,payment_method,delivery_address
+1,1,1,2024-01-15,25.50,completed,credit_card,"123 Oak Street"
+2,2,3,2024-01-16,67.89,completed,debit_card,"456 Elm Avenue"
+3,3,2,2024-01-17,145.00,completed,cash,"789 Pine Road"
+4,4,4,2024-01-18,89.99,completed,credit_card,"321 Maple Drive"
+5,5,5,2024-01-19,34.25,completed,digital_wallet,"654 Cedar Lane"
+6,1,6,2024-01-20,299.99,completed,credit_card,"123 Oak Street"
+7,6,7,2024-01-21,156.78,completed,debit_card,"987 Birch Court"
+8,7,8,2024-01-22,28.45,completed,cash,"147 Walnut Street"
+9,8,9,2024-01-23,89.99,pending,credit_card,"258 Cherry Avenue"
+10,9,10,2024-01-24,78.50,completed,digital_wallet,"369 Spruce Drive"
+
+# TRANSIT TRIPS DATA
+trip_id,route_id,vehicle_id,start_station,end_station,departure_time,arrival_time,passenger_count,fare_amount,trip_date
+1,101,BUS001,Central Station,North Plaza,08:00:00,08:25:00,23,2.50,2024-01-15
+2,102,BUS002,Downtown Hub,East Side,08:15:00,08:40:00,31,2.50,2024-01-15
+3,103,BUS003,South Terminal,University,08:30:00,08:55:00,45,2.50,2024-01-15
+4,101,BUS001,North Plaza,Central Station,08:45:00,09:10:00,28,2.50,2024-01-15
+5,104,BUS004,Airport,Downtown Hub,09:00:00,09:35:00,18,3.00,2024-01-15
+6,102,BUS002,East Side,Downtown Hub,09:15:00,09:40:00,33,2.50,2024-01-15
+7,105,BUS005,Mall District,Central Station,09:30:00,09:55:00,41,2.50,2024-01-15
+8,103,BUS003,University,South Terminal,09:45:00,10:10:00,39,2.50,2024-01-15
+9,106,BUS006,Industrial Zone,North Plaza,10:00:00,10:30:00,15,2.75,2024-01-15
+10,101,BUS001,Central Station,North Plaza,10:15:00,10:40:00,27,2.50,2024-01-15
