@@ -30,5 +30,5 @@ require_container
 target="$(container_path "$1")"
 log "running $1 on database '$db'"
 start=$(date +%s)
-docker exec -i "$POLARIS_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$POLARIS_USER" -d "$db" "${extra[@]}" -f "$target"
+docker exec -i "$POLARIS_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$POLARIS_USER" -d "$db" ${extra[@]+"${extra[@]}"} -f "$target"
 ok "$1 finished in $(( $(date +%s) - start ))s"

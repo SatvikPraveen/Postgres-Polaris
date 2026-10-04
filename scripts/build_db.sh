@@ -33,5 +33,5 @@ fi
 log "building '$db' (scale=$scale seed=$seed)"
 start=$(date +%s)
 docker exec -i -w /sql "$POLARIS_CONTAINER" psql -X -v ON_ERROR_STOP=1 -U "$POLARIS_USER" -d "$db" \
-    -v scale="$scale" -v seed="$seed" "${modules[@]}" -f /sql/build.sql
+    -v scale="$scale" -v seed="$seed" ${modules[@]+"${modules[@]}"} -f /sql/build.sql
 ok "built '$db' in $(( $(date +%s) - start ))s"

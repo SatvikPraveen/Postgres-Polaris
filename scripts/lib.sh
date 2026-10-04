@@ -58,10 +58,10 @@ container_path() {
 
 recreate_db() {
     local db="$1" template="${2:-template0}"
-    psql_in postgres -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" \
+    psql_in postgres -c "SET client_min_messages = warning" -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" \
                      -c "CREATE DATABASE \"$db\" TEMPLATE \"$template\"" >/dev/null
 }
 
 drop_db() {
-    psql_in postgres -c "DROP DATABASE IF EXISTS \"$1\" WITH (FORCE)" >/dev/null
+    psql_in postgres -c "SET client_min_messages = warning" -c "DROP DATABASE IF EXISTS \"$1\" WITH (FORCE)" >/dev/null
 }
