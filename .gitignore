@@ -98,3 +98,5 @@ exports/*.csv
 # Windows
 ehthumbs.db
 Thumbs.db
+.check_logs/
+benchmarks/results/

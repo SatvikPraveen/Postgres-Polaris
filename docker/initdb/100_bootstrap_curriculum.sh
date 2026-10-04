@@ -17,5 +17,5 @@ fi
 cd /sql
 psql -v ON_ERROR_STOP=1 --no-psqlrc \
      -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-     -v scale="${POLARIS_SCALE:-1}" -v seed="${POLARIS_SEED:-0.42}" \
+     -v scale="${POLARIS_SCALE:-1}" -v seed="${POLARIS_SEED:-42}" \
      -f build.sql

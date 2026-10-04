@@ -22,6 +22,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-polaris}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-polaris_dev_only}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8 --data-checksums"
+      POLARIS_SCALE: ${POLARIS_SCALE:-1}
+      POLARIS_SEED: ${POLARIS_SEED:-42}
+      POLARIS_SKIP_BOOTSTRAP: ${POLARIS_SKIP_BOOTSTRAP:-0}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     shm_size: 512mb

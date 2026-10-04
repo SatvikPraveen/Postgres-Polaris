@@ -205,7 +205,7 @@ CREATE INDEX idx_pois_zip ON geo.points_of_interest(zip_code);
 -- Function to find POIs within distance of a point.
 -- Distances are geodesic (geography type, WGS-84 spheroid). Projecting to
 -- Web Mercator (EPSG:3857) would overstate distances by ~1/cos(latitude),
--- about 15% at Polaris City's latitude, so it is deliberately avoided.
+-- about 19% at Polaris City's latitude, so it is deliberately avoided.
 CREATE OR REPLACE FUNCTION geo.find_nearby_pois(
     lat DECIMAL(10,8),
     lng DECIMAL(11,8),

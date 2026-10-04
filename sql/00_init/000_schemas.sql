@@ -6,6 +6,7 @@
 -- script works under any superuser name.
 
 \set ON_ERROR_STOP on
+SET client_min_messages = warning;
 
 DROP SCHEMA IF EXISTS civics, commerce, mobility, geo, documents,
                       analytics, audit, auth CASCADE;

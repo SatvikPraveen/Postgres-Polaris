@@ -1,162 +1,104 @@
-# PostgreSQL Polaris - Main Orchestration Makefile
-# Location: /Makefile
+# PostgreSQL Polaris
+# Run `make` or `make help` for the list of targets.
 
-.PHONY: help bootstrap up down restart psql reset test bench clean logs status
+SHELL        := bash
+.SHELLFLAGS  := -eu -o pipefail -c
+.DEFAULT_GOAL := help
 
-# Default target
-help: ## Show this help message
-	@echo "PostgreSQL Polaris - Learning Environment"
-	@echo ""
-	@echo "Available commands:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
+COMPOSE   := docker compose -f docker/docker-compose.yml
+CONTAINER := polaris-db
+PG_USER   := polaris
+PG_DB     := polaris
 
-bootstrap: ## Initialize the project (first-time setup)
-	@echo "🚀 Bootstrapping PostgreSQL Polaris..."
-	@if [ ! -f docker/.env ]; then cp docker/.env.example docker/.env; fi
-	@if [ ! -f .env ]; then cp .env.example .env; fi
-	@docker-compose -f docker/docker-compose.yml pull
-	@echo "✅ Bootstrap complete! Run 'make up' to start the environment."
+SCALE ?= 1
+SEED  ?= 42
 
-up: ## Start the database and admin UI
-	@echo "🌟 Starting PostgreSQL Polaris environment..."
-	@docker-compose -f docker/docker-compose.yml up -d
-	@echo "⏳ Waiting for database to be ready..."
-	@sleep 10
-	@echo "✅ Environment ready!"
-	@echo "   Database: localhost:5432"
-	@echo "   Adminer:  http://localhost:8080"
-	@echo "   Connect:  make psql"
+.PHONY: help bootstrap up ui down restart status logs psql shell \
+        build build-all module reset check reproduce test test-modules \
+        bench bench-report backup lint clean nuke
 
-down: ## Stop all containers
-	@echo "🛑 Stopping PostgreSQL Polaris..."
-	@docker-compose -f docker/docker-compose.yml down
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make \033[36m<target>\033[0m [SCALE=n SEED=n]\n"} \
+	     /^##@/ {printf "\n\033[1m%s\033[0m\n", substr($$0, 5)} \
+	     /^[a-zA-Z_-]+:.*?##/ {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-restart: down up ## Restart all containers
+##@ Environment
+bootstrap: ## Create .env files and build the database image
+	@test -f docker/.env || cp docker/.env.example docker/.env
+	@test -f .env || cp .env.example .env
+	@$(COMPOSE) build
+	@echo "Bootstrap complete. Next: make up"
 
-psql: ## Connect to PostgreSQL with psql client
-	@echo "🔗 Connecting to PostgreSQL..."
-	@docker exec -it polaris-db psql -U polaris -d polaris
+up: ## Start PostgreSQL (first start builds the dataset, ~30 s)
+	@$(COMPOSE) up -d --wait db
+	@echo "PostgreSQL ready on localhost:$${POSTGRES_PORT:-5432} (db=$(PG_DB) user=$(PG_USER)). Try: make psql"
 
-psql-root: ## Connect as postgres superuser
-	@docker exec -it polaris-db psql -U postgres -d polaris
+ui: ## Start Adminer (:8080) and pgAdmin (:8081) as well
+	@$(COMPOSE) --profile ui up -d --wait
 
-logs: ## Show container logs
-	@docker-compose -f docker/docker-compose.yml logs -f
+down: ## Stop all containers (data volume is kept)
+	@$(COMPOSE) --profile ui down
 
-status: ## Show container status
-	@docker-compose -f docker/docker-compose.yml ps
+restart: down up ## Restart the stack
 
-# Data Management
-reset: ## Reset database to clean state (WARNING: destroys all data)
-	@echo "⚠️  This will destroy all data. Continue? [y/N]" && read ans && [ $${ans:-N} = y ]
-	@echo "🗑️  Resetting database..."
-	@docker-compose -f docker/docker-compose.yml down -v
-	@docker-compose -f docker/docker-compose.yml up -d
-	@sleep 10
-	@echo "✅ Database reset complete!"
+status: ## Show container health
+	@$(COMPOSE) --profile ui ps
 
-load-data: ## Load sample data into database
-	@echo "📊 Loading sample data..."
-	@./scripts/load_sample_data.sh
+logs: ## Follow database logs
+	@$(COMPOSE) logs -f db
 
-# Module Execution
-run-module: ## Run specific SQL module (usage: make run-module MODULE=01_schema_design/civics.sql)
-	@if [ -z "$(MODULE)" ]; then echo "❌ Usage: make run-module MODULE=path/to/file.sql"; exit 1; fi
-	@echo "🏃 Running module: $(MODULE)"
-	@./scripts/run_sql.sh sql/$(MODULE)
+psql: ## Interactive psql session
+	@docker exec -it $(CONTAINER) psql -U $(PG_USER) -d $(PG_DB)
 
-run-init: ## Run initialization scripts
-	@echo "🔧 Running initialization..."
-	@for file in sql/00_init/*.sql; do \
-		echo "Running $$file..."; \
-		./scripts/run_sql.sh $$file; \
-	done
+shell: ## Shell inside the database container
+	@docker exec -it $(CONTAINER) bash
 
-run-examples: ## Run quick demo examples
-	@echo "🎯 Running example demonstrations..."
-	@./scripts/run_sql.sh examples/quick_demo.sql
+##@ Data
+build: ## Rebuild schemas and data in place (SCALE, SEED)
+	@scripts/build_db.sh -s $(SCALE) -r $(SEED)
 
-# Testing and Validation
-test: ## Run all validation tests
-	@echo "🧪 Running validation tests..."
-	@./scripts/run_sql.sh tests/schema_validation.sql
-	@./scripts/run_sql.sh tests/data_integrity_checks.sql
-	@./scripts/run_sql.sh tests/regression_tests.sql
-	@echo "✅ All tests passed!"
+build-all: ## Rebuild and also run every module 02-16
+	@scripts/build_db.sh -s $(SCALE) -r $(SEED) -m
 
-test-schema: ## Validate schema structure
-	@./scripts/run_sql.sh tests/schema_validation.sql
+module: ## Run one file, e.g. make module F=sql/07_geospatial/routing_nearest.sql
+	@test -n "$(F)" || { echo "usage: make module F=path/to/file.sql"; exit 1; }
+	@scripts/run_sql.sh "$(F)"
 
-test-data: ## Check data integrity
-	@./scripts/run_sql.sh tests/data_integrity_checks.sql
+reset: ## Regenerate base data (keeps module objects)
+	@scripts/reset_db.sh
 
-bench: ## Run performance benchmarks
-	@echo "⚡ Running performance benchmarks..."
-	@./scripts/run_sql.sh tests/performance_benchmarks.sql
+##@ Verification
+check: lint test test-modules reproduce ## Everything CI runs
 
-# Development Helpers
-backup: ## Create database backup
-	@echo "💾 Creating backup..."
-	@./scripts/backup_demo.sh
+test: ## pgTAP suite (schema, constraints, data invariants, regressions)
+	@docker exec $(CONTAINER) pg_prove -U $(PG_USER) -d $(PG_DB) --ext .sql \
+	    /tests/schema_validation.sql /tests/data_integrity_checks.sql /tests/regression_tests.sql
 
-shell: ## Open shell in database container
-	@docker exec -it polaris-db bash
+test-modules: ## Every module standalone + idempotent on a fresh copy
+	@scripts/check_modules.sh
 
-adminer: ## Open Adminer in browser (requires xdg-open/open command)
-	@echo "🌐 Opening Adminer..."
-	@command -v xdg-open >/dev/null && xdg-open http://localhost:8080 || \
-	 command -v open >/dev/null && open http://localhost:8080 || \
-	 echo "Please open http://localhost:8080 manually"
+reproduce: ## Same seed twice under different plans -> identical fingerprints
+	@scripts/reproduce.sh $(SCALE) $(SEED)
 
-# Cleanup
-clean: ## Clean up containers and volumes
-	@echo "🧹 Cleaning up..."
-	@docker-compose -f docker/docker-compose.yml down -v --remove-orphans
-	@docker system prune -f
+lint: ## shellcheck scripts, validate compose file
+	@shellcheck -x scripts/*.sh docker/initdb/*.sh benchmarks/*.sh
+	@$(COMPOSE) config --quiet
+	@echo "lint ok"
 
-clean-all: ## Deep clean (remove images too)
-	@echo "🧹 Deep cleaning..."
-	@docker-compose -f docker/docker-compose.yml down -v --remove-orphans --rmi all
-	@docker system prune -a -f
+##@ Benchmarks
+bench: ## Run the pgbench workload suite (see benchmarks/README.md)
+	@benchmarks/run.sh
 
-# Documentation
-docs: ## Generate/update documentation
-	@echo "📚 Updating documentation..."
-	@echo "Documentation available in docs/ directory"
+bench-report: ## Summarise the latest benchmark run with confidence intervals
+	@python3 benchmarks/analyze.py benchmarks/results/latest
 
-# Module-specific shortcuts
-schema: ## Run schema design modules
-	@make run-module MODULE=01_schema_design/civics.sql
-	@make run-module MODULE=01_schema_design/commerce.sql
-	@make run-module MODULE=01_schema_design/mobility.sql
-	@make run-module MODULE=01_schema_design/geo.sql
+##@ Operations
+backup: ## pg_dump + restore into a scratch DB + fingerprint verification
+	@scripts/backup_demo.sh
 
-constraints: ## Run constraint and indexing modules
-	@make run-module MODULE=02_constraints_indexes/constraints.sql
-	@make run-module MODULE=02_constraints_indexes/indexing_basics.sql
+clean: ## Stop containers and delete the data volume
+	@$(COMPOSE) --profile ui down -v
 
-queries: ## Run query practice modules
-	@make run-module MODULE=03_dml_queries/seed_data.sql
-	@make run-module MODULE=03_dml_queries/practice_selects.sql
-
-# Environment info
-info: ## Show environment information
-	@echo "PostgreSQL Polaris Environment Info"
-	@echo "===================================="
-	@echo "Docker Compose File: docker/docker-compose.yml"
-	@echo "Database Container: polaris-db"
-	@echo "Admin Container: polaris-adminer"
-	@echo ""
-	@echo "Ports:"
-	@echo "  PostgreSQL: 5432"
-	@echo "  Adminer: 8080"
-	@echo ""
-	@echo "Default Credentials:"
-	@echo "  Database: polaris"
-	@echo "  Username: polaris"
-	@echo "  Password: polar_star_2024"
-	@echo ""
-	@echo "Quick Commands:"
-	@echo "  Connect: make psql"
-	@echo "  Reset: make reset"
-	@echo "  Test: make test"
+nuke: clean ## Also remove built images and check logs
+	@docker image rm -f polaris-db:$${PG_MAJOR:-17} 2>/dev/null || true
+	@rm -rf .check_logs
