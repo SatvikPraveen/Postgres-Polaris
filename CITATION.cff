@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use PostgreSQL Polaris or its synthetic dataset in research or teaching, please cite it as below."
+title: "PostgreSQL Polaris: a reproducible PostgreSQL curriculum and synthetic urban dataset with planted ground truth"
+type: software
+authors:
+  - family-names: Praveen
+    given-names: Satvik
+version: 2.1.0
+date-released: 2026-10-04
+repository-code: "https://github.com/SatvikPraveen/Postgres-Polaris"
+license: MIT
+keywords:
+  - PostgreSQL
+  - PostGIS
+  - synthetic data
+  - reproducibility
+  - benchmarking
+  - database education
+  - anomaly detection
+abstract: >-
+  PostgreSQL Polaris is a containerised PostgreSQL 17/18 environment with a
+  deterministic, scalable synthetic city dataset (civics, commerce, mobility,
+  geography, documents) generated in SQL with a counter-based RNG. The dataset
+  carries planted effects with known parameters and labelled anomalies, so
+  analytical and detection methods can be validated against ground truth.
+  Sixteen modules cover schema design through MVCC, query tuning, security,
+  replication and capstone analyses; a pgTAP suite, a module isolation checker,
+  a fingerprint-based reproducibility check and a pgbench harness with
+  confidence intervals run in CI.
