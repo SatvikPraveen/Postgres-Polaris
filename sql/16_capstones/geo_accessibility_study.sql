@@ -1,694 +1,356 @@
--- File: sql/99_capstones/geo_accessibility_study.sql
--- Purpose: spatial joins + windows + routing for accessibility analysis
-
 -- =============================================================================
--- GEOSPATIAL ACCESSIBILITY INFRASTRUCTURE
+-- File: sql/16_capstones/geo_accessibility_study.sql
+-- Capstone: a "15-minute city" accessibility and equity study with PostGIS
+-- =============================================================================
+-- Research question
+--   What share of each neighbourhood's residents can WALK to the essentials
+--   (school, hospital, park, library, transit) and is access fair, i.e. does it
+--   depend on neighbourhood income?
+--
+-- What this capstone teaches
+--   * geography vs geometry: distances in metres on the spheroid with ::geography.
+--     (Never ST_Transform to 3857 to measure: Web Mercator inflates lengths by
+--     1/cos(latitude), ~19% at Polaris City's 33 degrees N.)
+--   * KNN nearest-neighbour search with ORDER BY geog <-> geog LIMIT 1 inside
+--     LATERAL, served by a GiST index on a geography column.
+--   * ST_DWithin(geography, geography, metres) for "cumulative opportunities"
+--     counts, also index-assisted.
+--   * Point-in-polygon assignment (ST_Contains) and a consistency check against
+--     the zip-code encoding.
+--   * Straight-line vs grid-network (Manhattan) walking distance.
+--   * Equity statistics: corr(), regr_slope(), regr_r2(), Spearman via ranks,
+--     and a population-weighted concentration curve.
+--   * A what-if: transit access before vs after recent station openings.
+--
+-- Inputs (base, read only): civics.citizens.home_geom, geo.points_of_interest,
+-- mobility.stations, geo.neighborhood_boundaries. Everything this file creates
+-- lives in schema accessibility and is rebuilt idempotently.
 -- =============================================================================
 
--- Create schema for accessibility analysis
+\echo '== 0. Schema and study parameters'
 CREATE SCHEMA IF NOT EXISTS accessibility;
+COMMENT ON SCHEMA accessibility IS 'Capstone 16: 15-minute-city walking accessibility and equity study.';
 
--- Enable PostGIS extension for spatial operations
--- CREATE EXTENSION IF NOT EXISTS postgis;
-
--- Points of Interest (POI) for accessibility analysis
-CREATE TABLE accessibility.points_of_interest (
-    poi_id BIGSERIAL PRIMARY KEY,
-    poi_name TEXT NOT NULL,
-    poi_type TEXT CHECK (poi_type IN ('hospital', 'school', 'transit_station', 'grocery', 'pharmacy', 'government', 'park', 'library')),
-    street_address TEXT,
-    city TEXT,
-    state_province TEXT,
-    -- coordinates GEOMETRY(POINT, 4326), -- PostGIS geometry column
-    latitude NUMERIC(10, 7),
-    longitude NUMERIC(11, 7),
-    accessibility_features JSONB, -- wheelchair_accessible, parking, etc.
-    operating_hours JSONB,
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+-- Essential categories, their weight in the index and a category-specific
+-- "acceptable walk". 1200 m ~ 15 minutes at 4.8 km/h; 800 m ~ 10 minutes
+-- (the classic transit walk-shed). Hospitals are rare, so 2 km is used there.
+CREATE TABLE IF NOT EXISTS accessibility.essential_categories (
+    category        text PRIMARY KEY,
+    weight          numeric NOT NULL CHECK (weight > 0),
+    target_walk_m   integer NOT NULL CHECK (target_walk_m > 0),
+    source          text NOT NULL
 );
+INSERT INTO accessibility.essential_categories VALUES
+    ('school',   0.25,  800, 'geo.points_of_interest'),
+    ('park',     0.20,  800, 'geo.points_of_interest'),
+    ('library',  0.15, 1200, 'geo.points_of_interest'),
+    ('hospital', 0.15, 2000, 'geo.points_of_interest'),
+    ('transit',  0.25,  800, 'mobility.stations (bus, rail)')
+ON CONFLICT (category) DO UPDATE
+    SET weight = EXCLUDED.weight, target_walk_m = EXCLUDED.target_walk_m, source = EXCLUDED.source;
 
--- Transit routes and stops
-CREATE TABLE accessibility.transit_routes (
-    route_id BIGSERIAL PRIMARY KEY,
-    route_name TEXT NOT NULL,
-    route_type TEXT CHECK (route_type IN ('bus', 'subway', 'train', 'tram')),
-    -- route_geometry GEOMETRY(LINESTRING, 4326), -- Route path
-    accessibility_rating TEXT CHECK (accessibility_rating IN ('full', 'partial', 'none')),
-    frequency_minutes INTEGER, -- Average time between vehicles
-    operating_hours JSONB,
-    is_active BOOLEAN DEFAULT TRUE
+-- -----------------------------------------------------------------------------
+-- 1. Destinations: one table, geography column, GiST index
+-- -----------------------------------------------------------------------------
+-- Teaches: harmonise heterogeneous sources (POIs have geometry, stations have
+-- numeric lat/lon) into one geography column; index it so <-> and ST_DWithin
+-- can use it. Stations: ST_MakePoint takes (x = longitude, y = latitude).
+\echo '== 1. Destinations'
+DROP TABLE IF EXISTS accessibility.destinations CASCADE;
+CREATE TABLE accessibility.destinations (
+    dest_id        text PRIMARY KEY,
+    category       text NOT NULL REFERENCES accessibility.essential_categories(category),
+    name           text NOT NULL,
+    opened_on      date,
+    geog           geography(Point, 4326) NOT NULL
 );
+INSERT INTO accessibility.destinations (dest_id, category, name, opened_on, geog)
+SELECT 'poi:' || p.poi_id, p.category::text, p.name, p.created_at::date, p.location_geom::geography
+FROM geo.points_of_interest p
+WHERE p.is_active AND p.category::text IN ('school', 'park', 'library', 'hospital')
+UNION ALL
+SELECT 'stn:' || s.station_id, 'transit', s.station_name, s.installation_date,
+       ST_SetSRID(ST_MakePoint(s.longitude::float8, s.latitude::float8), 4326)::geography
+FROM mobility.stations s
+WHERE s.station_type IN ('bus', 'rail') AND s.status = 'active';
+CREATE INDEX destinations_geog_gix ON accessibility.destinations USING gist (geog);
+CREATE INDEX destinations_category_idx ON accessibility.destinations (category);
+ANALYZE accessibility.destinations;
 
--- Transit stops
-CREATE TABLE accessibility.transit_stops (
-    stop_id BIGSERIAL PRIMARY KEY,
-    route_id BIGINT REFERENCES accessibility.transit_routes(route_id),
-    stop_name TEXT NOT NULL,
-    street_address TEXT,
-    -- stop_location GEOMETRY(POINT, 4326),
-    latitude NUMERIC(10, 7),
-    longitude NUMERIC(11, 7),
-    accessibility_features JSONB,
-    is_accessible BOOLEAN DEFAULT FALSE,
-    stop_sequence INTEGER -- Order along route
-);
+SELECT category, count(*) AS destinations FROM accessibility.destinations GROUP BY category ORDER BY category;
 
--- Accessibility assessment results
-CREATE TABLE accessibility.accessibility_scores (
-    assessment_id BIGSERIAL PRIMARY KEY,
-    citizen_id BIGINT REFERENCES civics.citizens(citizen_id),
-    assessment_type TEXT CHECK (assessment_type IN ('overall', 'healthcare', 'education', 'transportation', 'services')),
-    accessibility_score NUMERIC(4,2) CHECK (accessibility_score BETWEEN 0 AND 100),
-    score_components JSONB, -- Breakdown of score factors
-    assessment_date TIMESTAMPTZ DEFAULT NOW(),
-    methodology_version TEXT DEFAULT '1.0'
-);
+-- -----------------------------------------------------------------------------
+-- 2. Residents: geography + neighbourhood by point-in-polygon
+-- -----------------------------------------------------------------------------
+-- Teaches: spatial join with ST_Contains (geometry, uses the boundary GiST
+-- index), then a data-quality cross-check: zip '751NN' encodes neighbourhood NN.
+\echo '== 2. Residents assigned to neighbourhoods'
+DROP TABLE IF EXISTS accessibility.residents CASCADE;
+CREATE TABLE accessibility.residents AS
+SELECT c.citizen_id, n.neighborhood_id, c.home_geom::geography AS geog, c.home_geom
+FROM civics.citizens c
+JOIN geo.neighborhood_boundaries n ON ST_Contains(n.boundary_geom, c.home_geom)
+WHERE c.status = 'active' AND c.home_geom IS NOT NULL;
+ALTER TABLE accessibility.residents ADD PRIMARY KEY (citizen_id);
+CREATE INDEX residents_geog_gix ON accessibility.residents USING gist (geog);
+ANALYZE accessibility.residents;
 
--- =============================================================================
--- SPATIAL UTILITY FUNCTIONS
--- =============================================================================
+SELECT count(*) AS active_residents,
+       count(*) FILTER (WHERE substr(c.zip_code, 4, 2)::int <> r.neighborhood_id) AS zip_polygon_mismatches
+FROM accessibility.residents r JOIN civics.citizens c USING (citizen_id);
 
--- Calculate distance between two points using Haversine formula
-CREATE OR REPLACE FUNCTION accessibility.calculate_distance_km(
-    lat1 NUMERIC, lon1 NUMERIC,
-    lat2 NUMERIC, lon2 NUMERIC
+-- -----------------------------------------------------------------------------
+-- 3. Nearest essential of each category for every resident (KNN)
+-- -----------------------------------------------------------------------------
+-- Teaches: the KNN idiom. ORDER BY d.geog <-> r.geog LIMIT 1 walks the GiST
+-- index nearest-first; for geography, <-> is the true sphere distance, so the
+-- ordering is correct (geometry <-> in degrees would favour north-south
+-- neighbours at this latitude). We then compute the exact spheroid distance
+-- with ST_Distance and a grid-network (Manhattan) approximation: the street
+-- network is a regular grid, so a walker covers |dx| + |dy|.
+\echo '== 3. Nearest-destination distances (10k residents x 5 categories)'
+EXPLAIN (COSTS OFF)
+SELECT d.dest_id
+FROM accessibility.destinations d
+WHERE d.category = 'library'
+ORDER BY d.geog <-> (SELECT geog FROM accessibility.residents ORDER BY citizen_id LIMIT 1)
+LIMIT 1;
+
+DROP TABLE IF EXISTS accessibility.resident_nearest CASCADE;
+CREATE TABLE accessibility.resident_nearest AS
+SELECT r.citizen_id, r.neighborhood_id, e.category, nn.dest_id,
+       ST_Distance(r.geog, nn.geog)                                           AS crow_m,
+       -- Manhattan on the spheroid: east-west leg + north-south leg
+       ST_Distance(r.geog, ST_SetSRID(ST_MakePoint(ST_X(nn.geog::geometry), ST_Y(r.home_geom)), 4326)::geography)
+     + ST_Distance(r.geog, ST_SetSRID(ST_MakePoint(ST_X(r.home_geom), ST_Y(nn.geog::geometry)), 4326)::geography)
+                                                                              AS grid_m
+FROM accessibility.residents r
+CROSS JOIN accessibility.essential_categories e
+CROSS JOIN LATERAL (
+    SELECT d.dest_id, d.geog
+    FROM accessibility.destinations d
+    WHERE d.category = e.category
+    ORDER BY d.geog <-> r.geog
+    LIMIT 1
+) nn;
+ALTER TABLE accessibility.resident_nearest ADD PRIMARY KEY (citizen_id, category);
+ANALYZE accessibility.resident_nearest;
+
+-- City-wide distribution of nearest distances, and the network detour factor.
+SELECT category,
+       round(percentile_cont(0.5) WITHIN GROUP (ORDER BY crow_m)::numeric)  AS median_crow_m,
+       round(percentile_cont(0.9) WITHIN GROUP (ORDER BY crow_m)::numeric)  AS p90_crow_m,
+       round(avg(grid_m / nullif(crow_m, 0))::numeric, 2)                   AS mean_detour_factor,
+       round(avg((crow_m <= 800)::int)::numeric, 3)                          AS share_800m,
+       round(avg((crow_m <= 1200)::int)::numeric, 3)                         AS share_1200m,
+       round(avg((grid_m <= 1200)::int)::numeric, 3)                         AS share_1200m_grid
+FROM accessibility.resident_nearest
+GROUP BY category
+ORDER BY category;
+
+-- -----------------------------------------------------------------------------
+-- 4. Neighbourhood accessibility table and the index
+-- -----------------------------------------------------------------------------
+-- Teaches: conditional aggregation into a wide, analysis-ready table.
+--   share_<cat>_800 / _1200 : share of residents within 800 / 1200 m (geodesic)
+--   access_index            : weighted mean over categories of the share within
+--                             the category's target walk (0..100)
+--   share_15min_all         : share of residents reaching ALL five essentials
+--                             within 1200 m: the strict "15-minute city" test.
+\echo '== 4. Neighbourhood accessibility'
+CREATE OR REPLACE VIEW accessibility.neighborhood_access AS
+WITH per_resident AS (
+    SELECT rn.citizen_id, rn.neighborhood_id,
+           sum(e.weight * (rn.crow_m <= e.target_walk_m)::int) / sum(e.weight)  AS resident_score,
+           bool_and(rn.crow_m <= 1200)                                         AS all_within_1200,
+           max(rn.crow_m) FILTER (WHERE rn.category = 'school')                AS d_school,
+           max(rn.crow_m) FILTER (WHERE rn.category = 'park')                  AS d_park,
+           max(rn.crow_m) FILTER (WHERE rn.category = 'library')               AS d_library,
+           max(rn.crow_m) FILTER (WHERE rn.category = 'hospital')              AS d_hospital,
+           max(rn.crow_m) FILTER (WHERE rn.category = 'transit')               AS d_transit
+    FROM accessibility.resident_nearest rn
+    JOIN accessibility.essential_categories e USING (category)
+    GROUP BY rn.citizen_id, rn.neighborhood_id
 )
-RETURNS NUMERIC AS $$
-DECLARE
-    dlat NUMERIC;
-    dlon NUMERIC;
-    a NUMERIC;
-    c NUMERIC;
-    r NUMERIC := 6371; -- Earth's radius in km
-BEGIN
-    dlat := radians(lat2 - lat1);
-    dlon := radians(lon2 - lon1);
+SELECT n.neighborhood_id, n.neighborhood_name, n.median_income,
+       count(*)                                               AS residents,
+       round(avg((d_school   <=  800)::int), 3)               AS share_school_800,
+       round(avg((d_school   <= 1200)::int), 3)               AS share_school_1200,
+       round(avg((d_park     <=  800)::int), 3)               AS share_park_800,
+       round(avg((d_park     <= 1200)::int), 3)               AS share_park_1200,
+       round(avg((d_library  <=  800)::int), 3)               AS share_library_800,
+       round(avg((d_library  <= 1200)::int), 3)               AS share_library_1200,
+       round(avg((d_hospital <=  800)::int), 3)               AS share_hospital_800,
+       round(avg((d_hospital <= 1200)::int), 3)               AS share_hospital_1200,
+       round(avg((d_transit  <=  800)::int), 3)               AS share_transit_800,
+       round(avg((d_transit  <= 1200)::int), 3)               AS share_transit_1200,
+       round(100 * avg(resident_score), 1)                    AS access_index,
+       round(avg(all_within_1200::int), 3)                    AS share_15min_all
+FROM per_resident p
+JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+GROUP BY n.neighborhood_id, n.neighborhood_name, n.median_income;
 
-    a := sin(dlat/2) * sin(dlat/2) +
-         cos(radians(lat1)) * cos(radians(lat2)) *
-         sin(dlon/2) * sin(dlon/2);
-    c := 2 * atan2(sqrt(a), sqrt(1-a));
+SELECT neighborhood_name, residents, round(median_income) AS median_income,
+       share_school_800 AS school_800, share_park_800 AS park_800, share_library_1200 AS library_1200,
+       share_hospital_1200 AS hosp_1200, share_transit_800 AS transit_800,
+       access_index, share_15min_all
+FROM accessibility.neighborhood_access
+ORDER BY access_index DESC, neighborhood_name
+LIMIT 24;
 
-    RETURN r * c;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
+-- Cumulative opportunities: how MANY essentials are within 800 m (not just the
+-- nearest). ST_DWithin on geography is index-assisted and exact in metres.
+\echo '== 4b. Cumulative opportunities within 800 m (mean count per resident)'
+SELECT n.neighborhood_name,
+       round(avg(o.n_school), 2)  AS schools, round(avg(o.n_park), 2) AS parks,
+       round(avg(o.n_transit), 2) AS transit_stops
+FROM accessibility.residents r
+JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+CROSS JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE d.category = 'school')  AS n_school,
+           count(*) FILTER (WHERE d.category = 'park')    AS n_park,
+           count(*) FILTER (WHERE d.category = 'transit') AS n_transit
+    FROM accessibility.destinations d
+    WHERE ST_DWithin(d.geog, r.geog, 800)
+) o
+GROUP BY n.neighborhood_name
+ORDER BY avg(o.n_transit) DESC, n.neighborhood_name
+LIMIT 6;
 
--- Get coordinates for citizen address (simplified - would use geocoding service in reality)
-CREATE OR REPLACE FUNCTION accessibility.get_citizen_coordinates(citizen_id BIGINT)
-RETURNS TABLE(latitude NUMERIC, longitude NUMERIC) AS $$
-BEGIN
-    -- Simplified coordinate assignment based on city/state
-    -- In production, this would use a geocoding service
-    RETURN QUERY
-    SELECT
-        CASE c.city
-            WHEN 'Downtown' THEN 40.7128::NUMERIC
-            WHEN 'Midtown' THEN 40.7589::NUMERIC
-            WHEN 'Uptown' THEN 40.7831::NUMERIC
-            WHEN 'Westside' THEN 40.7505::NUMERIC
-            WHEN 'Eastside' THEN 40.7282::NUMERIC
-            ELSE 40.7500::NUMERIC
-        END as latitude,
-        CASE c.city
-            WHEN 'Downtown' THEN -74.0060::NUMERIC
-            WHEN 'Midtown' THEN -73.9851::NUMERIC
-            WHEN 'Uptown' THEN -73.9712::NUMERIC
-            WHEN 'Westside' THEN -73.9934::NUMERIC
-            WHEN 'Eastside' THEN -73.9942::NUMERIC
-            ELSE -74.0000::NUMERIC
-        END as longitude
-    FROM civics.citizens c
-    WHERE c.citizen_id = get_citizen_coordinates.citizen_id;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- HEALTHCARE ACCESSIBILITY ANALYSIS
--- =============================================================================
-
--- Analyze healthcare accessibility for citizens
-CREATE OR REPLACE FUNCTION accessibility.analyze_healthcare_accessibility()
-RETURNS TABLE(
-    citizen_id BIGINT,
-    nearest_hospital_distance_km NUMERIC,
-    hospitals_within_5km INTEGER,
-    hospitals_within_10km INTEGER,
-    accessible_hospitals_within_5km INTEGER,
-    healthcare_accessibility_score NUMERIC
-) AS $$
-BEGIN
-    RETURN QUERY
-    WITH citizen_coords AS (
-        SELECT
-            c.citizen_id,
-            cc.latitude as citizen_lat,
-            cc.longitude as citizen_lon
-        FROM civics.citizens c
-        CROSS JOIN LATERAL accessibility.get_citizen_coordinates(c.citizen_id) cc
-        WHERE c.status = 'active'
-    ),
-    hospital_distances AS (
-        SELECT
-            cc.citizen_id,
-            poi.poi_id,
-            poi.poi_name,
-            accessibility.calculate_distance_km(
-                cc.citizen_lat, cc.citizen_lon,
-                poi.latitude, poi.longitude
-            ) as distance_km,
-            CASE WHEN poi.accessibility_features->>'wheelchair_accessible' = 'true' THEN 1 ELSE 0 END as is_accessible
-        FROM citizen_coords cc
-        CROSS JOIN accessibility.points_of_interest poi
-        WHERE poi.poi_type = 'hospital' AND poi.is_active = TRUE
-    ),
-    accessibility_metrics AS (
-        SELECT
-            hd.citizen_id,
-            MIN(hd.distance_km) as nearest_hospital_distance_km,
-            COUNT(*) FILTER (WHERE hd.distance_km <= 5) as hospitals_within_5km,
-            COUNT(*) FILTER (WHERE hd.distance_km <= 10) as hospitals_within_10km,
-            COUNT(*) FILTER (WHERE hd.distance_km <= 5 AND hd.is_accessible = 1) as accessible_hospitals_within_5km
-        FROM hospital_distances hd
-        GROUP BY hd.citizen_id
-    )
-    SELECT
-        am.citizen_id,
-        am.nearest_hospital_distance_km,
-        am.hospitals_within_5km::INTEGER,
-        am.hospitals_within_10km::INTEGER,
-        am.accessible_hospitals_within_5km::INTEGER,
-        -- Calculate healthcare accessibility score (0-100)
-        ROUND(
-            GREATEST(0,
-                100 - (am.nearest_hospital_distance_km * 10) + -- Penalty for distance
-                (am.hospitals_within_5km * 10) + -- Bonus for nearby options
-                (am.accessible_hospitals_within_5km * 5) -- Bonus for accessible options
-            ), 2
-        ) as healthcare_accessibility_score
-    FROM accessibility_metrics am
-    ORDER BY healthcare_accessibility_score DESC;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- TRANSPORTATION ACCESSIBILITY ANALYSIS
--- =============================================================================
-
--- Analyze public transit accessibility
-CREATE OR REPLACE FUNCTION accessibility.analyze_transit_accessibility()
-RETURNS TABLE(
-    citizen_id BIGINT,
-    nearest_transit_stop_distance_km NUMERIC,
-    transit_stops_within_1km INTEGER,
-    accessible_stops_within_1km INTEGER,
-    unique_routes_accessible INTEGER,
-    transit_accessibility_score NUMERIC
-) AS $$
-BEGIN
-    RETURN QUERY
-    WITH citizen_coords AS (
-        SELECT
-            c.citizen_id,
-            cc.latitude as citizen_lat,
-            cc.longitude as citizen_lon
-        FROM civics.citizens c
-        CROSS JOIN LATERAL accessibility.get_citizen_coordinates(c.citizen_id) cc
-        WHERE c.status = 'active'
-    ),
-    stop_distances AS (
-        SELECT
-            cc.citizen_id,
-            ts.stop_id,
-            ts.route_id,
-            ts.stop_name,
-            accessibility.calculate_distance_km(
-                cc.citizen_lat, cc.citizen_lon,
-                ts.latitude, ts.longitude
-            ) as distance_km,
-            ts.is_accessible,
-            tr.route_type,
-            tr.frequency_minutes
-        FROM citizen_coords cc
-        CROSS JOIN accessibility.transit_stops ts
-        JOIN accessibility.transit_routes tr ON ts.route_id = tr.route_id
-        WHERE tr.is_active = TRUE
-    ),
-    transit_metrics AS (
-        SELECT
-            sd.citizen_id,
-            MIN(sd.distance_km) as nearest_transit_stop_distance_km,
-            COUNT(*) FILTER (WHERE sd.distance_km <= 1.0) as transit_stops_within_1km,
-            COUNT(*) FILTER (WHERE sd.distance_km <= 1.0 AND sd.is_accessible = TRUE) as accessible_stops_within_1km,
-            COUNT(DISTINCT sd.route_id) FILTER (WHERE sd.distance_km <= 1.0 AND sd.is_accessible = TRUE) as unique_routes_accessible,
-            -- Calculate frequency score (better frequency = higher score)
-            AVG(CASE WHEN sd.distance_km <= 1.0 THEN (60.0 / GREATEST(sd.frequency_minutes, 5)) ELSE NULL END) as avg_frequency_score
-        FROM stop_distances sd
-        GROUP BY sd.citizen_id
-    )
-    SELECT
-        tm.citizen_id,
-        tm.nearest_transit_stop_distance_km,
-        tm.transit_stops_within_1km::INTEGER,
-        tm.accessible_stops_within_1km::INTEGER,
-        tm.unique_routes_accessible::INTEGER,
-        -- Calculate transit accessibility score (0-100)
-        ROUND(
-            LEAST(100,
-                GREATEST(0,
-                    -- Base score reduced by distance to nearest stop
-                    80 - (tm.nearest_transit_stop_distance_km * 20) +
-                    -- Bonus for multiple nearby stops
-                    (tm.transit_stops_within_1km * 3) +
-                    -- Bonus for accessible stops
-                    (tm.accessible_stops_within_1km * 5) +
-                    -- Bonus for route diversity
-                    (tm.unique_routes_accessible * 3) +
-                    -- Bonus for frequency
-                    COALESCE(tm.avg_frequency_score * 2, 0)
-                )
-            ), 2
-        ) as transit_accessibility_score
-    FROM transit_metrics tm
-    ORDER BY transit_accessibility_score DESC;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- COMPREHENSIVE ACCESSIBILITY SCORING
--- =============================================================================
-
--- Calculate overall accessibility score for all citizens
-CREATE OR REPLACE FUNCTION accessibility.calculate_comprehensive_accessibility()
-RETURNS VOID AS $$
-DECLARE
-    citizen_record RECORD;
-    healthcare_score NUMERIC;
-    transit_score NUMERIC;
-    services_score NUMERIC;
-    overall_score NUMERIC;
-BEGIN
-    -- Clear existing assessments for today
-    DELETE FROM accessibility.accessibility_scores WHERE assessment_date::DATE = CURRENT_DATE;
-
-    -- Calculate accessibility for each citizen
-    FOR citizen_record IN
-        SELECT citizen_id FROM civics.citizens WHERE status = 'active'
-    LOOP
-        -- Get healthcare accessibility score
-        SELECT ha.healthcare_accessibility_score INTO healthcare_score
-        FROM accessibility.analyze_healthcare_accessibility() ha
-        WHERE ha.citizen_id = citizen_record.citizen_id;
-
-        -- Get transit accessibility score
-        SELECT ta.transit_accessibility_score INTO transit_score
-        FROM accessibility.analyze_transit_accessibility() ta
-        WHERE ta.citizen_id = citizen_record.citizen_id;
-
-        -- Calculate services accessibility (schools, grocery, government)
-        WITH service_access AS (
-            SELECT
-                AVG(
-                    CASE
-                        WHEN accessibility.calculate_distance_km(
-                            cc.latitude, cc.longitude, poi.latitude, poi.longitude
-                        ) <= 2.0 THEN 80
-                        WHEN accessibility.calculate_distance_km(
-                            cc.latitude, cc.longitude, poi.latitude, poi.longitude
-                        ) <= 5.0 THEN 60
-                        ELSE 20
-                    END
-                ) as avg_service_score
-            FROM accessibility.get_citizen_coordinates(citizen_record.citizen_id) cc
-            CROSS JOIN accessibility.points_of_interest poi
-            WHERE poi.poi_type IN ('school', 'grocery', 'government', 'library', 'pharmacy')
-            AND poi.is_active = TRUE
-        )
-        SELECT avg_service_score INTO services_score FROM service_access;
-
-        -- Calculate weighted overall score
-        overall_score := ROUND(
-            (COALESCE(healthcare_score, 50) * 0.4) + -- 40% weight
-            (COALESCE(transit_score, 50) * 0.35) +   -- 35% weight
-            (COALESCE(services_score, 50) * 0.25),   -- 25% weight
-            2
-        );
-
-        -- Insert assessment results
-        INSERT INTO accessibility.accessibility_scores (
-            citizen_id, assessment_type, accessibility_score, score_components
-        ) VALUES (
-            citizen_record.citizen_id,
-            'overall',
-            overall_score,
-            json_build_object(
-                'healthcare_score', COALESCE(healthcare_score, 50),
-                'transit_score', COALESCE(transit_score, 50),
-                'services_score', COALESCE(services_score, 50),
-                'weights', json_build_object(
-                    'healthcare', 0.4,
-                    'transit', 0.35,
-                    'services', 0.25
-                )
-            )
-        );
-
-        -- Insert individual component scores
-        INSERT INTO accessibility.accessibility_scores (
-            citizen_id, assessment_type, accessibility_score, score_components
-        ) VALUES
-        (citizen_record.citizen_id, 'healthcare', COALESCE(healthcare_score, 50),
-         json_build_object('component', 'healthcare')),
-        (citizen_record.citizen_id, 'transportation', COALESCE(transit_score, 50),
-         json_build_object('component', 'transportation')),
-        (citizen_record.citizen_id, 'services', COALESCE(services_score, 50),
-         json_build_object('component', 'services'));
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- ACCESSIBILITY GAP ANALYSIS
--- =============================================================================
-
--- Identify accessibility gaps and underserved areas
-CREATE OR REPLACE FUNCTION accessibility.identify_accessibility_gaps()
-RETURNS TABLE(
-    gap_category TEXT,
-    affected_citizens INTEGER,
-    avg_accessibility_score NUMERIC,
-    geographic_area TEXT,
-    priority_level TEXT,
-    recommended_actions TEXT[]
-) AS $$
-BEGIN
-    -- Low healthcare accessibility areas
-    RETURN QUERY
-    SELECT
-        'Healthcare Access'::TEXT as gap_category,
-        COUNT(*)::INTEGER as affected_citizens,
-        AVG(accessibility_score) as avg_accessibility_score,
-        c.city as geographic_area,
-        CASE
-            WHEN AVG(accessibility_score) < 30 THEN 'CRITICAL'
-            WHEN AVG(accessibility_score) < 50 THEN 'HIGH'
-            ELSE 'MEDIUM'
-        END as priority_level,
-        ARRAY[
-            'Consider mobile health clinics',
-            'Evaluate new healthcare facility locations',
-            'Improve healthcare transportation services'
-        ] as recommended_actions
-    FROM accessibility.accessibility_scores ascore
-    JOIN civics.citizens c ON ascore.citizen_id = c.citizen_id
-    WHERE ascore.assessment_type = 'healthcare'
-    AND ascore.assessment_date::DATE = CURRENT_DATE
-    AND ascore.accessibility_score < 60
-    GROUP BY c.city
-    HAVING COUNT(*) >= 5 -- At least 5 affected citizens
-
-    UNION ALL
-
-    -- Low transit accessibility areas
-    SELECT
-        'Transit Access'::TEXT,
-        COUNT(*)::INTEGER,
-        AVG(accessibility_score),
-        c.city,
-        CASE
-            WHEN AVG(accessibility_score) < 25 THEN 'CRITICAL'
-            WHEN AVG(accessibility_score) < 40 THEN 'HIGH'
-            ELSE 'MEDIUM'
-        END,
-        ARRAY[
-            'Expand bus route coverage',
-            'Add accessible transit stops',
-            'Increase service frequency',
-            'Consider shuttle services'
-        ]
-    FROM accessibility.accessibility_scores ascore
-    JOIN civics.citizens c ON ascore.citizen_id = c.citizen_id
-    WHERE ascore.assessment_type = 'transportation'
-    AND ascore.assessment_date::DATE = CURRENT_DATE
-    AND ascore.accessibility_score < 50
-    GROUP BY c.city
-    HAVING COUNT(*) >= 5
-
-    UNION ALL
-
-    -- Overall accessibility gaps
-    SELECT
-        'Overall Access'::TEXT,
-        COUNT(*)::INTEGER,
-        AVG(accessibility_score),
-        c.city,
-        CASE
-            WHEN AVG(accessibility_score) < 40 THEN 'CRITICAL'
-            WHEN AVG(accessibility_score) < 55 THEN 'HIGH'
-            ELSE 'MEDIUM'
-        END,
-        ARRAY[
-            'Comprehensive accessibility audit needed',
-            'Multi-modal transportation improvements',
-            'Strategic service location planning'
-        ]
-    FROM accessibility.accessibility_scores ascore
-    JOIN civics.citizens c ON ascore.citizen_id = c.citizen_id
-    WHERE ascore.assessment_type = 'overall'
-    AND ascore.assessment_date::DATE = CURRENT_DATE
-    AND ascore.accessibility_score < 65
-    GROUP BY c.city
-    HAVING COUNT(*) >= 10;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- ACCESSIBILITY TREND ANALYSIS
--- =============================================================================
-
--- Analyze accessibility trends over time
-CREATE OR REPLACE FUNCTION accessibility.analyze_accessibility_trends(
-    months_back INTEGER DEFAULT 12
+-- -----------------------------------------------------------------------------
+-- 5. Equity analysis: is access correlated with income?
+-- -----------------------------------------------------------------------------
+-- Teaches: statistical aggregates on the neighbourhood table.
+--   corr(y, x)          Pearson correlation
+--   regr_slope(y, x)    OLS slope of the access metric on income_z (standardised
+--                       ln(median_income)): change per +1 SD of income
+--   regr_r2(y, x)       share of variance explained
+--   Spearman rho        = Pearson correlation of ranks (robust to outliers)
+-- With only 24 neighbourhoods, report n and treat |r| < 0.4 as weak evidence
+-- (the 5% critical value of r for n = 24 is about 0.40).
+-- Ground truth: the generator places POIs and stations by neighbourhood
+-- density / commercial intensity, NOT by income (meta.planted_effects has no
+-- access-income effect). Correlations near zero are therefore the correct,
+-- verifiable answer here: a study must be able to report a null result.
+-- Note how the quintile table below is non-monotonic: big neighbourhoods
+-- dominate their quintile, which is why the weighting choice must be stated.
+\echo '== 5. Equity: access vs neighbourhood income'
+CREATE OR REPLACE VIEW accessibility.equity_stats AS
+WITH na AS (
+    SELECT a.*,
+           (ln(a.median_income) - avg(ln(a.median_income)) OVER ()) / stddev_pop(ln(a.median_income)) OVER () AS income_z,
+           rank() OVER (ORDER BY a.median_income) AS r_income
+    FROM accessibility.neighborhood_access a
+),
+metrics AS (
+    SELECT m.metric, m.y, na.income_z, na.r_income, na.residents,
+           rank() OVER (PARTITION BY m.metric ORDER BY m.y) AS r_y
+    FROM na
+    CROSS JOIN LATERAL (VALUES
+        ('access_index',      na.access_index::float8),
+        ('share_15min_all',   na.share_15min_all::float8),
+        ('share_transit_800', na.share_transit_800::float8),
+        ('share_park_800',    na.share_park_800::float8),
+        ('share_school_800',  na.share_school_800::float8),
+        ('share_hospital_1200', na.share_hospital_1200::float8)
+    ) m(metric, y)
 )
-RETURNS TABLE(
-    trend_period TEXT,
-    assessment_type TEXT,
-    avg_score NUMERIC,
-    score_change NUMERIC,
-    citizens_assessed INTEGER,
-    trend_direction TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    WITH monthly_scores AS (
-        SELECT
-            DATE_TRUNC('month', assessment_date) as month,
-            ascore.assessment_type,
-            AVG(ascore.accessibility_score) as avg_score,
-            COUNT(*) as citizens_assessed
-        FROM accessibility.accessibility_scores ascore
-        WHERE assessment_date >= CURRENT_DATE - (months_back || ' months')::INTERVAL
-        GROUP BY DATE_TRUNC('month', assessment_date), ascore.assessment_type
-    ),
-    trend_analysis AS (
-        SELECT
-            TO_CHAR(month, 'YYYY-MM') as trend_period,
-            assessment_type,
-            avg_score,
-            citizens_assessed,
-            LAG(avg_score) OVER (PARTITION BY assessment_type ORDER BY month) as prev_score,
-            avg_score - LAG(avg_score) OVER (PARTITION BY assessment_type ORDER BY month) as score_change
-        FROM monthly_scores
-    )
-    SELECT
-        ta.trend_period,
-        ta.assessment_type,
-        ROUND(ta.avg_score, 2) as avg_score,
-        ROUND(COALESCE(ta.score_change, 0), 2) as score_change,
-        ta.citizens_assessed::INTEGER,
-        CASE
-            WHEN ta.score_change > 2 THEN 'IMPROVING'
-            WHEN ta.score_change < -2 THEN 'DECLINING'
-            WHEN ta.score_change IS NULL THEN 'BASELINE'
-            ELSE 'STABLE'
-        END as trend_direction
-    FROM trend_analysis ta
-    WHERE ta.month >= CURRENT_DATE - (months_back || ' months')::INTERVAL
-    ORDER BY ta.assessment_type, ta.trend_period;
-END;
-$$ LANGUAGE plpgsql;
+SELECT metric, count(*) AS n_neighborhoods,
+       round(corr(y, income_z)::numeric, 3)        AS pearson_r,
+       round(corr(r_y, r_income)::numeric, 3)      AS spearman_rho,
+       round(regr_slope(y, income_z)::numeric, 4)  AS slope_per_income_sd,
+       round(regr_r2(y, income_z)::numeric, 3)     AS r2
+FROM metrics
+GROUP BY metric;
 
--- =============================================================================
--- ACCESSIBILITY REPORTING DASHBOARD
--- =============================================================================
+SELECT * FROM accessibility.equity_stats ORDER BY metric;
 
--- Generate comprehensive accessibility report
-CREATE OR REPLACE FUNCTION accessibility.generate_accessibility_dashboard()
-RETURNS TABLE(
-    dashboard_section TEXT,
-    metric_name TEXT,
-    metric_value TEXT,
-    benchmark_comparison TEXT,
-    status_indicator TEXT
-) AS $$
-BEGIN
-    -- Overall accessibility summary
-    RETURN QUERY
-    SELECT
-        'City Overview'::TEXT as dashboard_section,
-        'Average Overall Accessibility'::TEXT as metric_name,
-        ROUND(AVG(accessibility_score), 1)::TEXT || '%' as metric_value,
-        CASE
-            WHEN AVG(accessibility_score) >= 75 THEN 'Above national average (70%)'
-            WHEN AVG(accessibility_score) >= 60 THEN 'Meeting minimum standards (60%)'
-            ELSE 'Below minimum standards'
-        END as benchmark_comparison,
-        CASE
-            WHEN AVG(accessibility_score) >= 75 THEN 'EXCELLENT'
-            WHEN AVG(accessibility_score) >= 60 THEN 'GOOD'
-            WHEN AVG(accessibility_score) >= 45 THEN 'NEEDS_IMPROVEMENT'
-            ELSE 'CRITICAL'
-        END as status_indicator
-    FROM accessibility.accessibility_scores
-    WHERE assessment_type = 'overall'
-    AND assessment_date::DATE = CURRENT_DATE;
+-- Resident-level view of the same question: income-quintile (of the home
+-- neighbourhood) vs mean access. Population weighting matters: a small rich
+-- neighbourhood should not count as much as a large poor one.
+\echo '== 5b. Access by neighbourhood-income quintile (population weighted)'
+WITH res AS (
+    SELECT rn.citizen_id, n.median_income,
+           sum(e.weight * (rn.crow_m <= e.target_walk_m)::int) / sum(e.weight) AS score
+    FROM accessibility.resident_nearest rn
+    JOIN accessibility.essential_categories e USING (category)
+    JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+    GROUP BY rn.citizen_id, n.median_income
+)
+SELECT q AS income_quintile, count(*) AS residents,
+       round(min(median_income)) AS min_income, round(max(median_income)) AS max_income,
+       round(100 * avg(score), 1) AS mean_access_index
+FROM (SELECT res.*, ntile(5) OVER (ORDER BY median_income, citizen_id) AS q FROM res) x
+GROUP BY q
+ORDER BY q;
 
-    -- Component breakdowns
-    RETURN QUERY
-    SELECT
-        'Component Scores'::TEXT,
-        INITCAP(assessment_type) || ' Accessibility',
-        ROUND(AVG(accessibility_score), 1)::TEXT || '%',
-        CASE assessment_type
-            WHEN 'healthcare' THEN 'Target: 70%+'
-            WHEN 'transportation' THEN 'Target: 65%+'
-            WHEN 'services' THEN 'Target: 60%+'
-            ELSE 'Target: 65%+'
-        END,
-        CASE
-            WHEN assessment_type = 'healthcare' AND AVG(accessibility_score) >= 70 THEN 'GOOD'
-            WHEN assessment_type = 'transportation' AND AVG(accessibility_score) >= 65 THEN 'GOOD'
-            WHEN assessment_type = 'services' AND AVG(accessibility_score) >= 60 THEN 'GOOD'
-            WHEN AVG(accessibility_score) >= 50 THEN 'NEEDS_IMPROVEMENT'
-            ELSE 'CRITICAL'
-        END
-    FROM accessibility.accessibility_scores
-    WHERE assessment_type IN ('healthcare', 'transportation', 'services')
-    AND assessment_date::DATE = CURRENT_DATE
-    GROUP BY assessment_type;
+-- Concentration index (health-economics style): 2 * cov(score, fractional
+-- income rank) / mean(score). > 0 means access concentrated among the richer.
+WITH res AS (
+    SELECT rn.citizen_id, n.median_income,
+           sum(e.weight * (rn.crow_m <= e.target_walk_m)::int) / sum(e.weight) AS score
+    FROM accessibility.resident_nearest rn
+    JOIN accessibility.essential_categories e USING (category)
+    JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+    GROUP BY rn.citizen_id, n.median_income
+),
+ranked AS (
+    SELECT score, (cume_dist() OVER (ORDER BY median_income) - 0.5 / count(*) OVER ()) AS frac_rank
+    FROM res
+)
+SELECT round((2 * covar_pop(score, frac_rank) / avg(score))::numeric, 4) AS concentration_index
+FROM ranked;
 
-    -- Geographic disparities
-    RETURN QUERY
-    SELECT
-        'Geographic Analysis'::TEXT,
-        c.city || ' Accessibility',
-        ROUND(AVG(ascore.accessibility_score), 1)::TEXT || '%',
-        'Compared to city average',
-        CASE
-            WHEN AVG(ascore.accessibility_score) >= 70 THEN 'ABOVE_AVERAGE'
-            WHEN AVG(ascore.accessibility_score) >= 50 THEN 'AVERAGE'
-            ELSE 'BELOW_AVERAGE'
-        END
-    FROM accessibility.accessibility_scores ascore
-    JOIN civics.citizens c ON ascore.citizen_id = c.citizen_id
-    WHERE ascore.assessment_type = 'overall'
-    AND ascore.assessment_date::DATE = CURRENT_DATE
-    GROUP BY c.city
-    ORDER BY AVG(ascore.accessibility_score) DESC;
+-- -----------------------------------------------------------------------------
+-- 6. Gap analysis: where would a new transit stop help most?
+-- -----------------------------------------------------------------------------
+-- Teaches: aggregate geometry (ST_Collect + ST_Centroid) of the underserved
+-- residents as a naive siting heuristic, and a before/after evaluation of the
+-- candidate with ST_DWithin.
+\echo '== 6. Transit gap: residents > 800 m from a stop, candidate site per neighbourhood'
+WITH unserved AS (
+    SELECT r.neighborhood_id, r.citizen_id, r.home_geom
+    FROM accessibility.resident_nearest rn
+    JOIN accessibility.residents r USING (citizen_id)
+    WHERE rn.category = 'transit' AND rn.crow_m > 800
+),
+cand AS (
+    SELECT neighborhood_id, count(*) AS unserved_residents,
+           ST_Centroid(ST_Collect(home_geom)) AS site
+    FROM unserved GROUP BY neighborhood_id
+)
+SELECT n.neighborhood_name, c.unserved_residents,
+       round(ST_Y(c.site)::numeric, 5) AS cand_lat, round(ST_X(c.site)::numeric, 5) AS cand_lon,
+       (SELECT count(*) FROM unserved u
+         WHERE u.neighborhood_id = c.neighborhood_id
+           AND ST_DWithin(u.home_geom::geography, c.site::geography, 800)) AS newly_served
+FROM cand c
+JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+ORDER BY c.unserved_residents DESC, n.neighborhood_name
+LIMIT 5;
 
-    -- Accessibility gaps summary
-    RETURN QUERY
-    SELECT
-        'Priority Areas'::TEXT,
-        gap_category || ' - ' || geographic_area,
-        affected_citizens::TEXT || ' citizens affected',
-        'Priority: ' || priority_level,
-        CASE priority_level
-            WHEN 'CRITICAL' THEN 'URGENT_ACTION'
-            WHEN 'HIGH' THEN 'HIGH_PRIORITY'
-            ELSE 'MONITOR'
-        END
-    FROM accessibility.identify_accessibility_gaps()
-    ORDER BY
-        CASE priority_level
-            WHEN 'CRITICAL' THEN 1
-            WHEN 'HIGH' THEN 2
-            ELSE 3
-        END,
-        affected_citizens DESC;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- SETUP AND INITIALIZATION
--- =============================================================================
-
--- Initialize sample POIs and transit data
-CREATE OR REPLACE FUNCTION accessibility.setup_sample_accessibility_data()
-RETURNS TEXT AS $$
-DECLARE
-    pois_created INTEGER := 0;
-    routes_created INTEGER := 0;
-BEGIN
-    -- Sample hospitals
-    INSERT INTO accessibility.points_of_interest (
-        poi_name, poi_type, street_address, city, state_province,
-        latitude, longitude, accessibility_features
-    ) VALUES
-    ('Downtown General Hospital', 'hospital', '100 Main St', 'Downtown', 'State',
-     40.7128, -74.0060, '{"wheelchair_accessible": true, "parking": true}'),
-    ('Midtown Medical Center', 'hospital', '200 Center Ave', 'Midtown', 'State',
-     40.7589, -73.9851, '{"wheelchair_accessible": true, "parking": false}'),
-    ('Westside Community Hospital', 'hospital', '300 West St', 'Westside', 'State',
-     40.7505, -73.9934, '{"wheelchair_accessible": false, "parking": true}')
-    ON CONFLICT DO NOTHING;
-
-    pois_created := pois_created + 3;
-
-    -- Sample schools
-    INSERT INTO accessibility.points_of_interest (
-        poi_name, poi_type, street_address, city, state_province,
-        latitude, longitude, accessibility_features
-    ) VALUES
-    ('Downtown Elementary', 'school', '150 School St', 'Downtown', 'State',
-     40.7150, -74.0080, '{"wheelchair_accessible": true, "parking": true}'),
-    ('Midtown High School', 'school', '250 Education Blvd', 'Midtown', 'State',
-     40.7600, -73.9870, '{"wheelchair_accessible": true, "parking": true}')
-    ON CONFLICT DO NOTHING;
-
-    pois_created := pois_created + 2;
-
-    -- Sample transit routes
-    INSERT INTO accessibility.transit_routes (
-        route_name, route_type, accessibility_rating, frequency_minutes
-    ) VALUES
-    ('Metro Line 1', 'subway', 'full', 8),
-    ('Bus Route 42', 'bus', 'full', 15),
-    ('Express Bus A', 'bus', 'partial', 20)
-    ON CONFLICT DO NOTHING;
-
-    routes_created := 3;
-
-    -- Sample transit stops
-    INSERT INTO accessibility.transit_stops (
-        route_id, stop_name, street_address, latitude, longitude,
-        is_accessible, stop_sequence
-    )
-    SELECT
-        tr.route_id,
-        'Downtown Station', '110 Transit St', 40.7140, -74.0070,
-        true, 1
-    FROM accessibility.transit_routes tr WHERE route_name = 'Metro Line 1'
-
-    UNION ALL
-
-    SELECT
-        tr.route_id,
-        'Midtown Hub', '220 Transit Ave', 40.7580, -73.9860,
-        true, 2
-    FROM accessibility.transit_routes tr WHERE route_name = 'Metro Line 1'
-    ON CONFLICT DO NOTHING;
-
-    RETURN 'Created ' || pois_created || ' POIs and ' || routes_created || ' transit routes';
-END;
-$$ LANGUAGE plpgsql;
+-- -----------------------------------------------------------------------------
+-- 7. Change over time: transit access before the last two years of openings
+-- -----------------------------------------------------------------------------
+-- Teaches: time-travel on attribute dates. Re-run the KNN with only stations
+-- installed before meta.as_of() - 2 years and compare walk-shed coverage.
+\echo '== 7. Transit access then (stations open 2 years before as_of) vs now'
+WITH then_nn AS (
+    SELECT r.citizen_id, r.neighborhood_id,
+           (SELECT ST_Distance(d.geog, r.geog)
+              FROM accessibility.destinations d
+             WHERE d.category = 'transit'
+               AND d.opened_on <= (meta.as_of() - interval '2 years')::date
+             ORDER BY d.geog <-> r.geog LIMIT 1) AS then_m
+    FROM accessibility.residents r
+)
+SELECT n.neighborhood_name,
+       round(avg((t.then_m <= 800)::int), 3)   AS share_800_then,
+       round(avg((rn.crow_m <= 800)::int), 3)  AS share_800_now,
+       round(avg((rn.crow_m <= 800)::int) - avg((t.then_m <= 800)::int), 3) AS gain
+FROM then_nn t
+JOIN accessibility.resident_nearest rn ON rn.citizen_id = t.citizen_id AND rn.category = 'transit'
+JOIN geo.neighborhood_boundaries n ON n.neighborhood_id = t.neighborhood_id
+GROUP BY n.neighborhood_name
+ORDER BY gain DESC, n.neighborhood_name
+LIMIT 5;

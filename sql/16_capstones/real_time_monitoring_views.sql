@@ -1,743 +1,482 @@
--- File: sql/99_capstones/real_time_monitoring_views.sql
--- Purpose: LISTEN/NOTIFY + live dashboards for real-time city monitoring
-
 -- =============================================================================
--- REAL-TIME MONITORING INFRASTRUCTURE
+-- File: sql/16_capstones/real_time_monitoring_views.sql
+-- Capstone: an operational monitoring layer built from PostgreSQL's own
+--           statistics views, plus data-freshness checks and NOTIFY alerts
+-- =============================================================================
+-- What this capstone teaches
+--   * Where live operational truth lives: pg_stat_activity, pg_locks +
+--     pg_blocking_pids(), pg_stat_statements, pg_stat_io (PostgreSQL 16+),
+--     pg_stat_user_tables / pg_statio_user_tables, pg_stat_database,
+--     pg_replication_slots / pg_stat_replication, pg_database.datfrozenxid.
+--   * Turning raw counters into decisions: ratios, ages, thresholds and a
+--     single traffic-light health view.
+--   * Version / extension guards (server_version_num, pg_extension) so the same
+--     script runs on any server.
+--   * Data freshness: how stale is each base table relative to the dataset's
+--     reference clock meta.as_of() (the generated data ends there; wall-clock
+--     now() would make everything look a year old).
+--   * Snapshots for trending, LISTEN/NOTIFY for push alerts, and optional
+--     pg_cron scheduling (skipped with a NOTICE where pg_cron is absent).
+--
+-- Statistics views describe the whole cluster or the current database; the
+-- numbers you see depend on what else ran. That is the point: rerun the
+-- queries while other sessions are busy.
+-- All objects live in schema monitoring and are created idempotently.
 -- =============================================================================
 
--- Create schema for real-time monitoring
-CREATE SCHEMA IF NOT EXISTS realtime_monitoring;
+\echo '== 0. Schema'
+CREATE SCHEMA IF NOT EXISTS monitoring;
+COMMENT ON SCHEMA monitoring IS 'Capstone 16: operational monitoring views and data-freshness checks.';
 
--- Real-time event streams
-CREATE TABLE realtime_monitoring.event_streams (
-    stream_id BIGSERIAL PRIMARY KEY,
-    stream_name TEXT NOT NULL UNIQUE,
-    stream_description TEXT,
-    event_types TEXT[], -- Array of event types this stream handles
-    is_active BOOLEAN DEFAULT TRUE,
-    retention_hours INTEGER DEFAULT 24, -- How long to keep events
-    max_events_per_minute INTEGER DEFAULT 1000, -- Rate limiting
-    created_at TIMESTAMPTZ DEFAULT NOW()
+-- -----------------------------------------------------------------------------
+-- 1. Sessions: who is connected and what are they doing?
+-- -----------------------------------------------------------------------------
+-- Teaches: pg_stat_activity columns that matter. state 'idle in transaction'
+-- holds snapshots and locks (blocks VACUUM cleanup); xact_age and state_age
+-- reveal it. wait_event_type/wait_event say WHY a backend is not on CPU.
+\echo '== 1. Session activity'
+CREATE OR REPLACE VIEW monitoring.session_activity AS
+SELECT a.pid,
+       a.usename,
+       a.datname,
+       a.application_name,
+       a.client_addr,
+       a.backend_type,
+       a.state,
+       a.wait_event_type,
+       a.wait_event,
+       now() - a.backend_start               AS connection_age,
+       now() - a.xact_start                  AS xact_age,
+       now() - a.query_start                 AS query_age,
+       now() - a.state_change                AS state_age,
+       age(a.backend_xmin)                   AS xmin_age_xids,
+       left(regexp_replace(a.query, '\s+', ' ', 'g'), 120) AS query_head
+FROM pg_stat_activity a
+WHERE a.pid <> pg_backend_pid();
+
+-- Summary by backend type and state (client backends plus background workers).
+SELECT backend_type, coalesce(state, '-') AS state, count(*) AS sessions,
+       max(xact_age) AS oldest_xact
+FROM monitoring.session_activity
+GROUP BY backend_type, state
+ORDER BY backend_type, state;
+
+-- Problem sessions: long transactions or idle-in-transaction beyond a limit.
+CREATE OR REPLACE VIEW monitoring.problem_sessions AS
+SELECT pid, usename, datname, state, xact_age, state_age, wait_event_type, wait_event, query_head,
+       CASE WHEN state = 'idle in transaction' AND state_age > interval '5 minutes' THEN 'idle in transaction > 5 min'
+            WHEN state = 'active' AND query_age > interval '5 minutes'              THEN 'query running > 5 min'
+            WHEN xact_age > interval '1 hour'                                       THEN 'transaction open > 1 h'
+       END AS problem
+FROM monitoring.session_activity
+WHERE backend_type = 'client backend'
+  AND (   (state = 'idle in transaction' AND state_age > interval '5 minutes')
+       OR (state = 'active' AND query_age > interval '5 minutes')
+       OR xact_age > interval '1 hour');
+
+SELECT count(*) AS problem_sessions FROM monitoring.problem_sessions;
+
+-- -----------------------------------------------------------------------------
+-- 2. Lock waits: who blocks whom?
+-- -----------------------------------------------------------------------------
+-- Teaches: pg_blocking_pids(pid) (9.6+) returns the PIDs holding (or queued
+-- ahead for) the lock a backend waits on, including parallel-group logic, so
+-- you do not have to self-join pg_locks by hand. A blocking chain's root is a
+-- blocker that is not itself blocked.
+\echo '== 2. Lock waits'
+CREATE OR REPLACE VIEW monitoring.lock_waits AS
+SELECT w.pid                                  AS waiting_pid,
+       w.usename                              AS waiting_user,
+       now() - w.query_start                  AS waiting_for,
+       w.wait_event_type || ':' || w.wait_event AS wait,
+       left(w.query, 80)                      AS waiting_query,
+       b.pid                                  AS blocking_pid,
+       b.usename                              AS blocking_user,
+       b.state                                AS blocking_state,
+       now() - b.xact_start                   AS blocking_xact_age,
+       left(b.query, 80)                      AS blocking_query,
+       cardinality(pg_blocking_pids(b.pid)) = 0 AS blocker_is_root
+FROM pg_stat_activity w
+CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid)
+JOIN pg_stat_activity b ON b.pid = bp.pid
+WHERE w.wait_event_type = 'Lock';
+
+SELECT count(*) AS waiting_backends FROM monitoring.lock_waits;
+
+-- Seeing a lock wait needs two sessions. Try it by hand (after this file ran):
+--   [Session A]  BEGIN; LOCK TABLE monitoring.metric_snapshots IN ACCESS EXCLUSIVE MODE;
+--   [Session B]  SELECT count(*) FROM monitoring.metric_snapshots;     -- blocks
+--   [Session A]  SELECT * FROM monitoring.lock_waits;                  -- shows B waiting on A
+--   [Session A]  ROLLBACK;                                             -- B proceeds
+-- In a script, never wait: use SET lock_timeout or NOWAIT. A single-session
+-- demonstration of the guard (nothing else holds this lock, so it succeeds):
+BEGIN;
+SET LOCAL lock_timeout = '200ms';
+LOCK TABLE pg_catalog.pg_class IN ACCESS SHARE MODE NOWAIT;
+SELECT mode, granted FROM pg_locks
+WHERE pid = pg_backend_pid() AND relation = 'pg_catalog.pg_class'::regclass;
+ROLLBACK;
+
+-- -----------------------------------------------------------------------------
+-- 3. Statement statistics (pg_stat_statements), guarded
+-- -----------------------------------------------------------------------------
+-- Teaches: the extension must be in shared_preload_libraries AND created in the
+-- database. Rank by total_exec_time (where the server's time goes), then look
+-- at mean time and cache hit ratio per statement. Columns used here exist in
+-- PG 13-17 (PG17 renamed blk_read_time to shared_blk_read_time, so avoid it).
+\echo '== 3. Top statements (pg_stat_statements)'
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements') THEN
+        EXECUTE $v$
+        CREATE OR REPLACE VIEW monitoring.top_statements AS
+        SELECT s.queryid,
+               s.calls,
+               round(s.total_exec_time::numeric, 1)                        AS total_ms,
+               round(s.mean_exec_time::numeric, 2)                         AS mean_ms,
+               round((100 * s.total_exec_time / nullif(sum(s.total_exec_time) OVER (), 0))::numeric, 1) AS pct_of_total,
+               s.rows,
+               round(100.0 * s.shared_blks_hit / nullif(s.shared_blks_hit + s.shared_blks_read, 0), 1) AS hit_pct,
+               s.temp_blks_written,
+               left(regexp_replace(s.query, '\s+', ' ', 'g'), 80)          AS query_head
+        FROM pg_stat_statements s
+        WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        $v$;
+    ELSE
+        RAISE NOTICE 'pg_stat_statements not installed in %; skipping monitoring.top_statements', current_database();
+    END IF;
+END
+$$;
+
+SELECT calls, total_ms, mean_ms, pct_of_total, hit_pct, query_head
+FROM monitoring.top_statements
+ORDER BY total_ms DESC, queryid
+LIMIT 5;
+
+-- -----------------------------------------------------------------------------
+-- 4. I/O by backend type (pg_stat_io, PostgreSQL 16+)
+-- -----------------------------------------------------------------------------
+-- Teaches: pg_stat_io splits I/O by backend_type x object x context. High
+-- 'evictions' for client backends in the 'normal' context means shared_buffers
+-- pressure; 'bulkread'/'vacuum' contexts use small ring buffers on purpose.
+-- Multiply counts by op_bytes (8 kB) for volume.
+\echo '== 4. pg_stat_io (PG16+)'
+DO $$
+BEGIN
+    IF current_setting('server_version_num')::int >= 160000 THEN
+        EXECUTE $v$
+        CREATE OR REPLACE VIEW monitoring.io_by_backend AS
+        SELECT backend_type, object, context,
+               coalesce(reads, 0)     AS reads,
+               coalesce(writes, 0)    AS writes,
+               coalesce(extends, 0)   AS extends,
+               coalesce(hits, 0)      AS hits,
+               coalesce(evictions, 0) AS evictions,
+               pg_size_pretty((coalesce(reads, 0) + coalesce(writes, 0)) * op_bytes) AS read_write_volume,
+               round(100.0 * hits / nullif(hits + reads, 0), 2)                      AS hit_pct
+        FROM pg_stat_io
+        WHERE coalesce(reads, 0) + coalesce(writes, 0) + coalesce(hits, 0) + coalesce(extends, 0) > 0
+        $v$;
+    ELSE
+        RAISE NOTICE 'pg_stat_io needs PostgreSQL 16+ (this is %); skipping', current_setting('server_version');
+    END IF;
+END
+$$;
+
+SELECT backend_type, object, context, reads, writes, hits, evictions, hit_pct
+FROM monitoring.io_by_backend
+ORDER BY reads + writes DESC, backend_type, object, context
+LIMIT 6;
+
+-- -----------------------------------------------------------------------------
+-- 5. Cache hit ratios
+-- -----------------------------------------------------------------------------
+-- Teaches: database-wide buffer hit ratio from pg_stat_database and per-table
+-- heap/index hit ratios from pg_statio_user_tables. "Hit" means found in
+-- shared_buffers; a miss may still be served by the OS page cache, so < 99%
+-- is a hint, not proof, of a problem.
+\echo '== 5. Cache hit ratios'
+CREATE OR REPLACE VIEW monitoring.cache_hit_ratio AS
+SELECT d.datname,
+       d.blks_hit, d.blks_read,
+       round(100.0 * d.blks_hit / nullif(d.blks_hit + d.blks_read, 0), 2) AS hit_pct,
+       d.temp_files, pg_size_pretty(d.temp_bytes) AS temp_bytes,
+       d.deadlocks, d.conflicts, d.xact_commit, d.xact_rollback
+FROM pg_stat_database d
+WHERE d.datname = current_database();
+
+CREATE OR REPLACE VIEW monitoring.table_cache_hit AS
+SELECT s.schemaname, s.relname,
+       s.heap_blks_hit, s.heap_blks_read,
+       round(100.0 * s.heap_blks_hit / nullif(s.heap_blks_hit + s.heap_blks_read, 0), 2) AS heap_hit_pct,
+       round(100.0 * s.idx_blks_hit  / nullif(s.idx_blks_hit  + s.idx_blks_read, 0), 2)  AS idx_hit_pct
+FROM pg_statio_user_tables s;
+
+SELECT datname, hit_pct, temp_files, temp_bytes, deadlocks FROM monitoring.cache_hit_ratio;
+
+SELECT schemaname, relname, heap_blks_read, heap_hit_pct, idx_hit_pct
+FROM monitoring.table_cache_hit
+WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+ORDER BY heap_blks_read DESC, schemaname, relname
+LIMIT 5;
+
+-- -----------------------------------------------------------------------------
+-- 6. Table health: dead tuples, bloat proxy, vacuum/analyze recency, XID age
+-- -----------------------------------------------------------------------------
+-- Teaches: autovacuum triggers when
+--   n_dead_tup > autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * reltuples
+-- (per-table reloptions override the GUCs; this view uses the global values).
+-- age(relfrozenxid) counts transactions since the table was last fully frozen;
+-- at autovacuum_freeze_max_age (default 200M) an anti-wraparound vacuum is
+-- forced. Exact bloat needs pgstattuple (expensive: reads the whole table), so
+-- the view uses dead-tuple ratio as a cheap proxy and section 6b shows
+-- pgstattuple_approx on one table.
+\echo '== 6. Table health (dead tuples, vacuum age, wraparound)'
+CREATE OR REPLACE VIEW monitoring.table_health AS
+SELECT s.schemaname, s.relname,
+       s.n_live_tup, s.n_dead_tup,
+       round(100.0 * s.n_dead_tup / nullif(s.n_live_tup + s.n_dead_tup, 0), 2)          AS dead_pct,
+       (current_setting('autovacuum_vacuum_threshold')::float8
+        + current_setting('autovacuum_vacuum_scale_factor')::float8 * greatest(c.reltuples, 0))::bigint
+                                                                                          AS autovacuum_trigger_at,
+       s.n_mod_since_analyze,
+       greatest(s.last_vacuum, s.last_autovacuum)                                         AS last_vacuumed,
+       greatest(s.last_analyze, s.last_autoanalyze)                                       AS last_analyzed,
+       s.vacuum_count + s.autovacuum_count                                                AS vacuums,
+       age(c.relfrozenxid)                                                                AS xid_age,
+       round((100.0 * age(c.relfrozenxid) / current_setting('autovacuum_freeze_max_age')::float8)::numeric, 2)
+                                                                                          AS pct_to_forced_freeze,
+       pg_size_pretty(pg_total_relation_size(c.oid))                                      AS total_size,
+       pg_total_relation_size(c.oid)                                                      AS total_bytes,
+       s.seq_scan, s.idx_scan
+FROM pg_stat_user_tables s
+JOIN pg_class c ON c.oid = s.relid;
+
+SELECT schemaname, relname, n_live_tup, n_dead_tup, dead_pct, autovacuum_trigger_at,
+       last_vacuumed IS NOT NULL AS vacuumed, xid_age, total_size
+FROM monitoring.table_health
+WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+ORDER BY n_dead_tup DESC, total_bytes DESC, schemaname, relname
+LIMIT 6;
+-- On a freshly cloned database the cumulative statistics start empty
+-- (n_live_tup = 0, never vacuumed): stats are per cluster, not copied by
+-- CREATE DATABASE ... TEMPLATE. ANALYZE or normal traffic fills them in.
+
+-- Database-level wraparound headroom (the number that pages DBAs at 3 am).
+CREATE OR REPLACE VIEW monitoring.xid_wraparound AS
+SELECT datname, age(datfrozenxid) AS xid_age,
+       round(100.0 * age(datfrozenxid) / 2147483647, 3) AS pct_of_hard_limit,
+       mxid_age(datminmxid) AS multixact_age
+FROM pg_database;
+
+SELECT * FROM monitoring.xid_wraparound WHERE datname = current_database();
+
+-- 6b. Exact-ish bloat for one table with pgstattuple_approx (visibility-map
+-- assisted, much cheaper than pgstattuple). Guarded on the extension.
+DO $$
+DECLARE r record;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgstattuple') THEN
+        SELECT * INTO r FROM pgstattuple_approx('mobility.sensor_readings'::regclass);
+        RAISE NOTICE 'sensor_readings: table_len=% approx_tuple_pct=% dead_tuple_pct=% approx_free_pct=%',
+            pg_size_pretty(r.table_len), round(r.approx_tuple_percent::numeric, 1),
+            round(r.dead_tuple_percent::numeric, 1), round(r.approx_free_percent::numeric, 1);
+    ELSE
+        RAISE NOTICE 'pgstattuple not installed; skipping bloat estimate';
+    END IF;
+END
+$$;
+
+-- -----------------------------------------------------------------------------
+-- 7. Replication: slots and standbys
+-- -----------------------------------------------------------------------------
+-- Teaches: an inactive replication slot pins WAL forever (disk fills). Watch
+-- retained WAL = current LSN - restart_lsn, and wal_status ('lost' = broken).
+-- pg_stat_replication shows lag per connected standby. Both are empty on a
+-- stand-alone lab server, which is the correct reading, not an error.
+\echo '== 7. Replication slots and standbys'
+CREATE OR REPLACE VIEW monitoring.replication_slots AS
+SELECT slot_name, slot_type, database, active, active_pid, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)                  AS retained_wal_bytes,
+       safe_wal_size
+FROM pg_replication_slots;
+
+CREATE OR REPLACE VIEW monitoring.replication_standbys AS
+SELECT application_name, client_addr, state, sync_state,
+       write_lag, flush_lag, replay_lag,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS replay_bytes_behind
+FROM pg_stat_replication;
+
+SELECT (SELECT count(*) FROM monitoring.replication_slots)                     AS slots,
+       (SELECT count(*) FROM monitoring.replication_slots WHERE NOT active)    AS inactive_slots,
+       (SELECT count(*) FROM monitoring.replication_standbys)                  AS standbys,
+       pg_is_in_recovery()                                                     AS is_standby;
+
+-- -----------------------------------------------------------------------------
+-- 8. Data freshness per base table relative to meta.as_of()
+-- -----------------------------------------------------------------------------
+-- Teaches: freshness SLAs as data. A config table says which timestamp column
+-- represents "arrival" and how often new rows are expected; a function builds
+-- one max() query per table with format('%I') (safe identifier quoting) and
+-- EXECUTE. Staleness is measured against meta.as_of(), the dataset's clock.
+-- In production you would compare against now().
+\echo '== 8. Data freshness'
+CREATE TABLE IF NOT EXISTS monitoring.freshness_sla (
+    table_name      regclass PRIMARY KEY,
+    ts_column       name     NOT NULL,
+    expected_every  interval NOT NULL,
+    note            text
 );
+INSERT INTO monitoring.freshness_sla (table_name, ts_column, expected_every, note) VALUES
+    ('mobility.sensor_readings',      'reading_time',     '1 hour',   'hourly sensor feed'),
+    ('mobility.station_inventory',    'recorded_at',      '1 hour',   'dock/vehicle counts'),
+    ('mobility.trip_segments',        'start_time',       '15 minutes','trip stream'),
+    ('commerce.orders',               'order_date',       '1 hour',   'order stream'),
+    ('commerce.payments',             'payment_date',     '1 hour',   'payment processor feed'),
+    ('documents.complaint_records',   'submitted_at',     '1 day',    '311 complaints'),
+    ('civics.permit_applications',    'application_date', '2 days',   'permit intake'),
+    ('civics.tax_payments',           'payment_date',     '7 days',   'tax ledger'),
+    ('civics.voting_records',         'voted_at',         '365 days', 'elections are rare by design')
+ON CONFLICT (table_name) DO UPDATE
+    SET ts_column = EXCLUDED.ts_column, expected_every = EXCLUDED.expected_every, note = EXCLUDED.note;
 
--- Live events for real-time processing
-CREATE TABLE realtime_monitoring.live_events (
-    event_id BIGSERIAL PRIMARY KEY,
-    stream_name TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    event_data JSONB NOT NULL,
-    event_timestamp TIMESTAMPTZ DEFAULT NOW(),
-    processed BOOLEAN DEFAULT FALSE,
-    processing_notes TEXT,
-    INDEX (stream_name, event_timestamp DESC),
-    INDEX (event_type, event_timestamp DESC),
-    INDEX (processed, event_timestamp DESC)
-);
-
--- Real-time metrics aggregates
-CREATE TABLE realtime_monitoring.metrics_snapshots (
-    snapshot_id BIGSERIAL PRIMARY KEY,
-    metric_category TEXT NOT NULL,
-    metric_name TEXT NOT NULL,
-    metric_value NUMERIC,
-    metric_metadata JSONB,
-    snapshot_timestamp TIMESTAMPTZ DEFAULT NOW(),
-    INDEX (metric_category, snapshot_timestamp DESC),
-    INDEX (metric_name, snapshot_timestamp DESC)
-);
-
--- Dashboard subscriptions for real-time updates
-CREATE TABLE realtime_monitoring.dashboard_subscriptions (
-    subscription_id BIGSERIAL PRIMARY KEY,
-    dashboard_name TEXT NOT NULL,
-    user_identifier TEXT, -- Session ID or user ID
-    subscribed_metrics TEXT[], -- Array of metric names to watch
-    notification_channel TEXT, -- NOTIFY channel to use
-    subscription_filters JSONB, -- Additional filtering criteria
-    last_activity TIMESTAMPTZ DEFAULT NOW(),
-    is_active BOOLEAN DEFAULT TRUE
-);
-
--- =============================================================================
--- REAL-TIME EVENT PROCESSING FUNCTIONS
--- =============================================================================
-
--- Process incoming real-time events
-CREATE OR REPLACE FUNCTION realtime_monitoring.process_live_event(
-    stream_name TEXT,
-    event_type TEXT,
-    event_data JSONB
-)
-RETURNS BIGINT AS $$
+CREATE OR REPLACE FUNCTION monitoring.data_freshness(ref timestamptz DEFAULT meta.as_of())
+RETURNS TABLE (table_name text, ts_column name, row_count bigint, latest timestamptz,
+               staleness interval, expected_every interval, status text)
+LANGUAGE plpgsql STABLE
+AS $$
 DECLARE
-    event_id BIGINT;
-    stream_config RECORD;
-    current_rate INTEGER;
-    notification_payload JSONB;
+    r record;
 BEGIN
-    -- Check if stream exists and is active
-    SELECT * INTO stream_config
-    FROM realtime_monitoring.event_streams
-    WHERE realtime_monitoring.event_streams.stream_name = process_live_event.stream_name
-    AND is_active = TRUE;
-
-    IF stream_config IS NULL THEN
-        RAISE EXCEPTION 'Stream % not found or inactive', stream_name;
-    END IF;
-
-    -- Check event type is supported
-    IF NOT (event_type = ANY(stream_config.event_types)) THEN
-        RAISE EXCEPTION 'Event type % not supported by stream %', event_type, stream_name;
-    END IF;
-
-    -- Check rate limiting
-    SELECT COUNT(*) INTO current_rate
-    FROM realtime_monitoring.live_events
-    WHERE realtime_monitoring.live_events.stream_name = process_live_event.stream_name
-    AND event_timestamp >= NOW() - INTERVAL '1 minute';
-
-    IF current_rate >= stream_config.max_events_per_minute THEN
-        RAISE EXCEPTION 'Rate limit exceeded for stream %', stream_name;
-    END IF;
-
-    -- Insert event
-    INSERT INTO realtime_monitoring.live_events (stream_name, event_type, event_data)
-    VALUES (stream_name, event_type, event_data)
-    RETURNING live_events.event_id INTO event_id;
-
-    -- Build notification payload
-    notification_payload := json_build_object(
-        'event_id', event_id,
-        'stream_name', stream_name,
-        'event_type', event_type,
-        'event_data', event_data,
-        'timestamp', NOW()
-    );
-
-    -- Send real-time notifications
-    PERFORM pg_notify('realtime_events', notification_payload::TEXT);
-    PERFORM pg_notify('stream_' || stream_name, notification_payload::TEXT);
-    PERFORM pg_notify('event_' || event_type, notification_payload::TEXT);
-
-    -- Process specific event types
-    CASE event_type
-        WHEN 'citizen_registration' THEN
-            PERFORM realtime_monitoring.update_population_metrics();
-        WHEN 'permit_application' THEN
-            PERFORM realtime_monitoring.update_permit_metrics();
-        WHEN 'order_placed' THEN
-            PERFORM realtime_monitoring.update_commerce_metrics();
-        WHEN 'system_alert' THEN
-            PERFORM realtime_monitoring.handle_system_alert(event_data);
-        WHEN 'quality_issue' THEN
-            PERFORM realtime_monitoring.handle_quality_alert(event_data);
-        ELSE
-            -- Generic event processing
-            NULL;
-    END CASE;
-
-    RETURN event_id;
-END;
-$ LANGUAGE plpgsql;
-
--- Update population metrics in real-time
-CREATE OR REPLACE FUNCTION realtime_monitoring.update_population_metrics()
-RETURNS VOID AS $
-DECLARE
-    active_count INTEGER;
-    new_registrations_today INTEGER;
-    snapshot_data JSONB;
-BEGIN
-    -- Calculate current metrics
-    SELECT COUNT(*) INTO active_count
-    FROM civics.citizens WHERE status = 'active';
-
-    SELECT COUNT(*) INTO new_registrations_today
-    FROM civics.citizens WHERE registered_date = CURRENT_DATE;
-
-    snapshot_data := json_build_object(
-        'active_citizens', active_count,
-        'new_today', new_registrations_today,
-        'updated_at', NOW()
-    );
-
-    -- Store snapshot
-    INSERT INTO realtime_monitoring.metrics_snapshots (
-        metric_category, metric_name, metric_value, metric_metadata
-    ) VALUES (
-        'population', 'active_citizens', active_count, snapshot_data
-    );
-
-    -- Send live update
-    PERFORM pg_notify('population_metrics', snapshot_data::TEXT);
-END;
-$ LANGUAGE plpgsql;
-
--- Update permit processing metrics
-CREATE OR REPLACE FUNCTION realtime_monitoring.update_permit_metrics()
-RETURNS VOID AS $
-DECLARE
-    pending_count INTEGER;
-    processed_today INTEGER;
-    avg_processing_time NUMERIC;
-    snapshot_data JSONB;
-BEGIN
-    SELECT COUNT(*) INTO pending_count
-    FROM civics.permit_applications WHERE status = 'pending';
-
-    SELECT COUNT(*) INTO processed_today
-    FROM civics.permit_applications
-    WHERE approved_date = CURRENT_DATE OR (status = 'rejected' AND last_updated::DATE = CURRENT_DATE);
-
-    SELECT AVG(EXTRACT(days FROM (approved_date - submitted_date))) INTO avg_processing_time
-    FROM civics.permit_applications
-    WHERE approved_date >= CURRENT_DATE - INTERVAL '30 days';
-
-    snapshot_data := json_build_object(
-        'pending_permits', pending_count,
-        'processed_today', processed_today,
-        'avg_processing_days', ROUND(avg_processing_time, 1),
-        'updated_at', NOW()
-    );
-
-    INSERT INTO realtime_monitoring.metrics_snapshots (
-        metric_category, metric_name, metric_value, metric_metadata
-    ) VALUES (
-        'permits', 'pending_permits', pending_count, snapshot_data
-    );
-
-    PERFORM pg_notify('permit_metrics', snapshot_data::TEXT);
-END;
-$ LANGUAGE plpgsql;
-
--- Update commerce metrics in real-time
-CREATE OR REPLACE FUNCTION realtime_monitoring.update_commerce_metrics()
-RETURNS VOID AS $
-DECLARE
-    daily_revenue NUMERIC;
-    daily_orders INTEGER;
-    active_merchants INTEGER;
-    snapshot_data JSONB;
-BEGIN
-    SELECT COALESCE(SUM(total_amount), 0), COUNT(*)
-    INTO daily_revenue, daily_orders
-    FROM commerce.orders WHERE order_date = CURRENT_DATE;
-
-    SELECT COUNT(*) INTO active_merchants
-    FROM commerce.merchants WHERE status = 'active';
-
-    snapshot_data := json_build_object(
-        'daily_revenue', daily_revenue,
-        'daily_orders', daily_orders,
-        'active_merchants', active_merchants,
-        'avg_order_value', CASE WHEN daily_orders > 0 THEN ROUND(daily_revenue / daily_orders, 2) ELSE 0 END,
-        'updated_at', NOW()
-    );
-
-    INSERT INTO realtime_monitoring.metrics_snapshots (
-        metric_category, metric_name, metric_value, metric_metadata
-    ) VALUES (
-        'commerce', 'daily_revenue', daily_revenue, snapshot_data
-    );
-
-    PERFORM pg_notify('commerce_metrics', snapshot_data::TEXT);
-END;
-$ LANGUAGE plpgsql;
-
--- =============================================================================
--- REAL-TIME ALERT PROCESSING
--- =============================================================================
-
--- Handle system alerts with escalation
-CREATE OR REPLACE FUNCTION realtime_monitoring.handle_system_alert(alert_data JSONB)
-RETURNS VOID AS $
-DECLARE
-    alert_severity TEXT;
-    alert_type TEXT;
-    escalation_needed BOOLEAN := FALSE;
-BEGIN
-    alert_severity := alert_data->>'severity';
-    alert_type := alert_data->>'alert_type';
-
-    -- Determine if escalation is needed
-    IF alert_severity IN ('critical', 'high') THEN
-        escalation_needed := TRUE;
-    END IF;
-
-    -- Send targeted notifications based on alert type
-    CASE alert_type
-        WHEN 'database_performance' THEN
-            PERFORM pg_notify('dba_alerts', alert_data::TEXT);
-        WHEN 'security_breach' THEN
-            PERFORM pg_notify('security_alerts', alert_data::TEXT);
-        WHEN 'service_outage' THEN
-            PERFORM pg_notify('ops_alerts', alert_data::TEXT);
-        ELSE
-            PERFORM pg_notify('general_alerts', alert_data::TEXT);
-    END CASE;
-
-    -- Escalation notifications
-    IF escalation_needed THEN
-        PERFORM pg_notify('escalation_alerts',
-            (alert_data || json_build_object('escalated_at', NOW()))::TEXT
-        );
-    END IF;
-END;
-$ LANGUAGE plpgsql;
-
--- Handle data quality alerts
-CREATE OR REPLACE FUNCTION realtime_monitoring.handle_quality_alert(alert_data JSONB)
-RETURNS VOID AS $
-BEGIN
-    -- Send to data quality monitoring channel
-    PERFORM pg_notify('data_quality_alerts', alert_data::TEXT);
-
-    -- If critical quality issue, also send to general alerts
-    IF (alert_data->>'severity') = 'critical' THEN
-        PERFORM pg_notify('general_alerts',
-            (alert_data || json_build_object('alert_source', 'data_quality'))::TEXT
-        );
-    END IF;
-END;
-$ LANGUAGE plpgsql;
-
--- =============================================================================
--- LIVE DASHBOARD VIEWS
--- =============================================================================
-
--- Real-time city operations dashboard
-CREATE OR REPLACE VIEW realtime_monitoring.live_city_dashboard AS
-WITH latest_snapshots AS (
-    SELECT DISTINCT ON (metric_category, metric_name)
-        metric_category,
-        metric_name,
-        metric_value,
-        metric_metadata,
-        snapshot_timestamp
-    FROM realtime_monitoring.metrics_snapshots
-    WHERE snapshot_timestamp >= NOW() - INTERVAL '1 hour'
-    ORDER BY metric_category, metric_name, snapshot_timestamp DESC
-),
-current_alerts AS (
-    SELECT
-        COUNT(*) as active_alerts,
-        COUNT(*) FILTER (WHERE event_data->>'severity' = 'critical') as critical_alerts,
-        COUNT(*) FILTER (WHERE event_data->>'severity' = 'high') as high_alerts
-    FROM realtime_monitoring.live_events
-    WHERE event_type = 'system_alert'
-    AND event_timestamp >= NOW() - INTERVAL '1 hour'
-    AND NOT processed
-),
-recent_activity AS (
-    SELECT
-        event_type,
-        COUNT(*) as event_count,
-        MAX(event_timestamp) as latest_event
-    FROM realtime_monitoring.live_events
-    WHERE event_timestamp >= NOW() - INTERVAL '15 minutes'
-    GROUP BY event_type
-)
-SELECT
-    'Population' as dashboard_section,
-    (SELECT metric_value FROM latest_snapshots WHERE metric_name = 'active_citizens') as current_value,
-    (SELECT (metric_metadata->>'new_today')::INTEGER FROM latest_snapshots WHERE metric_name = 'active_citizens') as daily_change,
-    (SELECT COUNT(*) FROM recent_activity WHERE event_type = 'citizen_registration') as recent_activity_count,
-    NOW() as last_updated
-
-UNION ALL
-
-SELECT
-    'Permits',
-    (SELECT metric_value FROM latest_snapshots WHERE metric_name = 'pending_permits'),
-    (SELECT (metric_metadata->>'processed_today')::INTEGER FROM latest_snapshots WHERE metric_name = 'pending_permits'),
-    (SELECT COUNT(*) FROM recent_activity WHERE event_type = 'permit_application'),
-    NOW()
-
-UNION ALL
-
-SELECT
-    'Commerce',
-    (SELECT metric_value FROM latest_snapshots WHERE metric_name = 'daily_revenue'),
-    (SELECT (metric_metadata->>'daily_orders')::INTEGER FROM latest_snapshots WHERE metric_name = 'daily_revenue'),
-    (SELECT COUNT(*) FROM recent_activity WHERE event_type = 'order_placed'),
-    NOW()
-
-UNION ALL
-
-SELECT
-    'System Health',
-    (SELECT active_alerts FROM current_alerts),
-    (SELECT critical_alerts FROM current_alerts),
-    (SELECT COUNT(*) FROM recent_activity WHERE event_type = 'system_alert'),
-    NOW();
-
--- Real-time service performance view
-CREATE OR REPLACE VIEW realtime_monitoring.live_service_performance AS
-WITH service_metrics AS (
-    SELECT
-        event_data->>'service_name' as service_name,
-        AVG((event_data->>'response_time_ms')::NUMERIC) as avg_response_time,
-        COUNT(*) as request_count,
-        COUNT(*) FILTER (WHERE (event_data->>'status_code')::INTEGER >= 400) as error_count,
-        MAX(event_timestamp) as latest_request
-    FROM realtime_monitoring.live_events
-    WHERE event_type = 'service_request'
-    AND event_timestamp >= NOW() - INTERVAL '5 minutes'
-    GROUP BY event_data->>'service_name'
-)
-SELECT
-    service_name,
-    ROUND(avg_response_time, 0) as avg_response_time_ms,
-    request_count,
-    error_count,
-    ROUND((request_count - error_count)::NUMERIC / NULLIF(request_count, 0) * 100, 2) as success_rate_percent,
-    CASE
-        WHEN avg_response_time > 2000 THEN 'SLOW'
-        WHEN error_count::NUMERIC / NULLIF(request_count, 0) > 0.05 THEN 'ERROR_PRONE'
-        ELSE 'HEALTHY'
-    END as service_status,
-    latest_request
-FROM service_metrics
-ORDER BY request_count DESC;
-
--- =============================================================================
--- REAL-TIME NOTIFICATION MANAGEMENT
--- =============================================================================
-
--- Subscribe to real-time dashboard updates
-CREATE OR REPLACE FUNCTION realtime_monitoring.subscribe_to_dashboard(
-    dashboard_name TEXT,
-    user_identifier TEXT,
-    metrics_to_watch TEXT[] DEFAULT NULL
-)
-RETURNS TEXT AS $
-DECLARE
-    notification_channel TEXT;
-    subscription_id BIGINT;
-BEGIN
-    -- Generate unique notification channel
-    notification_channel := 'dashboard_' || dashboard_name || '_' ||
-                          regexp_replace(user_identifier, '[^a-zA-Z0-9_]', '_', 'g');
-
-    -- Create or update subscription
-    INSERT INTO realtime_monitoring.dashboard_subscriptions (
-        dashboard_name, user_identifier, subscribed_metrics, notification_channel
-    ) VALUES (
-        dashboard_name, user_identifier, COALESCE(metrics_to_watch, ARRAY[]::TEXT[]), notification_channel
-    ) ON CONFLICT (dashboard_name, user_identifier)
-    DO UPDATE SET
-        subscribed_metrics = EXCLUDED.subscribed_metrics,
-        notification_channel = EXCLUDED.notification_channel,
-        last_activity = NOW(),
-        is_active = TRUE
-    RETURNING subscription_subscriptions.subscription_id INTO subscription_id;
-
-    -- Return the channel name for the client to listen on
-    RETURN notification_channel;
-END;
-$ LANGUAGE plpgsql;
-
--- Send targeted dashboard updates
-CREATE OR REPLACE FUNCTION realtime_monitoring.send_dashboard_update(
-    dashboard_name TEXT,
-    update_data JSONB
-)
-RETURNS INTEGER AS $
-DECLARE
-    subscription_record RECORD;
-    notifications_sent INTEGER := 0;
-    update_payload JSONB;
-BEGIN
-    update_payload := update_data || json_build_object(
-        'dashboard_name', dashboard_name,
-        'timestamp', NOW()
-    );
-
-    -- Send to all active subscribers of this dashboard
-    FOR subscription_record IN
-        SELECT notification_channel, subscribed_metrics
-        FROM realtime_monitoring.dashboard_subscriptions
-        WHERE realtime_monitoring.dashboard_subscriptions.dashboard_name = send_dashboard_update.dashboard_name
-        AND is_active = TRUE
-        AND last_activity >= NOW() - INTERVAL '1 hour' -- Only active sessions
+    FOR r IN SELECT f.table_name, f.ts_column, f.expected_every FROM monitoring.freshness_sla f ORDER BY f.table_name::text
     LOOP
-        -- Send notification
-        PERFORM pg_notify(subscription_record.notification_channel, update_payload::TEXT);
-        notifications_sent := notifications_sent + 1;
+        table_name := r.table_name::text;
+        ts_column  := r.ts_column;
+        expected_every := r.expected_every;
+        -- reltuples is a free estimate; count(*) on big tables is not free.
+        SELECT greatest(c.reltuples, 0)::bigint INTO row_count FROM pg_class c WHERE c.oid = r.table_name;
+        EXECUTE format('SELECT max(%I) FROM %s WHERE %I <= $1', r.ts_column, r.table_name, r.ts_column)
+            INTO latest USING ref;
+        staleness := ref - latest;
+        status := CASE WHEN latest IS NULL                         THEN 'EMPTY'
+                       WHEN staleness <= r.expected_every          THEN 'fresh'
+                       WHEN staleness <= 3 * r.expected_every      THEN 'late'
+                       ELSE 'STALE' END;
+        RETURN NEXT;
     END LOOP;
+END
+$$;
 
-    -- Also send to general dashboard channel
-    PERFORM pg_notify('dashboard_' || dashboard_name, update_payload::TEXT);
+CREATE OR REPLACE VIEW monitoring.data_freshness AS
+SELECT * FROM monitoring.data_freshness();
 
-    RETURN notifications_sent;
-END;
-$ LANGUAGE plpgsql;
+SELECT table_name, row_count, latest, staleness, expected_every, status
+FROM monitoring.data_freshness
+ORDER BY status DESC, table_name;
+-- Expected finding: the commerce feeds end ~3 days before as_of (the order
+-- generator's 52-week calendar stops on Sunday 2025-12-28), so orders and
+-- payments are flagged STALE. That is what a freshness check is for:
+-- it surfaces a feed gap that row counts alone would never show.
 
--- =============================================================================
--- AUTOMATED REAL-TIME TRIGGERS
--- =============================================================================
+-- -----------------------------------------------------------------------------
+-- 9. One-row health summary (traffic lights)
+-- -----------------------------------------------------------------------------
+-- Teaches: compose the views into a single row a dashboard tile or a
+-- Prometheus exporter query can scrape.
+\echo '== 9. Health summary'
+CREATE OR REPLACE VIEW monitoring.health_summary AS
+SELECT now()                                                                      AS checked_at,
+       (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend') AS client_sessions,
+       current_setting('max_connections')::int                                    AS max_connections,
+       (SELECT count(*) FROM monitoring.problem_sessions)                          AS problem_sessions,
+       (SELECT count(*) FROM monitoring.lock_waits)                                AS lock_waits,
+       (SELECT hit_pct FROM monitoring.cache_hit_ratio)                            AS cache_hit_pct,
+       (SELECT max(dead_pct) FROM monitoring.table_health WHERE n_live_tup > 1000) AS worst_dead_pct,
+       (SELECT max(xid_age)  FROM monitoring.xid_wraparound)                       AS max_db_xid_age,
+       (SELECT coalesce(sum(retained_wal_bytes) FILTER (WHERE NOT active), 0)
+          FROM monitoring.replication_slots)                                       AS inactive_slot_wal_bytes,
+       (SELECT count(*) FROM monitoring.data_freshness WHERE status IN ('STALE', 'EMPTY')) AS stale_tables,
+       CASE
+         WHEN (SELECT count(*) FROM monitoring.lock_waits) > 5
+           OR (SELECT max(xid_age) FROM monitoring.xid_wraparound) > 1000000000     THEN 'RED'
+         WHEN (SELECT count(*) FROM monitoring.problem_sessions) > 0
+           OR (SELECT count(*) FROM monitoring.data_freshness WHERE status IN ('STALE', 'EMPTY')) > 0
+           OR coalesce((SELECT hit_pct FROM monitoring.cache_hit_ratio), 100) < 95  THEN 'AMBER'
+         ELSE 'GREEN'
+       END                                                                        AS overall;
 
--- Trigger for real-time citizen events
-CREATE OR REPLACE FUNCTION realtime_monitoring.citizen_realtime_trigger()
-RETURNS TRIGGER AS $
+SELECT client_sessions, max_connections, problem_sessions, lock_waits, cache_hit_pct,
+       worst_dead_pct, inactive_slot_wal_bytes, stale_tables, overall
+FROM monitoring.health_summary;
+
+-- -----------------------------------------------------------------------------
+-- 10. Snapshots for trending, NOTIFY alerts, optional pg_cron schedule
+-- -----------------------------------------------------------------------------
+-- Teaches: statistics views are cumulative counters or point-in-time states;
+-- trends need periodic snapshots (here a small module-owned table). Alerts are
+-- pushed with pg_notify(channel, payload): any client that ran
+-- LISTEN monitoring_alerts receives the JSON payload when the transaction
+-- commits (psql prints it after the next command).
+\echo '== 10. Snapshots and alerts'
+CREATE TABLE IF NOT EXISTS monitoring.metric_snapshots (
+    snapshot_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    taken_at      timestamptz NOT NULL DEFAULT now(),   -- wall clock: this is a real event
+    metric        text NOT NULL,
+    value         numeric,
+    detail        jsonb
+);
+CREATE INDEX IF NOT EXISTS metric_snapshots_metric_time_idx ON monitoring.metric_snapshots (metric, taken_at DESC);
+
+CREATE OR REPLACE FUNCTION monitoring.capture_snapshot()
+RETURNS integer
+LANGUAGE plpgsql
+AS $$
 DECLARE
-    event_data JSONB;
+    h monitoring.health_summary%ROWTYPE;
+    n integer;
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        event_data := json_build_object(
-            'citizen_id', NEW.citizen_id,
-            'operation', 'registration',
-            'city', NEW.city,
-            'registration_date', NEW.registered_date
-        );
-
-        PERFORM realtime_monitoring.process_live_event(
-            'citizen_events', 'citizen_registration', event_data
-        );
+    SELECT * INTO h FROM monitoring.health_summary;
+    INSERT INTO monitoring.metric_snapshots (metric, value, detail)
+    VALUES ('client_sessions',  h.client_sessions,  NULL),
+           ('lock_waits',       h.lock_waits,       NULL),
+           ('cache_hit_pct',    h.cache_hit_pct,    NULL),
+           ('worst_dead_pct',   h.worst_dead_pct,   NULL),
+           ('stale_tables',     h.stale_tables,     NULL),
+           ('overall',          NULL,               jsonb_build_object('status', h.overall));
+    GET DIAGNOSTICS n = ROW_COUNT;
+    IF h.overall <> 'GREEN' THEN
+        PERFORM pg_notify('monitoring_alerts',
+                          jsonb_build_object('status', h.overall, 'lock_waits', h.lock_waits,
+                                             'problem_sessions', h.problem_sessions,
+                                             'stale_tables', h.stale_tables,
+                                             'at', h.checked_at)::text);
     END IF;
+    -- retention: keep 7 days of snapshots
+    DELETE FROM monitoring.metric_snapshots WHERE taken_at < now() - interval '7 days';
+    RETURN n;
+END
+$$;
 
-    RETURN COALESCE(NEW, OLD);
-END;
-$ LANGUAGE plpgsql;
+LISTEN monitoring_alerts;
+SELECT monitoring.capture_snapshot() AS metrics_captured;
+UNLISTEN monitoring_alerts;
 
--- Trigger for real-time permit events
-CREATE OR REPLACE FUNCTION realtime_monitoring.permit_realtime_trigger()
-RETURNS TRIGGER AS $
-DECLARE
-    event_data JSONB;
+SELECT metric, value, detail
+FROM monitoring.metric_snapshots
+WHERE taken_at = (SELECT max(taken_at) FROM monitoring.metric_snapshots)
+ORDER BY metric;
+
+-- Schedule every minute with pg_cron when it exists (only the 'polaris'
+-- database has it in this lab). Elsewhere: skip with a NOTICE.
+DO $$
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        event_data := json_build_object(
-            'application_id', NEW.application_id,
-            'operation', 'application_submitted',
-            'permit_type', NEW.permit_type,
-            'citizen_id', NEW.citizen_id,
-            'estimated_cost', NEW.estimated_cost
-        );
-
-        PERFORM realtime_monitoring.process_live_event(
-            'permit_events', 'permit_application', event_data
-        );
-
-    ELSIF TG_OP = 'UPDATE' AND OLD.status != NEW.status THEN
-        event_data := json_build_object(
-            'application_id', NEW.application_id,
-            'operation', 'status_change',
-            'old_status', OLD.status,
-            'new_status', NEW.status,
-            'permit_type', NEW.permit_type
-        );
-
-        PERFORM realtime_monitoring.process_live_event(
-            'permit_events', 'permit_status_change', event_data
-        );
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        EXECUTE $c$SELECT cron.schedule('monitoring_snapshot', '* * * * *',
+                                         'SELECT monitoring.capture_snapshot()')$c$;
+        RAISE NOTICE 'pg_cron job monitoring_snapshot scheduled (remove with cron.unschedule)';
+    ELSE
+        RAISE NOTICE 'pg_cron not installed in %; run SELECT monitoring.capture_snapshot() from an external scheduler', current_database();
     END IF;
-
-    RETURN COALESCE(NEW, OLD);
-END;
-$ LANGUAGE plpgsql;
-
--- Trigger for real-time order events
-CREATE OR REPLACE FUNCTION realtime_monitoring.order_realtime_trigger()
-RETURNS TRIGGER AS $
-DECLARE
-    event_data JSONB;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        event_data := json_build_object(
-            'order_id', NEW.order_id,
-            'operation', 'order_placed',
-            'merchant_id', NEW.merchant_id,
-            'customer_id', NEW.customer_citizen_id,
-            'total_amount', NEW.total_amount,
-            'order_date', NEW.order_date
-        );
-
-        PERFORM realtime_monitoring.process_live_event(
-            'commerce_events', 'order_placed', event_data
-        );
-    END IF;
-
-    RETURN COALESCE(NEW, OLD);
-END;
-$ LANGUAGE plpgsql;
-
--- Create triggers on main tables
-DROP TRIGGER IF EXISTS realtime_citizen_trigger ON civics.citizens;
-CREATE TRIGGER realtime_citizen_trigger
-    AFTER INSERT ON civics.citizens
-    FOR EACH ROW EXECUTE FUNCTION realtime_monitoring.citizen_realtime_trigger();
-
-DROP TRIGGER IF EXISTS realtime_permit_trigger ON civics.permit_applications;
-CREATE TRIGGER realtime_permit_trigger
-    AFTER INSERT OR UPDATE ON civics.permit_applications
-    FOR EACH ROW EXECUTE FUNCTION realtime_monitoring.permit_realtime_trigger();
-
-DROP TRIGGER IF EXISTS realtime_order_trigger ON commerce.orders;
-CREATE TRIGGER realtime_order_trigger
-    AFTER INSERT ON commerce.orders
-    FOR EACH ROW EXECUTE FUNCTION realtime_monitoring.order_realtime_trigger();
-
--- =============================================================================
--- MAINTENANCE AND CLEANUP
--- =============================================================================
-
--- Clean up old events and snapshots
-CREATE OR REPLACE FUNCTION realtime_monitoring.cleanup_old_events()
-RETURNS INTEGER AS $
-DECLARE
-    deleted_events INTEGER := 0;
-    deleted_snapshots INTEGER := 0;
-    stream_record RECORD;
-BEGIN
-    -- Clean up events based on stream retention policies
-    FOR stream_record IN
-        SELECT stream_name, retention_hours
-        FROM realtime_monitoring.event_streams
-        WHERE is_active = TRUE
-    LOOP
-        DELETE FROM realtime_monitoring.live_events
-        WHERE stream_name = stream_record.stream_name
-        AND event_timestamp < NOW() - (stream_record.retention_hours || ' hours')::INTERVAL;
-
-        GET DIAGNOSTICS deleted_events = deleted_events + ROW_COUNT;
-    END LOOP;
-
-    -- Clean up old metric snapshots (keep 7 days)
-    DELETE FROM realtime_monitoring.metrics_snapshots
-    WHERE snapshot_timestamp < NOW() - INTERVAL '7 days';
-
-    GET DIAGNOSTICS deleted_snapshots = ROW_COUNT;
-
-    -- Clean up inactive dashboard subscriptions
-    DELETE FROM realtime_monitoring.dashboard_subscriptions
-    WHERE last_activity < NOW() - INTERVAL '24 hours';
-
-    RETURN deleted_events + deleted_snapshots;
-END;
-$ LANGUAGE plpgsql;
-
--- =============================================================================
--- SETUP AND INITIALIZATION
--- =============================================================================
-
--- Initialize real-time monitoring streams
-CREATE OR REPLACE FUNCTION realtime_monitoring.setup_monitoring_streams()
-RETURNS TEXT AS $
-DECLARE
-    streams_created INTEGER := 0;
-BEGIN
-    -- Citizen events stream
-    INSERT INTO realtime_monitoring.event_streams (
-        stream_name, stream_description, event_types, retention_hours, max_events_per_minute
-    ) VALUES (
-        'citizen_events', 'Citizen registration and profile changes',
-        ARRAY['citizen_registration', 'citizen_update', 'citizen_deactivation'], 48, 500
-    ) ON CONFLICT (stream_name) DO NOTHING;
-    streams_created := streams_created + 1;
-
-    -- Permit events stream
-    INSERT INTO realtime_monitoring.event_streams (
-        stream_name, stream_description, event_types, retention_hours, max_events_per_minute
-    ) VALUES (
-        'permit_events', 'Permit applications and status changes',
-        ARRAY['permit_application', 'permit_status_change', 'permit_approval'], 72, 300
-    ) ON CONFLICT (stream_name) DO NOTHING;
-    streams_created := streams_created + 1;
-
-    -- Commerce events stream
-    INSERT INTO realtime_monitoring.event_streams (
-        stream_name, stream_description, event_types, retention_hours, max_events_per_minute
-    ) VALUES (
-        'commerce_events', 'Orders, payments, and merchant activity',
-        ARRAY['order_placed', 'order_updated', 'payment_processed'], 24, 1000
-    ) ON CONFLICT (stream_name) DO NOTHING;
-    streams_created := streams_created + 1;
-
-    -- System events stream
-    INSERT INTO realtime_monitoring.event_streams (
-        stream_name, stream_description, event_types, retention_hours, max_events_per_minute
-    ) VALUES (
-        'system_events', 'System alerts, performance metrics, and health checks',
-        ARRAY['system_alert', 'performance_metric', 'health_check', 'service_request'], 168, 2000
-    ) ON CONFLICT (stream_name) DO NOTHING;
-    streams_created := streams_created + 1;
-
-    -- Data quality events stream
-    INSERT INTO realtime_monitoring.event_streams (
-        stream_name, stream_description, event_types, retention_hours, max_events_per_minute
-    ) VALUES (
-        'quality_events', 'Data quality issues and resolution tracking',
-        ARRAY['quality_issue', 'quality_resolution', 'data_validation'], 120, 200
-    ) ON CONFLICT (stream_name) DO NOTHING;
-    streams_created := streams_created + 1;
-
-    RETURN 'Initialized ' || streams_created || ' real-time monitoring streams';
-END;
-$ LANGUAGE plpgsql;
-
--- Generate test events for demonstration
-CREATE OR REPLACE FUNCTION realtime_monitoring.generate_test_events()
-RETURNS TEXT AS $
-DECLARE
-    events_generated INTEGER := 0;
-BEGIN
-    -- Generate sample citizen registration event
-    PERFORM realtime_monitoring.process_live_event(
-        'citizen_events',
-        'citizen_registration',
-        json_build_object(
-            'citizen_id', 999999,
-            'operation', 'registration',
-            'city', 'Test City',
-            'registration_date', NOW()
-        )
-    );
-    events_generated := events_generated + 1;
-
-    -- Generate sample permit application event
-    PERFORM realtime_monitoring.process_live_event(
-        'permit_events',
-        'permit_application',
-        json_build_object(
-            'application_id', 888888,
-            'operation', 'application_submitted',
-            'permit_type', 'building',
-            'citizen_id', 999999,
-            'estimated_cost', 5000
-        )
-    );
-    events_generated := events_generated + 1;
-
-    -- Generate sample commerce event
-    PERFORM realtime_monitoring.process_live_event(
-        'commerce_events',
-        'order_placed',
-        json_build_object(
-            'order_id', 777777,
-            'operation', 'order_placed',
-            'merchant_id', 1,
-            'customer_id', 999999,
-            'total_amount', 99.99,
-            'order_date', NOW()
-        )
-    );
-    events_generated := events_generated + 1;
-
-    -- Generate sample system alert
-    PERFORM realtime_monitoring.process_live_event(
-        'system_events',
-        'system_alert',
-        json_build_object(
-            'alert_type', 'database_performance',
-            'severity', 'medium',
-            'message', 'Database query response time elevated',
-            'metric_value', 1200,
-            'threshold', 1000
-        )
-    );
-    events_generated := events_generated + 1;
-
-    RETURN 'Generated ' || events_generated || ' test events for real-time monitoring demonstration';
-END;
-$ LANGUAGE plpgsql;
+END
+$$;
