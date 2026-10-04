@@ -34,6 +34,7 @@ CREATE TABLE civics.citizens (
     city VARCHAR(100) NOT NULL DEFAULT 'Polaris City',
     state VARCHAR(2) NOT NULL DEFAULT 'TX',
     zip_code VARCHAR(10) NOT NULL,
+    home_geom GEOMETRY(Point, 4326), -- geocoded residence (synthetic), used by spatial modules
 
     -- System fields
     status civics.civic_status DEFAULT 'active' NOT NULL,

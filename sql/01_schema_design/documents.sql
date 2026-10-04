@@ -11,7 +11,7 @@ CREATE TYPE documents.document_type AS ENUM (
 );
 
 CREATE TYPE documents.document_status AS ENUM (
-    'draft', 'submitted', 'under_review', 'approved', 'published',
+    'draft', 'submitted', 'under_review', 'approved', 'resolved', 'published',
     'archived', 'rejected', 'expired'
 );
 
@@ -84,7 +84,7 @@ CREATE TABLE documents.policy_documents (
     policy_id BIGSERIAL PRIMARY KEY,
 
     -- Document identification
-    policy_number VARCHAR(50) UNIQUE NOT NULL,
+    policy_number VARCHAR(50) NOT NULL, -- unique per version: see uq_policy_number_version (module 02)
     title VARCHAR(500) NOT NULL,
     version VARCHAR(20) DEFAULT '1.0' NOT NULL,
 
@@ -158,7 +158,7 @@ CREATE INDEX idx_policies_tags ON documents.policy_documents USING GIN(tags);
 
 -- Validate complaint metadata structure
 CREATE OR REPLACE FUNCTION documents.validate_complaint_metadata(metadata_json JSONB)
-RETURNS BOOLEAN AS $
+RETURNS BOOLEAN AS $$
 BEGIN
     -- Check for required fields based on category
     IF metadata_json ? 'category' THEN
@@ -176,11 +176,11 @@ BEGIN
 
     RETURN true;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 -- Validate policy document content structure
 CREATE OR REPLACE FUNCTION documents.validate_policy_content(content_json JSONB)
-RETURNS BOOLEAN AS $
+RETURNS BOOLEAN AS $$
 BEGIN
     -- Ensure basic required structure
     RETURN (
@@ -189,7 +189,7 @@ BEGIN
         jsonb_typeof(content_json->'sections') = 'array'
     );
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 -- =============================================================================
 -- FULL-TEXT SEARCH SETUP
@@ -201,7 +201,7 @@ ADD COLUMN search_vector tsvector;
 
 -- Update search vector on insert/update
 CREATE OR REPLACE FUNCTION documents.update_complaint_search_vector()
-RETURNS TRIGGER AS $
+RETURNS TRIGGER AS $$
 BEGIN
     NEW.search_vector := to_tsvector('english',
         COALESCE(NEW.subject, '') || ' ' ||
@@ -211,7 +211,7 @@ BEGIN
     );
     RETURN NEW;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trg_complaint_search_vector
     BEFORE INSERT OR UPDATE ON documents.complaint_records
@@ -225,7 +225,7 @@ ALTER TABLE documents.policy_documents
 ADD COLUMN search_vector tsvector;
 
 CREATE OR REPLACE FUNCTION documents.update_policy_search_vector()
-RETURNS TRIGGER AS $
+RETURNS TRIGGER AS $$
 BEGIN
     NEW.search_vector := to_tsvector('english',
         COALESCE(NEW.title, '') || ' ' ||
@@ -235,7 +235,7 @@ BEGIN
     );
     RETURN NEW;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 CREATE TRIGGER trg_policy_search_vector
     BEFORE INSERT OR UPDATE ON documents.policy_documents
@@ -259,7 +259,7 @@ RETURNS TABLE(
     category VARCHAR(100),
     status documents.document_status,
     rank_score REAL
-) AS $
+) AS $$
 BEGIN
     RETURN QUERY
     SELECT
@@ -274,7 +274,7 @@ BEGIN
     ORDER BY rank_score DESC, c.submitted_at DESC
     LIMIT limit_count;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 -- Get complaint statistics by category
 CREATE OR REPLACE FUNCTION documents.complaint_stats_by_category()
@@ -284,7 +284,7 @@ RETURNS TABLE(
     resolved_complaints BIGINT,
     avg_resolution_days NUMERIC,
     resolution_rate_pct NUMERIC
-) AS $
+) AS $$
 BEGIN
     RETURN QUERY
     SELECT
@@ -297,4 +297,4 @@ BEGIN
     GROUP BY c.category
     ORDER BY total_complaints DESC;
 END;
-$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;

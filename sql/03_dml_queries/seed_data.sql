@@ -1,569 +1,1095 @@
 -- File: sql/03_dml_queries/seed_data.sql
--- Purpose: Deterministic inserts from /data directory for testing and demos
+-- Purpose: Deterministic, scalable synthetic city generator ("Polaris City").
+--
+-- Usage (psql variables, both optional):
+--   psql -v scale=1 -v seed=42 -f seed_data.sql
+--
+-- Design
+--   * Counter-based RNG. Every random draw is synth.u(entity_key, stream):
+--     a 53-bit uniform derived from hashint8extended(key, seed:stream).
+--     Output is identical regardless of plan shape, parallelism or row
+--     order, which plain random()/setseed() cannot guarantee.
+--   * Fixed reference instant. All timestamps are generated relative to
+--     meta.as_of() (2025-12-31 23:59:59 UTC), never now(), so every query
+--     in the curriculum returns the same answer on every machine.
+--   * Planted effects with known parameters (meta.planted_effects) and
+--     labelled anomalies (meta.ground_truth) make analytical modules
+--     verifiable: an estimator either recovers the planted value or not.
+--   * Linear scale factor. Row counts for people/transactions scale with
+--     :scale; geography (neighbourhoods, roads, stations) does not.
+--
+-- Row counts at scale = 1, seed = 42 (~420k rows, ~12 s on a laptop)
+--   citizens 10,000   merchants 500      orders 50,000   order items 112k
+--   payments 48.7k    trip segments 51.9k sensor readings 103k
+--   tax payments 25.8k votes 11.3k      permits 3,000   complaints 5,000
+--   POIs 600          road segments 1,067 stations 150   neighbourhoods 24
 
--- =============================================================================
--- TRIP SEGMENTS SEED DATA
--- =============================================================================
+\set ON_ERROR_STOP on
+\if :{?scale}
+\else
+    \set scale 1
+\endif
+\if :{?seed}
+\else
+    \set seed 42
+\endif
 
-INSERT INTO mobility.trip_segments (
-    trip_id, segment_order, user_id, trip_mode, start_time, end_time, duration_minutes,
-    start_latitude, start_longitude, end_latitude, end_longitude,
-    start_station_id, end_station_id, distance_km, fare_paid
-) VALUES
-('TRIP-001', 1, 1, 'bus', '2024-12-28 08:15:00', '2024-12-28 08:32:00', 17, 32.9850, -96.8050, 32.9830, -96.7850, 1, 2, 2.5, 2.50),
-('TRIP-002', 1, 2, 'cycling', '2024-12-28 09:00:00', '2024-12-28 09:25:00', 25, 32.9820, -96.7950, 32.9750, -96.8020, 3, 4, 3.2, 0.00),
-('TRIP-003', 1, 3, 'walking', '2024-12-28 17:30:00', '2024-12-28 17:45:00', 15, 32.9830, -96.7850, 32.9840, -96.8030, NULL, NULL, 1.8, 0.00),
-('TRIP-004', 1, 4, 'scooter', '2024-12-28 12:10:00', '2024-12-28 12:18:00', 8, 32.9825, -96.7825, 32.9820, -96.7950, 7, NULL, 1.2, 3.50),
-('TRIP-005', 1, 5, 'rail', '2024-12-28 07:45:00', '2024-12-28 08:15:00', 30, 32.9860, -96.8070, 32.9750, -96.8020, 6, NULL, 4.5, 4.75);
+SET client_min_messages = warning;
+SET max_parallel_workers_per_gather = 0;   -- not needed for determinism, keeps load cheap
+SET synchronous_commit = off;
 
--- =============================================================================
--- SENSOR READINGS SEED DATA
--- =============================================================================
+-- ===========================================================================
+-- 0. Generator utilities and provenance
+-- ===========================================================================
 
-INSERT INTO mobility.sensor_readings (
-    sensor_code, sensor_type, latitude, longitude, location_description,
-    reading_value, unit_of_measure, reading_time, data_quality_score
-) VALUES
-('TRAFFIC-001', 'traffic_counter', 32.9845, -96.8045, 'Main St & 1st Ave', 245, 'vehicles/hour', '2024-12-28 08:00:00', 0.95),
-('TRAFFIC-001', 'traffic_counter', 32.9845, -96.8045, 'Main St & 1st Ave', 180, 'vehicles/hour', '2024-12-28 12:00:00', 0.95),
-('AIR-002', 'air_quality', 32.9830, -96.7850, 'Tech Valley Station', 45, 'AQI', '2024-12-28 08:00:00', 0.90),
-('NOISE-003', 'noise', 32.9850, -96.8050, 'Downtown Transit Center', 68, 'dB', '2024-12-28 08:30:00', 0.88),
-('SPEED-004', 'speed', 32.9820, -96.7950, 'River Rd', 25, 'mph', '2024-12-28 09:15:00', 0.92),
-('WEATHER-005', 'weather', 32.9840, -96.8030, 'City Hall', 72, 'temperature_f', '2024-12-28 10:00:00', 0.98);
+DROP SCHEMA IF EXISTS synth CASCADE;
+CREATE SCHEMA synth;
+COMMENT ON SCHEMA synth IS 'Deterministic random-variate helpers used by the synthetic data generator';
 
--- =============================================================================
--- COMPLAINT RECORDS SEED DATA
--- =============================================================================
+CREATE SCHEMA IF NOT EXISTS meta;
+COMMENT ON SCHEMA meta IS 'Dataset provenance, planted effects and ground-truth labels';
 
-INSERT INTO documents.complaint_records (
-    reporter_citizen_id, complaint_number, subject, description, category,
-    priority_level, incident_address, incident_latitude, incident_longitude,
-    status, submitted_at, metadata
-) VALUES
-(1, 'COMP-2024-001', 'Pothole on Main Street', 'Large pothole causing damage to vehicles near 150 Main St', 'roads', 'high',
- '150 Main St', 32.9848, -96.8048, 'under_review', '2024-12-20 14:30:00',
- '{"hazard_type": "pothole", "severity": "high", "traffic_impact": true}'::jsonb),
+SELECT set_config('polaris.seed',  :'seed',  false) AS _seed \gset
+SELECT set_config('polaris.scale', :'scale', false) AS _scale \gset
 
-(2, 'COMP-2024-002', 'Noise complaint - construction', 'Early morning construction noise before 7 AM', 'noise', 'normal',
- '200 Oak Ave', 32.9835, -96.8025, 'resolved', '2024-12-15 06:45:00',
- '{"decibel_level": 85, "time_of_day": "06:30", "construction_type": "road_work"}'::jsonb),
+-- Uniform [0,1) from (key, stream). 53 bits of a 64-bit hash.
+CREATE FUNCTION synth.u(k bigint, stream int)
+RETURNS float8 LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT ((hashint8extended(k, current_setting('polaris.seed')::bigint * 1000003 + stream) >> 11)
+            & 9007199254740991)::float8 / 9007199254740992.0
+$$;
 
-(4, 'COMP-2024-003', 'Streetlight out', 'Streetlight has been out for 3 weeks on Garden Ave', 'utilities', 'normal',
- '180 Garden Ave', 32.9750, -96.8020, 'resolved', '2024-12-10 19:20:00',
- '{"utility_type": "lighting", "outage_duration": "21_days", "safety_concern": true}'::jsonb),
+-- Standard normal via Box-Muller on two independent streams.
+CREATE FUNCTION synth.z(k bigint, stream int)
+RETURNS float8 LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT sqrt(-2.0 * ln(1.0 - synth.u(k, stream)))
+         * cos(2.0 * pi() * synth.u(k, stream + 50000))
+$$;
 
-(6, 'COMP-2024-004', 'Illegal dumping', 'Someone dumped furniture behind the shopping center', 'trash', 'urgent',
- '350 Cedar Ln', 32.9765, -96.7985, 'submitted', '2024-12-27 16:15:00',
- '{"waste_type": "furniture", "estimated_volume": "large", "health_hazard": false}'::jsonb);
+-- Exponential with given mean.
+CREATE FUNCTION synth.exp(k bigint, stream int, mean float8)
+RETURNS float8 LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT -mean * ln(1.0 - synth.u(k, stream))
+$$;
 
--- =============================================================================
--- POLICY DOCUMENTS SEED DATA
--- =============================================================================
+-- Bounded power-law (Zipf-like) rank in 1..n with exponent s (s <> 1),
+-- by inverting the continuous CDF.
+CREATE FUNCTION synth.zipf(k bigint, stream int, n int, s float8)
+RETURNS int LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT least(n, greatest(1, floor(
+        power((power(n + 1.0, 1.0 - s) - 1.0) * synth.u(k, stream) + 1.0, 1.0 / (1.0 - s))
+    )::int))
+$$;
 
-INSERT INTO documents.policy_documents (
-    policy_number, title, version, document_content, department, policy_area,
-    status, effective_date, created_by, tags, keywords
-) VALUES
-('POL-2024-001', 'Noise Ordinance Regulations', '2.1',
- '{"title": "Noise Ordinance Regulations", "sections": [{"number": "1", "title": "General Provisions", "content": "This ordinance regulates noise levels within city limits."}, {"number": "2", "title": "Prohibited Activities", "content": "Construction noise before 7 AM or after 8 PM is prohibited."}], "effective_date": "2024-01-01"}'::jsonb,
- 'Code Enforcement', 'Public Safety', 'published', '2024-01-01', 1,
- ARRAY['noise', 'ordinance', 'construction', 'quiet_hours'], ARRAY['noise', 'decibel', 'construction', 'enforcement']),
+-- Weighted categorical choice: returns items[i] where cumulative weight
+-- first exceeds u * total.
+CREATE FUNCTION synth.pick(items text[], weights float8[], u float8)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT items[i]
+    FROM (
+        SELECT i, sum(weights[i]) OVER (ORDER BY i) AS c,
+               sum(weights[i]) OVER () AS t
+        FROM generate_subscripts(weights, 1) AS i
+    ) s
+    WHERE c > u * t
+    ORDER BY i
+    LIMIT 1
+$$;
 
-('POL-2024-002', 'Business License Requirements', '1.0',
- '{"title": "Business License Requirements", "sections": [{"number": "1", "title": "Application Process", "content": "All businesses must obtain proper licensing before operation."}, {"number": "2", "title": "Renewal Requirements", "content": "Licenses must be renewed annually by December 31st."}], "effective_date": "2024-07-01"}'::jsonb,
- 'Economic Development', 'Business Regulation', 'published', '2024-07-01', 3,
- ARRAY['business', 'license', 'permit', 'regulations'], ARRAY['business', 'license', 'permit', 'application']);
+CREATE FUNCTION synth.sigmoid(x float8)
+RETURNS float8 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT 1.0 / (1.0 + exp(-x)) $$;
 
--- =============================================================================
--- BUSINESS LICENSES SEED DATA
--- =============================================================================
+-- Provenance -----------------------------------------------------------------
+DROP TABLE IF EXISTS meta.dataset, meta.planted_effects, meta.ground_truth CASCADE;
 
-INSERT INTO commerce.business_licenses (
-    merchant_id, license_type, license_number, status, application_date,
-    issue_date, expiration_date, license_fee, fee_paid
-) VALUES
-(1, 'Food Service', 'FS-2024-001', 'active', '2024-01-05', '2024-01-15', '2024-12-31', 350.00, 350.00),
-(1, 'General Business', 'GB-2024-001', 'active', '2024-01-05', '2024-01-15', '2024-12-31', 150.00, 150.00),
-(2, 'General Business', 'GB-2024-002', 'active', '2024-02-01', '2024-02-10', '2024-12-31', 150.00, 150.00),
-(3, 'Food Service', 'FS-2024-003', 'active', '2024-01-20', '2024-02-01', '2024-12-31', 350.00, 350.00),
-(3, 'General Business', 'GB-2024-003', 'active', '2024-01-20', '2024-02-01', '2024-12-31', 150.00, 150.00),
-(4, 'General Business', 'GB-2024-004', 'active', '2024-03-01', '2024-03-10', '2024-12-31', 150.00, 150.00),
-(5, 'Medical Practice', 'MP-2024-005', 'active', '2024-01-10', '2024-01-25', '2024-12-31', 500.00, 500.00);
-
--- =============================================================================
--- STATION INVENTORY SEED DATA
--- =============================================================================
-
-INSERT INTO mobility.station_inventory (
-    station_id, available_count, in_use_count, maintenance_count, recorded_at
-) VALUES
-(3, 15, 3, 2, '2024-12-28 08:00:00'), -- Riverside Bike Share
-(3, 12, 6, 2, '2024-12-28 12:00:00'),
-(3, 18, 1, 1, '2024-12-28 18:00:00'),
-(4, 10, 4, 1, '2024-12-28 08:00:00'), -- Garden Heights Bikes
-(4, 8, 6, 1, '2024-12-28 12:00:00'),
-(4, 13, 2, 0, '2024-12-28 18:00:00'),
-(5, 6, 1, 1, '2024-12-28 08:00:00'), -- Downtown Charging Hub
-(5, 4, 3, 1, '2024-12-28 12:00:00'),
-(5, 7, 1, 0, '2024-12-28 18:00:00'),
-(7, 20, 4, 1, '2024-12-28 08:00:00'), -- Tech District Scooters
-(7, 15, 9, 1, '2024-12-28 12:00:00'),
-(7, 22, 2, 1, '2024-12-28 18:00:00');
-
--- =============================================================================
--- PAYMENTS SEED DATA
--- =============================================================================
-
-INSERT INTO commerce.payments (
-    order_id, payment_method, amount, status, transaction_id, processor, processed_at
-) VALUES
-(1, 'credit_card', 32.05, 'completed', 'txn_abc123', 'Stripe', '2024-12-01 12:32:00'),
-(2, 'credit_card', 45.43, 'completed', 'txn_def456', 'Stripe', '2024-12-01 18:47:00'),
-(3, 'bank_transfer', 1353.13, 'completed', 'txn_ghi789', 'ACH', '2024-12-02 10:20:00'),
-(4, 'debit_card', 73.45, 'completed', 'txn_jkl012', 'Square', '2024-12-02 16:22:00'),
-(5, 'cash', 157.29, 'completed', NULL, NULL, '2024-12-03 09:35:00'),
-(6, 'credit_card', 37.12, 'pending', 'txn_mno345', 'Stripe', NULL);
-
--- =============================================================================
--- VOTING RECORDS SEED DATA
--- =============================================================================
-
-INSERT INTO civics.voting_records (
-    citizen_id, election_name, election_date, vote_type, precinct, voting_method, voted_at
-) VALUES
-(1, '2024 Municipal Election', '2024-11-05', 'municipal', 'PCT-001', 'early', '2024-10-28 14:30:00'),
-(2, '2024 Municipal Election', '2024-11-05', 'municipal', 'PCT-001', 'in_person', '2024-11-05 10:15:00'),
-(3, '2024 Municipal Election', '2024-11-05', 'municipal', 'PCT-002', 'in_person', '2024-11-05 16:45:00'),
-(4, '2024 Municipal Election', '2024-11-05', 'municipal', 'PCT-001', 'mail', '2024-10-25 00:00:00'),
-(5, '2024 Municipal Election', '2024-11-05', 'municipal', 'PCT-002', 'early', '2024-10-30 11:20:00'),
-(6, '2024 Municipal Election', '2024-11-05', 'municipal', 'PCT-001', 'in_person', '2024-11-05 18:30:00'),
-(7, '2024 School Board Election', '2024-05-15', 'school_board', 'PCT-002', 'in_person', '2024-05-15 12:00:00'),
-(8, '2024 School Board Election', '2024-05-15', 'school_board', 'PCT-001', 'early', '2024-05-10 09:45:00');
-
--- =============================================================================
--- VERIFICATION QUERIES
--- =============================================================================
-
--- Count records in each table
-SELECT 'Citizens' as table_name, COUNT(*) as record_count FROM civics.citizens
-UNION ALL SELECT 'Merchants', COUNT(*) FROM commerce.merchants
-UNION ALL SELECT 'Orders', COUNT(*) FROM commerce.orders
-UNION ALL SELECT 'Order Items', COUNT(*) FROM commerce.order_items
-UNION ALL SELECT 'Permits', COUNT(*) FROM civics.permit_applications
-UNION ALL SELECT 'Tax Payments', COUNT(*) FROM civics.tax_payments
-UNION ALL SELECT 'Neighborhoods', COUNT(*) FROM geo.neighborhood_boundaries
-UNION ALL SELECT 'POIs', COUNT(*) FROM geo.points_of_interest
-UNION ALL SELECT 'Stations', COUNT(*) FROM mobility.stations
-UNION ALL SELECT 'Trip Segments', COUNT(*) FROM mobility.trip_segments
-UNION ALL SELECT 'Sensor Readings', COUNT(*) FROM mobility.sensor_readings
-UNION ALL SELECT 'Complaints', COUNT(*) FROM documents.complaint_records
-UNION ALL SELECT 'Policies', COUNT(*) FROM documents.policy_documents
-UNION ALL SELECT 'Business Licenses', COUNT(*) FROM commerce.business_licenses
-UNION ALL SELECT 'Station Inventory', COUNT(*) FROM mobility.station_inventory
-UNION ALL SELECT 'Payments', COUNT(*) FROM commerce.payments
-UNION ALL SELECT 'Voting Records', COUNT(*) FROM civics.voting_records
-ORDER BY table_name;
-
--- Sample data validation
-SELECT 'Data integrity check passed' as status
-WHERE (
-    -- Check foreign key relationships
-    (SELECT COUNT(*) FROM civics.permit_applications p
-     JOIN civics.citizens c ON p.citizen_id = c.citizen_id) =
-    (SELECT COUNT(*) FROM civics.permit_applications)
-    AND
-    (SELECT COUNT(*) FROM commerce.orders o
-     LEFT JOIN civics.citizens c ON o.customer_citizen_id = c.citizen_id) =
-    (SELECT COUNT(*) FROM commerce.orders)
-    AND
-    -- Check calculated totals match
-    (SELECT SUM(ABS(total_amount - (subtotal + tax_amount + tip_amount)))
-     FROM commerce.orders) < 0.01
+CREATE TABLE meta.dataset (
+    dataset_id        int PRIMARY KEY DEFAULT 1 CHECK (dataset_id = 1),
+    generator_version text        NOT NULL,
+    scale             numeric     NOT NULL,
+    seed              bigint      NOT NULL,
+    as_of             timestamptz NOT NULL,
+    server_version    text        NOT NULL,
+    generated_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+    generation_ms     numeric,
+    row_counts        jsonb
 );
+COMMENT ON TABLE meta.dataset IS
+'One row describing how the current dataset was produced. Cite scale, seed and generator_version when reporting results.';
 
--- ============================================================================
--- CITIZENS SEED DATA
--- =============================================================================
+INSERT INTO meta.dataset (generator_version, scale, seed, as_of, server_version)
+VALUES ('2.0.0', :'scale', :'seed', '2025-12-31 23:59:59+00', current_setting('server_version'));
 
-INSERT INTO civics.citizens (first_name, last_name, date_of_birth, email, phone, street_address, zip_code, ssn_hash) VALUES
-('John', 'Smith', '1985-03-15', 'john.smith@email.com', '214-555-0101', '123 Main St', '75032', encode(sha256('123456789'::bytea), 'hex')),
-('Jane', 'Doe', '1990-07-22', 'jane.doe@email.com', '214-555-0102', '456 Oak Ave', '75032', encode(sha256('987654321'::bytea), 'hex')),
-('Michael', 'Johnson', '1978-12-08', 'mike.johnson@email.com', '214-555-0103', '789 Pine St', '75087', encode(sha256('456789123'::bytea), 'hex')),
-('Sarah', 'Williams', '1992-05-30', 'sarah.williams@email.com', '214-555-0104', '321 Elm Dr', '75032', encode(sha256('789123456'::bytea), 'hex')),
-('David', 'Brown', '1983-09-14', 'david.brown@email.com', '469-555-0105', '654 Cedar Ln', '75087', encode(sha256('321654987'::bytea), 'hex')),
-('Lisa', 'Davis', '1987-11-03', 'lisa.davis@email.com', '469-555-0106', '987 Birch Rd', '75032', encode(sha256('654987321'::bytea), 'hex')),
-('Robert', 'Miller', '1975-01-27', 'robert.miller@email.com', '972-555-0107', '147 Maple Way', '75087', encode(sha256('147258369'::bytea), 'hex')),
-('Emily', 'Wilson', '1995-08-19', 'emily.wilson@email.com', '972-555-0108', '258 Willow Ct', '75032', encode(sha256('258369147'::bytea), 'hex')),
-('James', 'Moore', '1980-04-11', 'james.moore@email.com', '214-555-0109', '369 Spruce Ave', '75087', encode(sha256('369147258'::bytea), 'hex')),
-('Amanda', 'Taylor', '1988-06-25', 'amanda.taylor@email.com', '469-555-0110', '741 Ash Blvd', '75032', encode(sha256('741852963'::bytea), 'hex'));
+CREATE OR REPLACE FUNCTION meta.as_of()
+RETURNS timestamptz LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT as_of FROM meta.dataset WHERE dataset_id = 1
+$$;
+COMMENT ON FUNCTION meta.as_of() IS
+'Reference "now" of the synthetic dataset. Use instead of now()/CURRENT_DATE for reproducible results.';
 
--- =============================================================================
--- GEO SEED DATA (Neighborhoods)
--- =============================================================================
+CREATE TABLE meta.planted_effects (
+    effect      text PRIMARY KEY,
+    domain      text    NOT NULL,
+    parameter   text    NOT NULL,
+    true_value  numeric NOT NULL,
+    description text    NOT NULL
+);
+COMMENT ON TABLE meta.planted_effects IS
+'Known generative parameters. Analyses can be validated by recovering these values.';
+
+INSERT INTO meta.planted_effects VALUES
+ ('complaint_resolution_income_gradient', 'documents', 'log-multiplier per SD of neighbourhood income', -0.25,
+  'Resolution time = lognormal(base_by_category) * exp(-0.25 * income_z): lower-income neighbourhoods wait longer.'),
+ ('turnout_age_slope', 'civics', 'logit change per year of age', 0.035,
+  'P(vote) = sigmoid(-0.6 + 0.035*(age-45) + 0.40*income_z + election_effect).'),
+ ('turnout_income_slope', 'civics', 'logit change per SD of neighbourhood income', 0.40,
+  'See turnout_age_slope.'),
+ ('peak_hour_bus_delay_ratio', 'mobility', 'mean delay at peak / mean delay off-peak (bus, rail)', 3.0,
+  'Transit delay ~ Exponential(mean = 2 min off-peak, 6 min in 07-09 and 16-19 weekday peaks).'),
+ ('peak_hour_road_speed_factor', 'mobility', 'speed multiplier at weekday peak (car, bus, rideshare)', 0.70,
+  'Road modes travel 30% slower during weekday peaks.'),
+ ('merchant_popularity_zipf_exponent', 'commerce', 'Zipf exponent of orders per merchant', 1.10,
+  'Order-to-merchant assignment follows a bounded power law; merchant rank is a fixed permutation of merchant_id.'),
+ ('order_growth_exponent', 'commerce', 'week index = 52 * u^0.85', 0.85,
+  'Order volume grows over the year: density of week w is proportional to w^(1/0.85 - 1).'),
+ ('sensor_point_anomaly_rate', 'mobility', 'share of readings that are point anomalies (spike + dropout)', 0.006,
+  'Spikes (p=0.004) and dropouts to 0 with quality 0.25 (p=0.002); labelled in meta.ground_truth.'),
+ ('sensor_level_shift_windows', 'mobility', 'level-shift windows per sensor (6-24 h, value x1.4)', 3,
+  'Contextual anomalies: about 2% of readings fall inside a window; every reading inside is labelled level_shift.'),
+ ('order_amount_outlier_rate', 'commerce', 'share of orders with an injected 15-25x amount', 0.002,
+  'Labelled in meta.ground_truth with entity = commerce.orders.');
+
+-- Content fingerprint of every generated table, for reproducibility checks.
+-- Audit columns stamped at load time (created_at, updated_at, last_updated)
+-- and surrogate keys' sequence state are excluded; everything else must match
+-- bit-for-bit between two runs with the same scale and seed.
+CREATE OR REPLACE FUNCTION meta.fingerprint()
+RETURNS TABLE (table_name text, row_count bigint, content_md5 text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    t   record;
+    cols text;
+BEGIN
+    FOR t IN
+        SELECT c.oid, n.nspname, c.relname
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'p')
+          AND n.nspname IN ('civics','commerce','mobility','geo','documents','meta')
+          AND NOT c.relispartition
+          AND c.relname <> 'dataset'
+        ORDER BY 1
+    LOOP
+        SELECT string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum)
+          INTO cols
+        FROM pg_attribute a
+        WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
+          AND a.attname NOT IN ('created_at', 'updated_at', 'last_updated', 'search_vector');
+
+        RETURN QUERY EXECUTE format(
+            'SELECT %L::text, count(*), md5(coalesce(string_agg(r::text, %L ORDER BY r::text), %L))
+             FROM (SELECT ROW(%s) AS r FROM %I.%I) s',
+            t.nspname || '.' || t.relname, chr(10), '', cols, t.nspname, t.relname);
+    END LOOP;
+END
+$$;
+COMMENT ON FUNCTION meta.fingerprint() IS
+'Per-table row count and MD5 of row contents (excluding load-time audit columns). Equal fingerprints = identical dataset.';
+
+CREATE TABLE meta.ground_truth (
+    entity     text   NOT NULL,
+    entity_id  bigint NOT NULL,
+    label      text   NOT NULL,
+    detail     jsonb,
+    PRIMARY KEY (entity, entity_id, label)
+);
+COMMENT ON TABLE meta.ground_truth IS
+'Labelled anomalies injected by the generator, for precision/recall evaluation of detection methods.';
+
+-- ===========================================================================
+-- 1. Geography: 6 x 4 grid of neighbourhoods around 32.98 N, 96.80 W
+-- ===========================================================================
+
+TRUNCATE geo.neighborhood_boundaries, geo.points_of_interest, geo.road_segments,
+         civics.citizens, civics.permit_applications, civics.tax_payments, civics.voting_records,
+         commerce.merchants, commerce.business_licenses, commerce.orders, commerce.order_items, commerce.payments,
+         mobility.stations, mobility.station_inventory, mobility.trip_segments, mobility.sensor_readings,
+         documents.complaint_records, documents.policy_documents
+         RESTART IDENTITY CASCADE;
+
+CREATE TEMP TABLE nb_seed AS
+WITH names AS (
+    SELECT * FROM unnest(ARRAY[
+        'Founders Square','Civic Center','Market Row','Arts District','Station District','Medical Center',
+        'Riverside','Oak Hill','University Heights','Tech Valley','Cedar Grove','Industrial Flats',
+        'Northgate','Prairie Ridge','Bluebonnet','Cottonwood','Pecan Grove','Live Oak',
+        'Magnolia','Willow Creek','Spring Valley','Brookhaven','Westfield','Sunset Ridge'])
+         WITH ORDINALITY AS t(name, idx)
+)
+SELECT
+    n.idx::int                                  AS nb,
+    n.name,
+    ((n.idx - 1) % 6)::int                      AS col,
+    ((n.idx - 1) / 6)::int                      AS row,
+    -96.86 + ((n.idx - 1) % 6) * 0.02           AS x0,
+    32.948 + ((n.idx - 1) / 6) * 0.016          AS y0
+FROM names n;
+
+-- Latent socioeconomic surface: richer to the north-west, plus noise.
+ALTER TABLE nb_seed ADD COLUMN income_z float8, ADD COLUMN density float8, ADD COLUMN commercial float8;
+UPDATE nb_seed SET
+    income_z   = 0.45 * (row - 1.5) - 0.30 * (col - 2.5) + 0.6 * synth.z(nb, 1),
+    density    = exp(0.8 - 0.25 * abs(col - 2.5) - 0.20 * abs(row - 1.5) + 0.3 * synth.z(nb, 2)),
+    commercial = exp(1.2 - 0.45 * abs(col - 2.5) - 0.45 * abs(row - 1.0) + 0.3 * synth.z(nb, 3));
+-- standardise income_z so the planted effects are per-SD
+UPDATE nb_seed s SET income_z = (s.income_z - m.mu) / m.sd
+FROM (SELECT avg(income_z) mu, stddev_pop(income_z) sd FROM nb_seed) m;
 
 INSERT INTO geo.neighborhood_boundaries (
-    neighborhood_name, neighborhood_code,
-    boundary_geom, area_sq_km, population_estimate,
-    city_council_district, school_district
-) VALUES
-('Downtown Core', 'DTC',
- ST_GeomFromText('POLYGON((-96.8100 32.9900, -96.8000 32.9900, -96.8000 32.9800, -96.8100 32.9800, -96.8100 32.9900))', 4326),
- 0.85, 2500, 1, 'Polaris ISD'),
-('Riverside District', 'RSD',
- ST_GeomFromText('POLYGON((-96.8000 32.9900, -96.7900 32.9900, -96.7900 32.9800, -96.8000 32.9800, -96.8000 32.9900))', 4326),
- 1.20, 3200, 1, 'Polaris ISD'),
-('Tech Valley', 'TCV',
- ST_GeomFromText('POLYGON((-96.7900 32.9900, -96.7800 32.9900, -96.7800 32.9800, -96.7900 32.9800, -96.7900 32.9900))', 4326),
- 2.15, 4800, 2, 'North Polaris ISD'),
-('Garden Heights', 'GDH',
- ST_GeomFromText('POLYGON((-96.8100 32.9800, -96.8000 32.9800, -96.8000 32.9700, -96.8100 32.9700, -96.8100 32.9800))', 4326),
- 1.45, 2800, 3, 'Polaris ISD'),
-('Industrial Park', 'IDP',
- ST_GeomFromText('POLYGON((-96.8000 32.9800, -96.7900 32.9800, -96.7900 32.9700, -96.8000 32.9700, -96.8000 32.9800))', 4326),
- 1.80, 1200, 2, 'South Polaris ISD');
+    neighborhood_id, neighborhood_name, official_name, neighborhood_code, boundary_geom,
+    population_estimate, household_count, median_income, city_council_district, school_district,
+    police_beat, fire_district, zoning_primary, development_status, data_source, last_updated)
+OVERRIDING SYSTEM VALUE
+SELECT
+    nb, name, name || ' Neighborhood', 'NB' || lpad(nb::text, 2, '0'),
+    ST_MakeEnvelope(x0, y0, x0 + 0.02, y0 + 0.016, 4326),
+    0, 0,
+    round((58000 * exp(0.35 * income_z))::numeric, -2),
+    1 + (col / 2) + 3 * (row / 2),
+    'PISD-' || (1 + col / 3),
+    'B' || lpad(nb::text, 2, '0'),
+    'FD-' || (1 + (nb - 1) / 4),
+    CASE WHEN commercial > 2.4 THEN 'commercial' WHEN commercial > 1.4 THEN 'mixed_use'
+         WHEN name = 'Industrial Flats' THEN 'industrial' ELSE 'residential' END,
+    CASE WHEN synth.u(nb, 4) < 0.2 THEN 'developing' ELSE 'established' END,
+    'polaris-synthetic-v2', (meta.as_of())::date
+FROM nb_seed;
+SELECT setval(pg_get_serial_sequence('geo.neighborhood_boundaries', 'neighborhood_id'), 24) AS _sv \gset
 
--- =============================================================================
--- MERCHANTS SEED DATA
--- =============================================================================
+-- CDF tables used to sample neighbourhoods proportional to a weight.
+CREATE TEMP TABLE nb_cdf_pop AS
+SELECT nb, coalesce(lag(c) OVER (ORDER BY nb), 0) AS lo, c AS hi
+FROM (SELECT nb, sum(density) OVER (ORDER BY nb) / sum(density) OVER () AS c FROM nb_seed) s;
+UPDATE nb_cdf_pop SET hi = 1.0000001 WHERE nb = 24;
 
-INSERT INTO commerce.merchants (
-    business_name, legal_name, tax_id, owner_citizen_id,
-    contact_email, contact_phone, business_address, zip_code,
-    business_type, annual_revenue, employee_count
-) VALUES
-('Polaris Pizza Palace', 'PPP Restaurant Corp', '12-3456789', 1,
- 'orders@polarispizza.com', '214-555-2001', '101 Main St', '75032',
- 'restaurant', 850000.00, 12),
-('Tech Solutions Inc', 'Tech Solutions Incorporated', '98-7654321', 3,
- 'info@techsolutions.com', '469-555-2002', '500 Innovation Blvd', '75087',
- 'technology', 2400000.00, 35),
-('Green Grocers Market', 'Green Grocers LLC', '45-6789012', 5,
- 'hello@greengrocers.com', '972-555-2003', '200 Oak Ave', '75032',
- 'retail', 650000.00, 8),
-('City Hardware Store', 'City Hardware Co', '78-9012345', 7,
- 'sales@cityhardware.com', '214-555-2004', '350 Cedar Ln', '75087',
- 'retail', 480000.00, 6),
-('Wellness Medical Center', 'Wellness Medical PC', '34-5678901', 9,
- 'contact@wellnessmedical.com', '469-555-2005', '750 Health Way', '75032',
- 'healthcare', 1800000.00, 25);
+CREATE TEMP TABLE nb_cdf_com AS
+SELECT nb, coalesce(lag(c) OVER (ORDER BY nb), 0) AS lo, c AS hi
+FROM (SELECT nb, sum(commercial) OVER (ORDER BY nb) / sum(commercial) OVER () AS c FROM nb_seed) s;
+UPDATE nb_cdf_com SET hi = 1.0000001 WHERE nb = 24;
 
--- =============================================================================
--- MOBILITY STATIONS SEED DATA
--- =============================================================================
+-- Road network: regular grid, ~375 m x ~400 m blocks -------------------------
+INSERT INTO geo.road_segments (
+    road_name, road_type, address_range_start, address_range_end, zip_code_left, zip_code_right,
+    road_surface, lane_count, speed_limit, one_way, segment_geom, has_sidewalk, has_bike_lane,
+    has_street_lighting, maintenance_authority, construction_status, last_maintenance,
+    condition_rating, data_source)
+SELECT
+    road_name, road_type::geo.road_type, 100 * seg, 100 * seg + 98, NULL, NULL,
+    CASE WHEN road_type IN ('arterial','collector') THEN 'concrete' ELSE 'asphalt' END::geo.road_surface,
+    CASE road_type WHEN 'arterial' THEN 4 WHEN 'collector' THEN 2 ELSE 2 END,
+    CASE road_type WHEN 'arterial' THEN 45 WHEN 'collector' THEN 35 ELSE 25 END,
+    false,
+    geom,
+    road_type <> 'arterial' OR synth.u(k, 11) < 0.7,
+    road_type = 'collector' OR synth.u(k, 12) < 0.15,
+    road_type <> 'residential' OR synth.u(k, 13) < 0.6,
+    'Polaris City Public Works',
+    CASE WHEN synth.u(k, 14) < 0.03 THEN 'under_construction' ELSE 'complete' END,
+    (meta.as_of())::date - (synth.u(k, 15) * 1500)::int,
+    1 + floor(synth.u(k, 16) * 5)::int,
+    'polaris-synthetic-v2'
+FROM (
+    -- north-south avenues
+    SELECT 100000 + i * 100 + j AS k, j AS seg,
+           CASE WHEN i % 5 = 0 THEN 'arterial' WHEN i % 5 = 2 THEN 'collector' ELSE 'residential' END AS road_type,
+           (ARRAY['Elm','Maple','Pine','Birch','Cedar','Walnut','Hickory','Aspen','Juniper','Sycamore'])[1 + i % 10]
+             || ' ' || CASE WHEN i % 5 = 0 THEN 'Parkway' ELSE 'Avenue' END || ' ' || (i / 10 + 1) AS road_name,
+           ST_SetSRID(ST_MakeLine(ST_MakePoint(-96.86 + i * 0.004, 32.948 + j * 0.0036),
+                                  ST_MakePoint(-96.86 + i * 0.004, 32.948 + (j + 1) * 0.0036)), 4326) AS geom
+    FROM generate_series(0, 30) i, generate_series(0, 16) j
+    UNION ALL
+    -- east-west streets
+    SELECT 200000 + j * 100 + i, i,
+           CASE WHEN j % 4 = 0 THEN 'arterial' WHEN j % 4 = 2 THEN 'collector' ELSE 'residential' END,
+           (j + 1) || CASE (j + 1) % 10 WHEN 1 THEN 'st' WHEN 2 THEN 'nd' WHEN 3 THEN 'rd' ELSE 'th' END
+             || CASE WHEN j % 4 = 0 THEN ' Boulevard' ELSE ' Street' END,
+           ST_SetSRID(ST_MakeLine(ST_MakePoint(-96.86 + i * 0.004, 32.948 + j * 0.0036),
+                                  ST_MakePoint(-96.86 + (i + 1) * 0.004, 32.948 + j * 0.0036)), 4326)
+    FROM generate_series(0, 17) j, generate_series(0, 29) i
+) r
+ORDER BY r.k;
 
-INSERT INTO mobility.stations (
-    station_code, station_name, station_type, latitude, longitude,
-    address, neighborhood, total_capacity, accessible, operator
-) VALUES
-('BUS_001', 'Downtown Transit Center', 'bus', 32.9850, -96.8050, '150 Main St', 'Downtown Core', 6, true, 'Polaris Transit'),
-('BUS_002', 'Tech Valley Station', 'bus', 32.9830, -96.7850, '400 Innovation Blvd', 'Tech Valley', 4, true, 'Polaris Transit'),
-('BIKE_001', 'Riverside Bike Share', 'bike_share', 32.9820, -96.7950, '250 River Rd', 'Riverside District', 20, true, 'PolarisWheels'),
-('BIKE_002', 'Garden Heights Bikes', 'bike_share', 32.9750, -96.8020, '180 Garden Ave', 'Garden Heights', 15, true, 'PolarisWheels'),
-('EV_001', 'Downtown Charging Hub', 'ev_charging', 32.9840, -96.8030, '120 Electric Ave', 'Downtown Core', 8, true, 'ChargePolar'),
-('RAIL_001', 'Polaris Central Station', 'rail', 32.9860, -96.8070, '100 Railroad St', 'Downtown Core', 200, true, 'Metro Rail'),
-('SCOOT_001', 'Tech District Scooters', 'scooter', 32.9825, -96.7825, '450 Tech Pkwy', 'Tech Valley', 25, false, 'ScootPolar');
+UPDATE geo.road_segments r SET neighborhood_id = n.neighborhood_id,
+       zip_code_left = '75' || lpad((100 + n.neighborhood_id)::text, 3, '0'),
+       zip_code_right = '75' || lpad((100 + n.neighborhood_id)::text, 3, '0')
+FROM geo.neighborhood_boundaries n
+WHERE ST_Intersects(n.boundary_geom, ST_LineInterpolatePoint(r.segment_geom, 0.5));
 
--- =============================================================================
--- POINTS OF INTEREST SEED DATA
--- =============================================================================
+-- ===========================================================================
+-- 2. People
+-- ===========================================================================
 
-INSERT INTO geo.points_of_interest (
-    name, category, subcategory, phone, website, street_address, zip_code,
-    location_geom, business_hours, services_offered, average_rating
-) VALUES
-('Polaris City Hall', 'government', 'Municipal Building', '214-555-3001', 'https://polariscity.gov',
- '1 City Plaza', '75032', ST_SetSRID(ST_Point(-96.8040, 32.9855), 4326),
- '{"monday":{"open":"08:00","close":"17:00"},"tuesday":{"open":"08:00","close":"17:00"},"wednesday":{"open":"08:00","close":"17:00"},"thursday":{"open":"08:00","close":"17:00"},"friday":{"open":"08:00","close":"17:00"}}'::jsonb,
- ARRAY['Permits', 'Licenses', 'Tax Payments', 'Public Records'], 4.2),
+CREATE TEMP TABLE name_pool AS
+SELECT ARRAY['James','Mary','Robert','Patricia','John','Jennifer','Michael','Linda','David','Elizabeth',
+             'William','Barbara','Richard','Susan','Joseph','Jessica','Thomas','Sarah','Carlos','Karen',
+             'Daniel','Lisa','Matthew','Nancy','Anthony','Betty','Mark','Sandra','Luis','Ashley',
+             'Steven','Kimberly','Andrew','Emily','Jose','Donna','Kevin','Michelle','Brian','Carol',
+             'Wei','Amanda','Juan','Melissa','Priya','Deborah','Omar','Stephanie','Ahmed','Rebecca',
+             'Hiroshi','Laura','Ivan','Sharon','Kwame','Cynthia','Mateo','Fatima','Arjun','Mei'] AS first_names,
+       ARRAY['Smith','Johnson','Williams','Brown','Jones','Garcia','Miller','Davis','Rodriguez','Martinez',
+             'Hernandez','Lopez','Gonzalez','Wilson','Anderson','Thomas','Taylor','Moore','Jackson','Martin',
+             'Lee','Perez','Thompson','White','Harris','Sanchez','Clark','Ramirez','Lewis','Robinson',
+             'Walker','Young','Allen','King','Wright','Scott','Torres','Nguyen','Hill','Flores',
+             'Green','Adams','Nelson','Baker','Hall','Rivera','Campbell','Mitchell','Carter','Roberts',
+             'Patel','Kim','Chen','Singh','Okafor','Tanaka','Ivanova','Haddad','Kowalski','Mensah'] AS last_names,
+       ARRAY['Main','Oak','Park','Lake','Hill','River','Church','Mill','Spring','Ridge',
+             'Meadow','Forest','Sunset','Highland','Valley','Willow','Prairie','Mesa','Bluebonnet','Pecan'] AS streets,
+       ARRAY['St','Ave','Blvd','Dr','Ln','Ct','Way','Pl'] AS suffixes;
 
-('Central Library', 'library', 'Public Library', '214-555-3002', 'https://polarislibrary.org',
- '200 Knowledge St', '75032', ST_SetSRID(ST_Point(-96.8020, 32.9845), 4326),
- '{"monday":{"open":"09:00","close":"21:00"},"tuesday":{"open":"09:00","close":"21:00"},"wednesday":{"open":"09:00","close":"21:00"},"thursday":{"open":"09:00","close":"21:00"},"friday":{"open":"09:00","close":"18:00"},"saturday":{"open":"09:00","close":"17:00"},"sunday":{"open":"13:00","close":"17:00"}}'::jsonb,
- ARRAY['Books', 'Internet Access', 'Study Rooms', 'Events'], 4.7),
+-- Citizens ---------------------------------------------------------------------
+INSERT INTO civics.citizens (
+    first_name, last_name, date_of_birth, ssn_hash, email, phone, street_address, zip_code,
+    home_geom, status, registered_date, created_at, updated_at)
+SELECT
+    fn, ln,
+    (meta.as_of())::date - ((18 + 72 * power(synth.u(i, 102), 1.35)) * 365.25)::int,
+    encode(sha256(convert_to('citizen:' || i || ':' || current_setting('polaris.seed'), 'UTF8')), 'hex'),
+    lower(fn || '.' || ln || '.' || i || '@mail.polaris.example'),
+    '(972) 555-' || lpad((i % 10000)::text, 4, '0'),
+    (100 + floor(synth.u(i, 103) * 9800))::int || ' '
+        || np.streets[1 + floor(synth.u(i, 104) * 20)::int] || ' '
+        || np.suffixes[1 + floor(synth.u(i, 105) * 8)::int],
+    '75' || lpad((100 + c.nb)::text, 3, '0'),
+    ST_SetSRID(ST_MakePoint(s.x0 + 0.02 * synth.u(i, 106), s.y0 + 0.016 * synth.u(i, 107)), 4326),
+    synth.pick(ARRAY['active','inactive','suspended','deceased'], ARRAY[96, 2.5, 1, 0.5], synth.u(i, 108))::civics.civic_status,
+    meta.as_of() - make_interval(secs => synth.u(i, 109) * 10 * 365.25 * 86400),
+    meta.as_of() - make_interval(secs => synth.u(i, 109) * 10 * 365.25 * 86400),
+    meta.as_of() - make_interval(secs => synth.u(i, 109) * 2 * 365.25 * 86400)
+FROM generate_series(1, (10000 * :scale)::int) i
+CROSS JOIN name_pool np
+CROSS JOIN LATERAL (SELECT np.first_names[1 + floor(synth.u(i, 100) * 60)::int] AS fn,
+                           np.last_names [1 + floor(synth.u(i, 101) * 60)::int] AS ln) n
+JOIN nb_cdf_pop c ON synth.u(i, 110) >= c.lo AND synth.u(i, 110) < c.hi
+JOIN nb_seed s ON s.nb = c.nb
+ORDER BY i;
 
-('Riverside Park', 'park', 'Community Park', '214-555-3003', NULL,
- '300 River Rd', '75032', ST_SetSRID(ST_Point(-96.7940, 32.9815), 4326),
- '{"daily":{"open":"06:00","close":"22:00"}}'::jsonb,
- ARRAY['Playground', 'Walking Trails', 'Picnic Areas', 'Sports Courts'], 4.5),
+UPDATE geo.neighborhood_boundaries n SET
+    population_estimate = p.cnt,
+    household_count     = round(p.cnt / 2.45)
+FROM (SELECT ('1' || right(zip_code, 2))::int - 100 AS nb, count(*) AS cnt
+      FROM civics.citizens GROUP BY 1) p
+WHERE n.neighborhood_id = p.nb;
 
-('Memorial Hospital', 'hospital', 'General Hospital', '469-555-3004', 'https://memorialhospital.com',
- '500 Health Blvd', '75032', ST_SetSRID(ST_Point(-96.8000, 32.9770), 4326),
- '{"daily":{"open":"00:00","close":"23:59"}}'::jsonb,
- ARRAY['Emergency Care', 'Surgery', 'Maternity', 'Radiology'], 4.1),
+-- Fast lookups used by the remaining sections.
+CREATE TEMP TABLE cit AS
+SELECT c.citizen_id, ('1' || right(c.zip_code, 2))::int - 100 AS nb,
+       extract(year FROM age(meta.as_of(), c.date_of_birth))::int AS age_years,
+       s.income_z
+FROM civics.citizens c JOIN nb_seed s ON s.nb = ('1' || right(c.zip_code, 2))::int - 100;
+CREATE UNIQUE INDEX ON cit (citizen_id);
+ANALYZE cit;
 
-('Polaris Elementary School', 'school', 'Elementary', '972-555-3005', 'https://polariselem.edu',
- '400 Learning Lane', '75087', ST_SetSRID(ST_Point(-96.7880, 32.9820), 4326),
- '{"monday":{"open":"07:30","close":"15:30"},"tuesday":{"open":"07:30","close":"15:30"},"wednesday":{"open":"07:30","close":"15:30"},"thursday":{"open":"07:30","close":"15:30"},"friday":{"open":"07:30","close":"15:30"}}'::jsonb,
- ARRAY['K-5 Education', 'After School Care', 'Cafeteria'], 4.3);
-
--- =============================================================================
--- PERMIT APPLICATIONS SEED DATA
--- =============================================================================
+-- ===========================================================================
+-- 3. Civics: permits, taxes, votes
+-- ===========================================================================
 
 INSERT INTO civics.permit_applications (
-    citizen_id, permit_type, permit_number, description, property_address,
-    status, application_date, fee_amount, fee_paid
-) VALUES
-(1, 'building', 'BP-2024-001', 'Residential deck addition', '123 Main St', 'approved', '2024-01-15', 250.00, 250.00),
-(2, 'business', 'BZ-2024-002', 'Home bakery business license', '456 Oak Ave', 'approved', '2024-01-20', 150.00, 150.00),
-(3, 'building', 'BP-2024-003', 'Office renovation', '500 Innovation Blvd', 'approved', '2024-02-01', 800.00, 800.00),
-(4, 'event', 'EV-2024-004', 'Block party street closure', '321 Elm Dr', 'approved', '2024-03-10', 75.00, 75.00),
-(5, 'building', 'BP-2024-005', 'Commercial storefront update', '200 Oak Ave', 'under_review', '2024-12-01', 500.00, 500.00),
-(6, 'parking', 'PK-2024-006', 'Reserved parking space', '987 Birch Rd', 'pending', '2024-12-15', 100.00, 0.00);
+    citizen_id, permit_type, permit_number, description, property_address, parcel_id, status,
+    application_date, approval_date, expiration_date, fee_amount, fee_paid, created_at, updated_at)
+SELECT
+    cid, ptype::civics.permit_type,
+    'PRM-' || to_char(app, 'YYYY') || '-' || lpad(i::text, 6, '0'),
+    initcap(ptype) || ' permit: ' || (ARRAY['new construction','renovation','temporary structure','change of use',
+                                             'street closure','signage','outdoor seating','fence installation'])[1 + floor(synth.u(i, 205) * 8)::int],
+    (100 + floor(synth.u(i, 206) * 9800))::int || ' Permit Way',
+    'PCL-' || lpad(nb::text, 2, '0') || '-' || lpad(i::text, 6, '0'),
+    st::civics.permit_status,
+    app,
+    CASE WHEN st IN ('approved','expired','revoked') THEN app + make_interval(days => 1 + synth.exp(i, 207, 9)::int) END,
+    CASE WHEN st IN ('approved','expired','revoked')
+         THEN app + make_interval(days => 1 + synth.exp(i, 207, 9)::int)
+                  + CASE ptype WHEN 'event' THEN interval '14 days' WHEN 'parking' THEN interval '365 days'
+                               ELSE interval '180 days' END END,
+    fee, CASE WHEN st IN ('approved','expired','revoked') THEN fee ELSE 0 END,
+    app, app
+FROM (
+    SELECT i, c.citizen_id AS cid, c.nb,
+           synth.pick(ARRAY['building','business','event','parking','street'], ARRAY[35,20,20,15,10], synth.u(i, 201)) AS ptype,
+           meta.as_of() - make_interval(secs => synth.u(i, 202) * 3 * 365.25 * 86400) AS app,
+           synth.pick(ARRAY['approved','pending','denied','expired','revoked'], ARRAY[62,12,10,14,2], synth.u(i, 203)) AS st,
+           round((50 + synth.exp(i, 204, 250))::numeric, 2) AS fee
+    FROM generate_series(1, (3000 * :scale)::int) i
+    JOIN cit c ON c.citizen_id = 1 + floor(synth.u(i, 200) * (10000 * :scale))::bigint
+) p
+ORDER BY p.i;
+-- pending/expired permits must be consistent with as_of
+UPDATE civics.permit_applications SET status = 'expired'
+WHERE status = 'approved' AND expiration_date < meta.as_of();
 
--- =============================================================================
--- TAX PAYMENTS SEED DATA
--- =============================================================================
-
+-- Property (55% of residents) and vehicle (40%) tax, 2023-2025.
 INSERT INTO civics.tax_payments (
-    citizen_id, tax_type, tax_year, assessment_amount, amount_due, amount_paid,
-    payment_status, due_date, property_address, assessed_value, mill_rate
-) VALUES
-(1, 'property', 2024, 2850.00, 2850.00, 2850.00, 'paid', '2024-01-31', '123 Main St', 285000.00, 10.0000),
-(2, 'property', 2024, 3200.00, 3200.00, 3200.00, 'paid', '2024-01-31', '456 Oak Ave', 320000.00, 10.0000),
-(3, 'property', 2024, 4500.00, 4500.00, 4500.00, 'paid', '2024-01-31', '500 Innovation Blvd', 450000.00, 10.0000),
-(4, 'property', 2024, 2650.00, 2650.00, 2650.00, 'paid', '2024-01-31', '321 Elm Dr', 265000.00, 10.0000),
-(5, 'property', 2024, 3800.00, 3800.00, 2000.00, 'overdue', '2024-01-31', '654 Cedar Ln', 380000.00, 10.0000),
-(1, 'vehicle', 2024, 185.00, 185.00, 185.00, 'paid', '2024-03-15', NULL, NULL, NULL),
-(3, 'business', 2024, 750.00, 750.00, 750.00, 'paid', '2024-04-15', NULL, NULL, NULL);
+    citizen_id, tax_type, tax_year, assessment_amount, amount_due, amount_paid, payment_status,
+    due_date, payment_date, property_address, assessed_value, mill_rate, created_at, updated_at)
+SELECT
+    citizen_id, ttype::civics.tax_type, yr, assessed, due,
+    paid, pstatus::civics.payment_status, due_date,
+    CASE WHEN paid > 0 THEN (due_date - (synth.u(k, 306) * 40)::int)::timestamptz + interval '10 hours' END,
+    CASE WHEN ttype = 'property' THEN 'Parcel of citizen ' || citizen_id END,
+    CASE WHEN ttype = 'property' THEN assessed END,
+    mill, due_date - 90, due_date - 90
+FROM (
+    SELECT t.*, round(assessed * mill / 1000, 2) AS due,
+           CASE WHEN pay_u < 0.88 THEN round(assessed * mill / 1000, 2)
+                WHEN pay_u < 0.93 THEN round(assessed * mill / 1000 * 0.5, 2)
+                ELSE 0 END AS paid,
+           CASE WHEN pay_u < 0.88 THEN 'paid'
+                WHEN due_date > meta.as_of() THEN 'pending'
+                ELSE 'overdue' END AS pstatus
+    FROM (
+        SELECT c.citizen_id, tt.ttype, y.yr,
+               (c.citizen_id * 10 + tt.n) * 10000 + y.yr AS k,
+               make_date(y.yr + 1, 1, 31) AS due_date,
+               CASE tt.ttype
+                 WHEN 'property' THEN round((240000 * exp(0.35 * c.income_z + 0.30 * synth.z(c.citizen_id, 300)))::numeric, -2)
+                 ELSE round((9000 + 21000 * synth.u(c.citizen_id, 301))::numeric, -2) END AS assessed,
+               CASE tt.ttype WHEN 'property' THEN 21.5000 ELSE 9.7500 END::numeric AS mill,
+               synth.u((c.citizen_id * 10 + tt.n) * 10000 + y.yr, 305) AS pay_u
+        FROM cit c
+        CROSS JOIN (VALUES ('property', 1), ('vehicle', 2)) tt(ttype, n)
+        CROSS JOIN generate_series(2023, 2025) y(yr)
+        WHERE c.age_years >= 21
+          AND ((tt.ttype = 'property' AND synth.u(c.citizen_id, 302) < 0.55)
+            OR (tt.ttype = 'vehicle'  AND synth.u(c.citizen_id, 303) < 0.40))
+    ) t
+) t2
+ORDER BY t2.citizen_id, t2.ttype, t2.yr;
 
--- =============================================================================
--- ORDERS SEED DATA
--- =============================================================================
-
-INSERT INTO commerce.orders (
-    merchant_id, customer_citizen_id, order_number, order_date, status,
-    subtotal, tax_amount, tip_amount, total_amount, delivery_address
-) VALUES
-(1, 1, 'ORD-001', '2024-12-01 12:30:00', 'delivered', 24.99, 2.06, 5.00, 32.05, '123 Main St'),
-(1, 2, 'ORD-002', '2024-12-01 18:45:00', 'delivered', 35.50, 2.93, 7.00, 45.43, '456 Oak Ave'),
-(2, 3, 'ORD-003', '2024-12-02 10:15:00', 'completed', 1250.00, 103.13, 0.00, 1353.13, '500 Innovation Blvd'),
-(3, 4, 'ORD-004', '2024-12-02 16:20:00', 'delivered', 67.85, 5.60, 0.00, 73.45, '321 Elm Dr'),
-(4, 5, 'ORD-005', '2024-12-03 09:30:00', 'delivered', 145.30, 11.99, 0.00, 157.29, '654 Cedar Ln'),
-(1, 6, 'ORD-006', '2024-12-28 19:15:00', 'processing', 28.75, 2.37, 6.00, 37.12, '987 Birch Rd');
-
--- =============================================================================
--- ORDER ITEMS SEED DATA
--- =============================================================================
-
-INSERT INTO commerce.order_items (order_id, item_name, item_description, sku, unit_price, quantity, line_total) VALUES
-(1, 'Margherita Pizza', 'Fresh mozzarella, tomatoes, basil', 'PIZZA-MAR', 18.99, 1, 18.99),
-(1, 'Garlic Bread', 'Homemade garlic bread with herbs', 'SIDE-GAR', 5.99, 1, 5.99),
-(2, 'Pepperoni Pizza Large', 'Large pepperoni pizza', 'PIZZA-PEP-L', 22.99, 1, 22.99),
-(2, 'Caesar Salad', 'Fresh romaine, parmesan, croutons', 'SALAD-CAE', 12.50, 1, 12.50),
-(3, 'Website Development', 'Custom business website', 'WEB-DEV', 1250.00, 1, 1250.00),
-(4, 'Organic Vegetables', 'Weekly vegetable box', 'VEG-BOX', 35.50, 1, 35.50),
-(4, 'Fresh Fruit Selection', 'Seasonal fruit assortment', 'FRUIT-SEL', 32.35, 1, 32.35),
-(5, 'Power Drill Kit', 'Cordless drill with bits', 'TOOL-DRL-001', 89.99, 1, 89.99),
-(5, 'Paint Set', '1 gallon interior paint', 'PAINT-INT', 55.31, 1, 55.31),
-(6, 'Pepperoni Pizza Medium', 'Medium pepperoni pizza', 'PIZZA-PEP-M', 19.99, 1, 19.99),
-(6, 'Wings 12pc', '12 piece buffalo wings', 'WINGS-12', 8.75, 1, 8.75);
-
--- =============================================================================
--- ADDITIONAL ORDER ITEMS (to match existing orders)
--- =============================================================================
-
--- Additional items for existing orders to ensure realistic order totals
-INSERT INTO commerce.order_items (order_id, item_name, item_description, sku, unit_price, quantity, line_total) VALUES
--- Order 4 needs more items to reach $67.85 subtotal (currently at $67.85, perfect)
--- Order 5 needs adjustment to reach $145.30 subtotal (currently at $145.30, perfect)
-
--- Adding some missing seasonal/specialty items
-(3, 'Technical Consultation', '2 hours technical consulting', 'CONSULT-TECH', 75.00, 2, 150.00),
-(4, 'Organic Herbs', 'Fresh herb selection', 'HERB-ORGANIC', 12.99, 1, 12.99);
-
--- Update order 3 subtotal to account for additional consulting
-UPDATE commerce.orders SET subtotal = 1475.00, tax_amount = 121.75, total_amount = 1596.75 WHERE order_id = 3;
-
--- =============================================================================
--- ADDITIONAL CITIZENS (to have even 10 total)
--- =============================================================================
-
--- The file has 10 citizens, which is complete, but adding a few more for better testing
-INSERT INTO civics.citizens (first_name, last_name, date_of_birth, email, phone, street_address, zip_code, ssn_hash) VALUES
-('Christopher', 'Anderson', '1982-02-14', 'chris.anderson@email.com', '972-555-0111', '852 Poplar St', '75087', encode(sha256('852963741'::bytea), 'hex')),
-('Jessica', 'Thomas', '1991-10-07', 'jessica.thomas@email.com', '214-555-0112', '963 Hickory Ave', '75032', encode(sha256('963741852'::bytea), 'hex'));
-
--- =============================================================================
--- ADDITIONAL HISTORICAL DATA
--- =============================================================================
-
--- More sensor readings for trend analysis
-INSERT INTO mobility.sensor_readings (
-    sensor_code, sensor_type, latitude, longitude, location_description,
-    reading_value, unit_of_measure, reading_time, data_quality_score
-) VALUES
--- Traffic patterns throughout the day
-('TRAFFIC-001', 'traffic_counter', 32.9845, -96.8045, 'Main St & 1st Ave', 320, 'vehicles/hour', '2024-12-28 16:00:00', 0.94),
-('TRAFFIC-001', 'traffic_counter', 32.9845, -96.8045, 'Main St & 1st Ave', 145, 'vehicles/hour', '2024-12-28 20:00:00', 0.96),
-
--- Air quality throughout day
-('AIR-002', 'air_quality', 32.9830, -96.7850, 'Tech Valley Station', 52, 'AQI', '2024-12-28 12:00:00', 0.91),
-('AIR-002', 'air_quality', 32.9830, -96.7850, 'Tech Valley Station', 38, 'AQI', '2024-12-28 18:00:00', 0.93),
-
--- Weather data points
-('WEATHER-005', 'weather', 32.9840, -96.8030, 'City Hall', 68, 'temperature_f', '2024-12-28 06:00:00', 0.97),
-('WEATHER-005', 'weather', 32.9840, -96.8030, 'City Hall', 75, 'temperature_f', '2024-12-28 14:00:00', 0.98),
-('WEATHER-005', 'weather', 32.9840, -96.8030, 'City Hall', 71, 'temperature_f', '2024-12-28 18:00:00', 0.97);
-
--- =============================================================================
--- ADDITIONAL TRIP SEGMENTS (to show multi-modal trips)
--- =============================================================================
-
--- Multi-segment trips to demonstrate complex mobility patterns
-INSERT INTO mobility.trip_segments (
-    trip_id, segment_order, user_id, trip_mode, start_time, end_time, duration_minutes,
-    start_latitude, start_longitude, end_latitude, end_longitude,
-    start_station_id, end_station_id, distance_km, fare_paid
-) VALUES
--- Multi-modal trip: bus + walking
-('TRIP-006', 1, 6, 'bus', '2024-12-28 08:00:00', '2024-12-28 08:15:00', 15, 32.9860, -96.8070, 32.9850, -96.8050, 6, 1, 2.1, 2.50),
-('TRIP-006', 2, 6, 'walking', '2024-12-28 08:18:00', '2024-12-28 08:30:00', 12, 32.9850, -96.8050, 32.9845, -96.8020, NULL, NULL, 0.8, 0.00),
-
--- Another multi-modal: cycling + rail
-('TRIP-007', 1, 7, 'cycling', '2024-12-28 17:00:00', '2024-12-28 17:10:00', 10, 32.9750, -96.8020, 32.9830, -96.7950, 4, NULL, 1.5, 0.00),
-('TRIP-007', 2, 7, 'rail', '2024-12-28 17:15:00', '2024-12-28 17:45:00', 30, 32.9860, -96.8070, 32.9750, -96.8100, 6, NULL, 5.2, 4.75);
-
--- =============================================================================
--- ADDITIONAL POLICY DOCUMENTS
--- =============================================================================
-
-INSERT INTO documents.policy_documents (
-    policy_number, title, version, document_content, department, policy_area,
-    status, effective_date, created_by, tags, keywords
-) VALUES
-('POL-2024-003', 'Parking Enforcement Guidelines', '1.2',
- '{"title": "Parking Enforcement Guidelines", "sections": [{"number": "1", "title": "Violation Types", "content": "Standard parking violations include expired meters, no parking zones, and handicap violations."}, {"number": "2", "title": "Fine Schedule", "content": "Meter violations: $25, No parking zone: $50, Handicap violation: $200."}], "effective_date": "2024-03-01"}'::jsonb,
- 'Parking Services', 'Traffic Management', 'published', '2024-03-01', 2,
- ARRAY['parking', 'enforcement', 'fines', 'violations'], ARRAY['parking', 'meter', 'violation', 'fine']),
-
-('POL-2024-004', 'Public Wi-Fi Usage Policy', '1.0',
- '{"title": "Public Wi-Fi Usage Policy", "sections": [{"number": "1", "title": "Acceptable Use", "content": "Public Wi-Fi is provided for general internet access and city services."}, {"number": "2", "title": "Prohibited Activities", "content": "Illegal activities, bandwidth abuse, and commercial use are prohibited."}], "effective_date": "2024-06-01"}'::jsonb,
- 'IT Services', 'Public Services', 'published', '2024-06-01', 4,
- ARRAY['wifi', 'internet', 'public', 'acceptable_use'], ARRAY['wifi', 'internet', 'policy', 'usage']);
-
--- =============================================================================
--- ADDITIONAL VOTING RECORDS (for different elections)
--- =============================================================================
-
+-- Voting: logistic turnout with planted age and income slopes.
 INSERT INTO civics.voting_records (
-    citizen_id, election_name, election_date, vote_type, precinct, voting_method, voted_at
-) VALUES
--- 2024 Primary Elections
-(1, '2024 Primary Election', '2024-03-05', 'primary', 'PCT-001', 'early', '2024-02-28 16:20:00'),
-(3, '2024 Primary Election', '2024-03-05', 'primary', 'PCT-002', 'in_person', '2024-03-05 14:30:00'),
-(5, '2024 Primary Election', '2024-03-05', 'primary', 'PCT-002', 'mail', '2024-02-25 00:00:00'),
+    citizen_id, election_name, election_date, vote_type, precinct, ballot_style, voted_at, voting_method)
+SELECT
+    c.citizen_id, e.name, e.d, e.vt::civics.vote_type,
+    'PCT-' || lpad(c.nb::text, 3, '0'), 'BS-' || e.id || '-' || (1 + c.nb % 3),
+    e.d + make_interval(hours => 7 + floor(synth.u(c.citizen_id * 10 + e.id, 402) * 12)::int,
+                        mins => floor(synth.u(c.citizen_id * 10 + e.id, 403) * 60)::int),
+    synth.pick(ARRAY['in_person','early','mail'],
+               ARRAY[55, 30, 15 + greatest(0, c.age_years - 60)], synth.u(c.citizen_id * 10 + e.id, 404))
+FROM cit c
+CROSS JOIN (VALUES (1, 'Municipal General 2023', date '2023-05-06', 'municipal', -0.2),
+                   (2, 'Bond Referendum 2023',   date '2023-11-07', 'referendum', -0.9),
+                   (3, 'School Board 2024',      date '2024-05-04', 'school_board', -1.1),
+                   (4, 'Municipal General 2025', date '2025-05-03', 'municipal', 0.0)) e(id, name, d, vt, eff)
+WHERE c.age_years >= 18 + (extract(year FROM meta.as_of())::int - extract(year FROM e.d)::int)
+  AND synth.u(c.citizen_id * 10 + e.id, 401)
+      < synth.sigmoid(-0.6 + 0.035 * (c.age_years - 45) + 0.40 * c.income_z + e.eff)
+ORDER BY c.citizen_id, e.id;
 
--- Constitutional Amendment Election
-(2, '2024 Constitutional Amendment', '2024-09-15', 'constitutional', 'PCT-001', 'early', '2024-09-10 10:45:00'),
-(4, '2024 Constitutional Amendment', '2024-09-15', 'constitutional', 'PCT-001', 'in_person', '2024-09-15 11:30:00'),
-(6, '2024 Constitutional Amendment', '2024-09-15', 'constitutional', 'PCT-001', 'mail', '2024-09-08 00:00:00');
+-- ===========================================================================
+-- 4. Commerce
+-- ===========================================================================
 
--- =============================================================================
--- DATA CONSISTENCY FIXES
--- =============================================================================
-
--- Ensure all foreign key relationships are satisfied
--- Add any missing merchants referenced by orders
 INSERT INTO commerce.merchants (
-    business_name, legal_name, tax_id, owner_citizen_id,
-    contact_email, contact_phone, business_address, zip_code,
-    business_type, annual_revenue, employee_count
-) VALUES
-('Corner Pharmacy', 'Corner Pharmacy LLC', '56-7890123', 11,
- 'info@cornerpharmacy.com', '972-555-2006', '600 Wellness Dr', '75032',
- 'healthcare', 420000.00, 4)
-ON CONFLICT DO NOTHING;
-
--- =============================================================================
--- ADDITIONAL BUSINESS LICENSES (for completeness)
--- =============================================================================
+    business_name, legal_name, tax_id, owner_citizen_id, contact_email, contact_phone, business_address,
+    zip_code, business_type, industry_code, website, description, annual_revenue, employee_count,
+    is_active, registration_date, created_at, updated_at)
+SELECT
+    bname, bname || ' LLC', '75-' || lpad(i::text, 7, '0'),
+    1 + floor(synth.u(i, 501) * (10000 * :scale))::bigint,
+    'contact@merchant-' || i || '.polaris.example',
+    '(214) 555-' || lpad((i % 10000)::text, 4, '0'),
+    (100 + floor(synth.u(i, 502) * 9800))::int || ' Commerce St',
+    '75' || lpad((100 + c.nb)::text, 3, '0'),
+    btype::commerce.business_type,
+    CASE btype WHEN 'restaurant' THEN '722511' WHEN 'retail' THEN '445110' WHEN 'service' THEN '812111'
+               WHEN 'technology' THEN '541511' WHEN 'healthcare' THEN '621111' WHEN 'manufacturing' THEN '332710'
+               ELSE '999999' END,
+    'https://merchant-' || i || '.polaris.example',
+    initcap(btype) || ' business serving ' || s.name,
+    round(exp(12.6 + 1.1 * synth.z(i, 503))::numeric, 2),
+    greatest(1, round(exp(12.6 + 1.1 * synth.z(i, 503)) / 95000))::int,
+    synth.u(i, 504) < 0.92,
+    reg, reg, reg
+FROM generate_series(1, (500 * :scale)::int) i
+CROSS JOIN LATERAL (SELECT synth.pick(ARRAY['restaurant','retail','service','technology','healthcare','manufacturing','other'],
+                                      ARRAY[30,25,20,8,7,4,6], synth.u(i, 500)) AS btype,
+                           meta.as_of() - make_interval(secs => (0.5 + synth.u(i, 505) * 12) * 365.25 * 86400) AS reg) b
+CROSS JOIN LATERAL (SELECT (ARRAY['Lone Star','Polaris','Bluebonnet','Northgate','Riverside','Cedar','Golden','Prairie',
+                                  'Union','Main Street','Pioneer','Summit','Harbor','Liberty','Maple','Star'])[1 + floor(synth.u(i, 506) * 16)::int]
+                           || ' ' ||
+                           CASE b.btype WHEN 'restaurant' THEN (ARRAY['Kitchen','Grill','Cafe','Taqueria','Bistro','BBQ'])[1 + floor(synth.u(i, 507) * 6)::int]
+                                        WHEN 'retail' THEN (ARRAY['Market','Outfitters','Goods','Supply','Mercantile'])[1 + floor(synth.u(i, 507) * 5)::int]
+                                        WHEN 'service' THEN (ARRAY['Cleaners','Salon','Repair','Services'])[1 + floor(synth.u(i, 507) * 4)::int]
+                                        WHEN 'technology' THEN (ARRAY['Labs','Software','Systems','Analytics'])[1 + floor(synth.u(i, 507) * 4)::int]
+                                        WHEN 'healthcare' THEN (ARRAY['Clinic','Pharmacy','Dental','Health'])[1 + floor(synth.u(i, 507) * 4)::int]
+                                        WHEN 'manufacturing' THEN (ARRAY['Works','Fabrication','Industries'])[1 + floor(synth.u(i, 507) * 3)::int]
+                                        ELSE 'Co' END || ' #' || i AS bname) nm
+JOIN nb_cdf_com c ON synth.u(i, 508) >= c.lo AND synth.u(i, 508) < c.hi
+JOIN nb_seed s ON s.nb = c.nb
+ORDER BY i;
 
 INSERT INTO commerce.business_licenses (
-    merchant_id, license_type, license_number, status, application_date,
-    issue_date, expiration_date, license_fee, fee_paid
-) VALUES
--- Pharmacy license for new merchant
-(6, 'Pharmacy', 'PH-2024-006', 'active', '2024-01-15', '2024-02-01', '2024-12-31', 750.00, 750.00),
-(6, 'General Business', 'GB-2024-006', 'active', '2024-01-15', '2024-02-01', '2024-12-31', 150.00, 150.00),
+    merchant_id, license_type, license_number, status, application_date, issue_date, expiration_date,
+    renewal_date, license_fee, fee_paid, inspection_required, last_inspection_date, next_inspection_due)
+SELECT
+    m.merchant_id, lt.ltype, 'BL-' || lt.code || '-' || lpad(m.merchant_id::text, 6, '0'),
+    CASE WHEN iss + 365 > (meta.as_of())::date THEN 'active' ELSE 'expired' END::commerce.license_status,
+    iss - 14, iss, iss + 365, CASE WHEN iss + 365 > (meta.as_of())::date THEN iss + 335 END,
+    lt.fee, lt.fee, lt.inspect,
+    CASE WHEN lt.inspect THEN iss + (synth.u(m.merchant_id * 10 + lt.n, 602) * 200)::int END,
+    CASE WHEN lt.inspect THEN iss + 365 END
+FROM commerce.merchants m
+CROSS JOIN LATERAL (VALUES ('general_business', 'GB', 1, 150.00, false),
+                           ('food_service',     'FS', 2, 325.00, true),
+                           ('health_facility',  'HF', 3, 500.00, true)) lt(ltype, code, n, fee, inspect)
+CROSS JOIN LATERAL (SELECT (meta.as_of())::date
+                           - CASE WHEN synth.u(m.merchant_id * 10 + lt.n, 600) < 0.9
+                                  THEN (synth.u(m.merchant_id * 10 + lt.n, 601) * 330)::int
+                                  ELSE 400 + (synth.u(m.merchant_id * 10 + lt.n, 601) * 300)::int END AS iss) d
+WHERE lt.n = 1
+   OR (lt.n = 2 AND m.business_type = 'restaurant')
+   OR (lt.n = 3 AND m.business_type = 'healthcare')
+ORDER BY m.merchant_id, lt.n;
 
--- Renewal applications for next year
-(1, 'Food Service', 'FS-2025-001', 'pending', '2024-11-01', NULL, '2025-12-31', 375.00, 375.00),
-(2, 'General Business', 'GB-2025-002', 'under_review', '2024-10-15', NULL, '2025-12-31', 175.00, 175.00);
+-- Orders: Zipf merchant popularity, weekly + diurnal seasonality, growth.
+CREATE TEMP TABLE dow_cdf AS
+SELECT d, coalesce(lag(c) OVER (ORDER BY d), 0) lo, c hi FROM (
+  SELECT d, sum(w) OVER (ORDER BY d) / sum(w) OVER () c
+  FROM unnest(ARRAY[0.12,0.12,0.13,0.14,0.17,0.18,0.14]) WITH ORDINALITY t(w, d)) s;  -- Mon..Sun
+UPDATE dow_cdf SET hi = 1.0000001 WHERE d = 7;
 
--- =============================================================================
--- FINAL VERIFICATION AND SUMMARY
--- =============================================================================
+CREATE TEMP TABLE hour_cdf_orders AS
+SELECT h - 1 AS h, coalesce(lag(c) OVER (ORDER BY h), 0) lo, c hi FROM (
+  SELECT h, sum(w) OVER (ORDER BY h) / sum(w) OVER () c
+  FROM unnest(ARRAY[0.3,0.2,0.1,0.1,0.1,0.3,0.8,1.6,2.2,2.6,3.2,5.5,7.5,5.0,3.4,3.2,3.8,5.6,7.6,7.0,5.0,3.2,1.6,0.8])
+       WITH ORDINALITY t(w, h)) s;
+UPDATE hour_cdf_orders SET hi = 1.0000001 WHERE h = 23;
 
--- Enhanced verification query with more comprehensive checks
-SELECT 'FINAL DATA SUMMARY' as section, '' as details
-UNION ALL SELECT '==================', '===================='
-UNION ALL SELECT 'Citizens', CONCAT(COUNT(*), ' records') FROM civics.citizens
-UNION ALL SELECT 'Merchants', CONCAT(COUNT(*), ' records') FROM commerce.merchants
-UNION ALL SELECT 'Orders', CONCAT(COUNT(*), ' records') FROM commerce.orders
-UNION ALL SELECT 'Order Items', CONCAT(COUNT(*), ' records') FROM commerce.order_items
-UNION ALL SELECT 'Permits', CONCAT(COUNT(*), ' records') FROM civics.permit_applications
-UNION ALL SELECT 'Tax Payments', CONCAT(COUNT(*), ' records') FROM civics.tax_payments
-UNION ALL SELECT 'Neighborhoods', CONCAT(COUNT(*), ' records') FROM geo.neighborhood_boundaries
-UNION ALL SELECT 'POIs', CONCAT(COUNT(*), ' records') FROM geo.points_of_interest
-UNION ALL SELECT 'Stations', CONCAT(COUNT(*), ' records') FROM mobility.stations
-UNION ALL SELECT 'Trip Segments', CONCAT(COUNT(*), ' records') FROM mobility.trip_segments
-UNION ALL SELECT 'Sensor Readings', CONCAT(COUNT(*), ' records') FROM mobility.sensor_readings
-UNION ALL SELECT 'Complaints', CONCAT(COUNT(*), ' records') FROM documents.complaint_records
-UNION ALL SELECT 'Policies', CONCAT(COUNT(*), ' records') FROM documents.policy_documents
-UNION ALL SELECT 'Business Licenses', CONCAT(COUNT(*), ' records') FROM commerce.business_licenses
-UNION ALL SELECT 'Station Inventory', CONCAT(COUNT(*), ' records') FROM mobility.station_inventory
-UNION ALL SELECT 'Payments', CONCAT(COUNT(*), ' records') FROM commerce.payments
-UNION ALL SELECT 'Voting Records', CONCAT(COUNT(*), ' records') FROM civics.voting_records
-UNION ALL SELECT '', ''
-UNION ALL SELECT 'INTEGRITY CHECKS', '===================='
-UNION ALL SELECT 'Orphaned Orders',
-    CASE
-        WHEN COUNT(*) = 0 THEN 'PASS - No orphaned orders'
-        ELSE CONCAT('FAIL - ', COUNT(*), ' orders without valid customers')
-    END
+ALTER TABLE commerce.order_items DISABLE TRIGGER USER;
+
+CREATE TEMP TABLE ord AS
+SELECT
+    i AS order_id,
+    -- popularity rank -> merchant via a fixed permutation (7919 is prime)
+    1 + ((synth.zipf(i, 700, nm, 1.10) - 1)::bigint * 7919) % nm AS merchant_id,
+    1 + floor(synth.u(i, 701) * nc)::bigint AS customer_citizen_id,
+    date_trunc('week', meta.as_of() - interval '364 days')
+        + make_interval(weeks => floor(52 * power(synth.u(i, 702), 0.85))::int,
+                        days  => (dc.d - 1)::int,
+                        hours => hc.h::int,
+                        mins  => floor(synth.u(i, 705) * 60)::int,
+                        secs  => floor(synth.u(i, 706) * 60)) AS order_date,
+    synth.u(i, 707) < 0.002 AS is_outlier
+FROM generate_series(1, (50000 * :scale)::int) i
+CROSS JOIN (SELECT (500 * :scale)::int AS nm, (10000 * :scale)::int AS nc) n
+JOIN dow_cdf dc ON synth.u(i, 703) >= dc.lo AND synth.u(i, 703) < dc.hi
+JOIN hour_cdf_orders hc ON synth.u(i, 704) >= hc.lo AND synth.u(i, 704) < hc.hi;
+DELETE FROM ord WHERE order_date > meta.as_of();
+
+INSERT INTO commerce.orders (order_id, merchant_id, customer_citizen_id, order_number, order_date, status,
+                             delivery_address, created_at, updated_at)
+OVERRIDING SYSTEM VALUE
+SELECT o.order_id, o.merchant_id, o.customer_citizen_id,
+       'ORD-' || to_char(o.order_date, 'YYYYMMDD') || '-' || lpad(o.order_id::text, 7, '0'),
+       o.order_date,
+       CASE WHEN o.order_date > meta.as_of() - interval '1 day'
+            THEN synth.pick(ARRAY['pending','confirmed','processing'], ARRAY[3,3,4], synth.u(o.order_id, 710))
+            WHEN o.order_date > meta.as_of() - interval '4 days'
+            THEN synth.pick(ARRAY['shipped','delivered'], ARRAY[4,6], synth.u(o.order_id, 710))
+            ELSE synth.pick(ARRAY['delivered','cancelled','refunded'], ARRAY[94,4,2], synth.u(o.order_id, 710)) END::commerce.order_status,
+       CASE WHEN synth.u(o.order_id, 711) < 0.4 THEN (100 + floor(synth.u(o.order_id, 712) * 9800))::int || ' Delivery Ln' END,
+       o.order_date, o.order_date
+FROM ord o
+ORDER BY o.order_id;
+SELECT setval(pg_get_serial_sequence('commerce.orders', 'order_id'), (SELECT max(order_id) FROM commerce.orders)) AS _sv \gset
+
+INSERT INTO commerce.order_items (order_id, item_name, item_description, sku, unit_price, quantity, line_total, item_options, created_at)
+SELECT o.order_id, it.item_name, it.item_name || ' from merchant ' || o.merchant_id,
+       'SKU-' || o.merchant_id || '-' || it.n,
+       it.price, it.qty, it.price * it.qty,
+       CASE WHEN m.business_type = 'restaurant' THEN jsonb_build_object('spice', (ARRAY['mild','medium','hot'])[1 + it.n % 3]) END,
+       o.order_date
+FROM ord o
+JOIN commerce.merchants m ON m.merchant_id = o.merchant_id
+CROSS JOIN LATERAL generate_series(1, 1 + floor(power(synth.u(o.order_id, 720), 2) * 5)::int) AS li(n)
+CROSS JOIN LATERAL (
+    SELECT li.n,
+           (ARRAY['Standard item','Premium item','Combo','Accessory','Service fee','Seasonal special'])[1 + floor(synth.u(o.order_id * 10 + li.n, 721) * 6)::int] AS item_name,
+           round((CASE m.business_type WHEN 'restaurant' THEN exp(2.4 + 0.45 * synth.z(o.order_id * 10 + li.n, 722))
+                                       WHEN 'retail' THEN exp(3.0 + 0.70 * synth.z(o.order_id * 10 + li.n, 722))
+                                       WHEN 'technology' THEN exp(4.6 + 0.80 * synth.z(o.order_id * 10 + li.n, 722))
+                                       WHEN 'healthcare' THEN exp(4.0 + 0.60 * synth.z(o.order_id * 10 + li.n, 722))
+                                       ELSE exp(3.4 + 0.70 * synth.z(o.order_id * 10 + li.n, 722)) END
+                  * CASE WHEN o.is_outlier THEN 15 + 10 * synth.u(o.order_id, 723) ELSE 1 END)::numeric, 2) + 0.01 AS price,
+           1 + floor(power(synth.u(o.order_id * 10 + li.n, 724), 3) * 4)::int AS qty
+) it
+ORDER BY o.order_id, it.n;
+
+ALTER TABLE commerce.order_items ENABLE TRIGGER USER;
+
+UPDATE commerce.orders o SET
+    subtotal     = s.sub,
+    tax_amount   = round(s.sub * 0.0825, 2),
+    tip_amount   = CASE WHEN m.business_type = 'restaurant' THEN round(s.sub * (0.10 + 0.12 * synth.u(o.order_id, 730))::numeric, 2) ELSE 0 END,
+    total_amount = s.sub + round(s.sub * 0.0825, 2)
+                 + CASE WHEN m.business_type = 'restaurant' THEN round(s.sub * (0.10 + 0.12 * synth.u(o.order_id, 730))::numeric, 2) ELSE 0 END,
+    estimated_delivery = o.order_date + CASE WHEN m.business_type = 'restaurant' THEN interval '45 minutes' ELSE interval '3 days' END,
+    actual_delivery = CASE WHEN o.status = 'delivered' THEN
+        o.order_date + CASE WHEN m.business_type = 'restaurant'
+                            THEN make_interval(mins => (20 + synth.exp(o.order_id, 731, 25))::int)
+                            ELSE make_interval(hours => (24 + synth.exp(o.order_id, 731, 48))::int) END END
+FROM (SELECT order_id, sum(line_total) sub FROM commerce.order_items GROUP BY order_id) s,
+     commerce.merchants m
+WHERE s.order_id = o.order_id AND m.merchant_id = o.merchant_id;
+
+INSERT INTO meta.ground_truth (entity, entity_id, label, detail)
+SELECT 'commerce.orders', order_id, 'order_amount_outlier', jsonb_build_object('multiplier_range', '15-25')
+FROM ord WHERE is_outlier AND order_id IN (SELECT order_id FROM commerce.orders);
+
+INSERT INTO commerce.payments (order_id, payment_method, amount, status, transaction_id, processor, payment_date,
+                               processed_at, reference_number, receipt_number, processor_response, failure_reason, created_at)
+SELECT o.order_id, pm::commerce.payment_method, o.total_amount, ps::commerce.payment_status,
+       'TXN-' || lpad(o.order_id::text, 9, '0') || '-' || p.attempt,
+       CASE WHEN pm IN ('credit_card','debit_card','digital_wallet') THEN 'StripeLike' WHEN pm = 'bank_transfer' THEN 'ACH' ELSE 'in_store' END,
+       o.order_date + make_interval(secs => p.attempt * 30),
+       CASE WHEN ps IN ('completed','refunded') THEN o.order_date + make_interval(secs => p.attempt * 30 + 2) END,
+       'REF-' || o.order_id || '-' || p.attempt,
+       CASE WHEN ps = 'completed' THEN 'RCPT-' || o.order_id END,
+       jsonb_build_object('code', CASE WHEN ps = 'failed' THEN 'card_declined' ELSE 'approved' END, 'latency_ms', 80 + floor(synth.exp(o.order_id * 10 + p.attempt, 742, 120))),
+       CASE WHEN ps = 'failed' THEN 'Card declined by issuer' END,
+       o.order_date
 FROM commerce.orders o
-LEFT JOIN civics.citizens c ON o.customer_citizen_id = c.citizen_id
-WHERE c.citizen_id IS NULL
-UNION ALL SELECT 'Order Totals',
-    CASE
-        WHEN COUNT(*) = 0 THEN 'PASS - All order totals calculated correctly'
-        ELSE CONCAT('FAIL - ', COUNT(*), ' orders with incorrect totals')
-    END
-FROM commerce.orders
-WHERE ABS(total_amount - (subtotal + tax_amount + tip_amount)) > 0.01
-ORDER BY section DESC, details;
+CROSS JOIN LATERAL (
+    SELECT a AS attempt,
+           synth.pick(ARRAY['credit_card','debit_card','digital_wallet','cash','bank_transfer','check'],
+                      ARRAY[45,25,18,8,3,1], synth.u(o.order_id, 740)) AS pm,
+           CASE WHEN a = 1 AND synth.u(o.order_id, 741) < 0.015 THEN 'failed'
+                WHEN o.status = 'refunded' THEN 'refunded'
+                WHEN o.status IN ('pending') THEN 'pending'
+                ELSE 'completed' END AS ps
+    FROM generate_series(1, 2) a
+) p
+WHERE o.status <> 'cancelled' AND o.total_amount > 0
+  AND (p.attempt = 1 OR synth.u(o.order_id, 741) < 0.015)
+ORDER BY o.order_id, p.attempt;
 
--- =============================================================================
--- PERFORMANCE INDEXES (RECOMMENDED)
--- =============================================================================
+-- ===========================================================================
+-- 5. Mobility
+-- ===========================================================================
 
--- Create indexes for common query patterns (commented for reference)
-/*
--- Citizen lookups
-CREATE INDEX CONCURRENTLY idx_citizens_email ON civics.citizens(email);
-CREATE INDEX CONCURRENTLY idx_citizens_phone ON civics.citizens(phone);
+INSERT INTO mobility.stations (station_code, station_name, station_type, latitude, longitude, address, neighborhood,
+                               total_capacity, accessible, covered, lighting, status, operator, installation_date,
+                               last_maintenance, next_maintenance_due, amenities)
+SELECT
+    upper(left(t.stype, 3)) || '-' || lpad(g.n::text, 3, '0'),
+    s.name || ' ' || initcap(replace(t.stype, '_', ' ')) || ' ' || g.n,
+    t.stype::mobility.station_type,
+    round(lat::numeric, 6), round(lng::numeric, 6),
+    (100 + g.n * 7) || ' Transit Way', s.name,
+    t.cap, synth.u(k, 802) < 0.85, synth.u(k, 803) < 0.5, synth.u(k, 804) < 0.9,
+    synth.pick(ARRAY['active','maintenance','offline'], ARRAY[94,4,2], synth.u(k, 805))::mobility.station_status,
+    t.op, (meta.as_of())::date - (365 + synth.u(k, 806) * 3000)::int,
+    (meta.as_of())::date - (synth.u(k, 807) * 120)::int,
+    (meta.as_of())::date + (synth.u(k, 808) * 120)::int,
+    jsonb_build_object('bench', synth.u(k, 809) < 0.7, 'shelter', synth.u(k, 803) < 0.5, 'realtime_display', synth.u(k, 810) < 0.4)
+FROM (VALUES (1,'bus',60,40,'Polaris Transit'), (2,'rail',12,400,'Polaris Transit'), (3,'bike_share',40,20,'PolarisBike'),
+             (4,'scooter',20,30,'ScootCo'), (5,'park_ride',8,250,'Polaris Transit'), (6,'ev_charging',10,8,'ChargeTX')) t(tn, stype, cnt, cap, op)
+CROSS JOIN LATERAL generate_series(1, t.cnt) g(n)
+CROSS JOIN LATERAL (SELECT t.tn * 1000 + g.n AS k) kk
+JOIN nb_cdf_com c ON synth.u(k, 800) >= c.lo AND synth.u(k, 800) < c.hi
+JOIN nb_seed s ON s.nb = c.nb
+CROSS JOIN LATERAL (
+    SELECT CASE WHEN t.stype = 'rail' THEN 32.948 + 0.032 + 0.0005 * synth.z(k, 811)   -- east-west rail corridor
+                ELSE s.y0 + 0.016 * synth.u(k, 811) END AS lat,
+           CASE WHEN t.stype = 'rail' THEN -96.855 + 0.11 * (g.n - 1) / 11.0
+                ELSE s.x0 + 0.02 * synth.u(k, 812) END AS lng
+) xy
+ORDER BY t.tn, g.n;
 
--- Geographic queries
-CREATE INDEX CONCURRENTLY idx_poi_location ON geo.points_of_interest USING GIST(location_geom);
-CREATE INDEX CONCURRENTLY idx_neighborhoods_boundary ON geo.neighborhood_boundaries USING GIST(boundary_geom);
+CREATE TEMP TABLE st_range AS
+SELECT station_type::text AS stype, min(station_id) AS lo, count(*) AS n FROM mobility.stations GROUP BY 1;
 
--- Temporal queries
-CREATE INDEX CONCURRENTLY idx_orders_date ON commerce.orders(order_date);
-CREATE INDEX CONCURRENTLY idx_sensor_readings_time ON mobility.sensor_readings(reading_time);
-CREATE INDEX CONCURRENTLY idx_trip_segments_time ON mobility.trip_segments(start_time, end_time);
+-- Hourly inventory snapshots for shared-micromobility docks, last 30 days.
+INSERT INTO mobility.station_inventory (station_id, available_count, in_use_count, maintenance_count, recorded_at, inventory_details)
+SELECT st.station_id, avail, greatest(0, st.total_capacity - avail - maint), maint, ts,
+       jsonb_build_object('battery_avg', CASE WHEN st.station_type = 'scooter' THEN round((0.55 + 0.4 * synth.u(k, 822))::numeric, 2) END)
+FROM mobility.stations st
+CROSS JOIN generate_series(meta.as_of() - interval '30 days' + interval '1 second', meta.as_of(), interval '1 hour') ts
+CROSS JOIN LATERAL (SELECT st.station_id * 100000 + extract(epoch FROM ts)::bigint / 3600 AS k) kk
+CROSS JOIN LATERAL (
+    SELECT (synth.u(k, 820) < 0.05)::int + (synth.u(k, 821) < 0.02)::int AS maint,
+           least(st.total_capacity, greatest(0, round(
+               st.total_capacity * (0.55 - 0.35 * sin(2 * pi() * (extract(hour FROM ts) - 6) / 24.0))
+               + 2.0 * synth.z(k, 823)))::int) AS avail
+) v
+WHERE st.station_type IN ('bike_share', 'scooter')
+ORDER BY st.station_id, ts;
 
--- Business queries
-CREATE INDEX CONCURRENTLY idx_orders_merchant ON commerce.orders(merchant_id);
-CREATE INDEX CONCURRENTLY idx_licenses_merchant ON commerce.business_licenses(merchant_id);
-CREATE INDEX CONCURRENTLY idx_payments_order ON commerce.payments(order_id);
-*/
+-- Trips: commute-shaped demand, mode-specific distance/speed, peak congestion,
+-- exponential transit delays (planted 3x peak ratio). 15% of transit trips
+-- have a walking access leg (segment_order 1).
+CREATE TEMP TABLE hour_cdf_trips AS
+SELECT wk, h - 1 AS h, coalesce(lag(c) OVER (PARTITION BY wk ORDER BY h), 0) lo, c hi FROM (
+  SELECT wk, h, sum(w) OVER (PARTITION BY wk ORDER BY h) / sum(w) OVER (PARTITION BY wk) c
+  FROM (SELECT false AS wk, w, h FROM unnest(ARRAY[0.2,0.1,0.1,0.1,0.3,1.0,3.5,7.5,8.0,4.5,3.5,3.8,4.2,3.8,3.6,4.5,6.5,8.2,7.0,4.5,3.0,2.2,1.4,0.6]) WITH ORDINALITY t(w, h)
+        UNION ALL
+        SELECT true, w, h FROM unnest(ARRAY[0.6,0.4,0.2,0.1,0.1,0.3,0.6,1.2,2.2,3.5,4.6,5.4,5.8,5.6,5.4,5.2,5.0,5.0,4.6,4.0,3.2,2.4,1.6,1.0]) WITH ORDINALITY t(w, h)) x) s;
+UPDATE hour_cdf_trips SET hi = 1.0000001 WHERE h = 23;
 
--- =============================================================================
--- FILE COMPLETION MARKER
--- =============================================================================
+CREATE TEMP TABLE trip_base AS
+SELECT i AS trip_no,
+       mode,
+       1 + floor(synth.u(i, 901) * (10000 * :scale))::bigint AS user_id,
+       ts,
+       extract(isodow FROM ts) <= 5 AND (extract(hour FROM ts) BETWEEN 7 AND 8 OR extract(hour FROM ts) BETWEEN 16 AND 18) AS is_peak,
+       extract(isodow FROM ts) >= 6 AS is_weekend
+FROM generate_series(1, (50000 * :scale)::int) i
+CROSS JOIN LATERAL (SELECT synth.pick(ARRAY['car','bus','walking','cycling','rail','rideshare','scooter','other'],
+                                      ARRAY[30,18,15,10,8,9,7,3], synth.u(i, 900)) AS mode,
+                           (date_trunc('day', meta.as_of()) - make_interval(days => floor(synth.u(i, 902) * 180)::int))::date AS day) a
+CROSS JOIN LATERAL (SELECT extract(isodow FROM a.day) >= 6 AS wk) w
+JOIN hour_cdf_trips hc ON hc.wk = w.wk AND synth.u(i, 903) >= hc.lo AND synth.u(i, 903) < hc.hi
+CROSS JOIN LATERAL (SELECT a.day + make_interval(hours => hc.h::int, mins => floor(synth.u(i, 904) * 60)::int,
+                                                 secs => floor(synth.u(i, 905) * 60)) AS ts) t;
 
-SELECT 'SEED DATA FILE COMPLETED SUCCESSFULLY' as status, NOW() as completed_at;
+INSERT INTO mobility.trip_segments (
+    trip_id, segment_order, user_id, trip_mode, start_time, end_time, duration_minutes,
+    start_latitude, start_longitude, end_latitude, end_longitude, start_station_id, end_station_id,
+    distance_km, average_speed_kmh, fare_paid, payment_method, comfort_rating, delay_minutes,
+    route_taken, trip_purpose, created_at)
+SELECT
+    'T' || lpad(b.trip_no::text, 8, '0'), seg.ord, b.user_id, seg.mode::mobility.trip_mode,
+    seg.t0, seg.t0 + make_interval(secs => round(seg.minutes * 60 + seg.delay * 60)),
+    round(seg.minutes + seg.delay)::int,
+    coalesce(ss.latitude, round((32.948 + 0.064 * synth.u(seg.k, 920))::numeric, 6)),
+    coalesce(ss.longitude, round((-96.86 + 0.12 * synth.u(seg.k, 921))::numeric, 6)),
+    coalesce(es.latitude, round((32.948 + 0.064 * synth.u(seg.k, 922))::numeric, 6)),
+    coalesce(es.longitude, round((-96.86 + 0.12 * synth.u(seg.k, 923))::numeric, 6)),
+    ss.station_id, es.station_id,
+    round(seg.dist::numeric, 3), round(seg.speed::numeric, 2),
+    CASE seg.mode WHEN 'bus' THEN 2.50 WHEN 'rail' THEN round((2.50 + 0.10 * seg.dist)::numeric, 2)
+                  WHEN 'scooter' THEN round((1.00 + 0.39 * seg.minutes)::numeric, 2)
+                  WHEN 'rideshare' THEN round((3.00 + 1.60 * seg.dist)::numeric, 2)
+                  WHEN 'cycling' THEN CASE WHEN ss.station_id IS NOT NULL THEN 1.75 ELSE 0 END
+                  ELSE 0 END,
+    CASE WHEN seg.mode IN ('bus','rail') THEN synth.pick(ARRAY['transit_card','mobile_app','cash'], ARRAY[60,32,8], synth.u(seg.k, 930))
+         WHEN seg.mode IN ('scooter','rideshare','cycling') THEN 'mobile_app' END,
+    greatest(1, least(5, round(4.3 - 0.12 * seg.delay + 0.7 * synth.z(seg.k, 931))))::int,
+    round(seg.delay)::int,
+    jsonb_build_object('waypoints', 2 + floor(seg.dist)::int, 'congested', b.is_peak AND seg.mode IN ('car','bus','rideshare')),
+    CASE WHEN b.is_peak THEN 'commute'
+         ELSE synth.pick(ARRAY['errand','leisure','commute','school','medical'], ARRAY[35,30,15,12,8], synth.u(b.trip_no, 932)) END,
+    seg.t0
+FROM trip_base b
+CROSS JOIN LATERAL (
+    -- optional walking access leg
+    SELECT 1 AS ord, b.trip_no * 10 + 1 AS k, 'walking' AS mode, b.ts AS t0,
+           0.3 + synth.exp(b.trip_no * 10 + 1, 910, 0.4) AS dist, 4.8 AS speed,
+           (0.3 + synth.exp(b.trip_no * 10 + 1, 910, 0.4)) / 4.8 * 60 AS minutes, 0.0 AS delay
+    WHERE b.mode IN ('bus','rail') AND synth.u(b.trip_no, 911) < 0.15
+    UNION ALL
+    SELECT CASE WHEN b.mode IN ('bus','rail') AND synth.u(b.trip_no, 911) < 0.15 THEN 2 ELSE 1 END,
+           b.trip_no * 10 + 2, b.mode,
+           b.ts + CASE WHEN b.mode IN ('bus','rail') AND synth.u(b.trip_no, 911) < 0.15
+                       THEN make_interval(secs => round((0.3 + synth.exp(b.trip_no * 10 + 1, 910, 0.4)) / 4.8 * 3600 + 120)) ELSE interval '0' END,
+           d.dist, d.speed, d.dist / d.speed * 60,
+           CASE WHEN b.mode IN ('bus','rail') THEN synth.exp(b.trip_no, 913, CASE WHEN b.is_peak THEN 6.0 ELSE 2.0 END) ELSE 0.0 END
+    FROM (SELECT
+            exp(ln(CASE b.mode WHEN 'walking' THEN 1.2 WHEN 'cycling' THEN 3.5 WHEN 'bus' THEN 6.0 WHEN 'rail' THEN 12.0
+                               WHEN 'car' THEN 9.0 WHEN 'rideshare' THEN 7.0 WHEN 'scooter' THEN 2.0 ELSE 4.0 END)
+                + 0.5 * synth.z(b.trip_no, 912)) AS dist,
+            greatest(3.0, (CASE b.mode WHEN 'walking' THEN 4.8 WHEN 'cycling' THEN 15 WHEN 'bus' THEN 22 WHEN 'rail' THEN 38
+                                       WHEN 'car' THEN 40 WHEN 'rideshare' THEN 36 WHEN 'scooter' THEN 14 ELSE 20 END)
+                * CASE WHEN b.is_peak AND b.mode IN ('car','bus','rideshare') THEN 0.70 ELSE 1.0 END
+                * exp(0.12 * synth.z(b.trip_no, 914))) AS speed) d
+) seg
+LEFT JOIN st_range r ON r.stype = CASE seg.mode WHEN 'bus' THEN 'bus' WHEN 'rail' THEN 'rail'
+                                               WHEN 'cycling' THEN 'bike_share' WHEN 'scooter' THEN 'scooter' END
+                    AND (seg.mode IN ('bus','rail','scooter') OR synth.u(seg.k, 924) < 0.5)
+LEFT JOIN mobility.stations ss ON ss.station_id = r.lo + floor(synth.u(seg.k, 925) * r.n)::bigint
+LEFT JOIN mobility.stations es ON es.station_id = r.lo + floor(synth.u(seg.k, 926) * r.n)::bigint
+ORDER BY b.trip_no, seg.ord;
 
--- End of seed_data.sql
--- =============================================================================
+-- Sensors: hourly series with daily/weekly/annual structure and labelled anomalies.
+CREATE TEMP TABLE sensors AS
+SELECT row_number() OVER (ORDER BY t.tn, g.n) AS sid, t.stype, t.unit, t.prefix || '-' || lpad(g.n::text, 3, '0') AS code,
+       s.y0 + 0.016 * synth.u(t.tn * 1000 + g.n, 1000) AS lat, s.x0 + 0.02 * synth.u(t.tn * 1000 + g.n, 1001) AS lng,
+       s.name AS nb_name, 0.7 + 0.6 * synth.u(t.tn * 1000 + g.n, 1002) AS level
+FROM (VALUES (1, 'traffic_counter', 'vehicles/hour', 'TRF', 16), (2, 'air_quality', 'AQI', 'AQI', 10),
+             (3, 'noise', 'dB', 'NOI', 10), (4, 'speed', 'mph', 'SPD', 6), (5, 'weather', 'temperature_f', 'WTH', 6)) t(tn, stype, unit, prefix, cnt)
+CROSS JOIN LATERAL generate_series(1, (t.cnt * greatest(1, :scale))::int) g(n)
+JOIN nb_cdf_pop c ON synth.u(t.tn * 1000 + g.n, 1003) >= c.lo AND synth.u(t.tn * 1000 + g.n, 1003) < c.hi
+JOIN nb_seed s ON s.nb = c.nb;
+
+-- Level-shift windows: ~1 per sensor per 30 days, 6-24 h, +40%.
+CREATE TEMP TABLE shift_windows AS
+SELECT s.sid, meta.as_of() - make_interval(hours => floor(synth.u(s.sid * 100 + w, 1010) * 2160)::int) AS w_start,
+       make_interval(hours => 6 + floor(synth.u(s.sid * 100 + w, 1011) * 18)::int) AS w_len
+FROM sensors s CROSS JOIN generate_series(1, 3) w;
+
+CREATE TEMP TABLE readings AS
+SELECT s.sid, s.code, s.stype, s.unit, s.lat, s.lng, s.nb_name, ts,
+       s.sid * 1000000 + (extract(epoch FROM ts)::bigint / 3600) % 1000000 AS k,
+       -- weekday commute profile in [0,1]
+       CASE WHEN extract(isodow FROM ts) <= 5
+            THEN exp(-power((extract(hour FROM ts) - 8) / 1.5, 2)) + exp(-power((extract(hour FROM ts) - 17.5) / 1.8, 2))
+            ELSE 0.6 * exp(-power((extract(hour FROM ts) - 14) / 4.0, 2)) END AS peak,
+       extract(hour FROM ts) AS hr,
+       extract(doy FROM ts) AS doy,
+       s.level
+FROM sensors s
+CROSS JOIN generate_series(meta.as_of() - interval '90 days' + interval '1 second', meta.as_of(), interval '1 hour') ts;
+
+ALTER TABLE readings ADD COLUMN v float8, ADD COLUMN anomaly text, ADD COLUMN q float8;
+UPDATE readings SET v = CASE stype
+        WHEN 'traffic_counter' THEN level * (120 + 680 * peak + 60 * sin(2 * pi() * (hr - 3) / 24)) * exp(0.08 * synth.z(k, 1020))
+        WHEN 'air_quality'     THEN 38 + 10 * sin(2 * pi() * (hr - 15) / 24) + 8 * peak + 6 * sin(2 * pi() * doy / 7.0) + 3 * synth.z(k, 1020)
+        WHEN 'noise'           THEN 48 + 14 * peak + 6 * sin(2 * pi() * (hr - 4) / 24) + 2 * synth.z(k, 1020)
+        WHEN 'speed'           THEN 38 - 14 * peak + 2.5 * synth.z(k, 1020)
+        WHEN 'weather'         THEN 66 + 16 * sin(2 * pi() * (doy - 110) / 365.25) + 9 * sin(2 * pi() * (hr - 9) / 24) + 2 * synth.z(k, 1020)
+    END,
+    q = 0.86 + 0.14 * synth.u(k, 1021);
+
+UPDATE readings r SET v = v * 1.4, anomaly = 'level_shift'
+FROM shift_windows w WHERE w.sid = r.sid AND r.ts >= w.w_start AND r.ts < w.w_start + w.w_len;
+UPDATE readings SET v = v + 6 * CASE stype WHEN 'traffic_counter' THEN 0.25 * v + 40 WHEN 'weather' THEN 2 ELSE 4 END,
+                    anomaly = 'spike'
+WHERE anomaly IS NULL AND synth.u(k, 1022) < 0.004;
+UPDATE readings SET v = 0, q = 0.25, anomaly = 'dropout'
+WHERE anomaly IS NULL AND synth.u(k, 1023) < 0.002;
+DELETE FROM readings WHERE anomaly IS NULL AND synth.u(k, 1024) < 0.003;   -- realistic gaps
+
+INSERT INTO mobility.sensor_readings (sensor_code, sensor_type, latitude, longitude, location_description, reading_value,
+                                      unit_of_measure, reading_time, data_quality_score, calibration_date,
+                                      weather_conditions, special_events, raw_data)
+SELECT code, stype::mobility.sensor_type, round(lat::numeric, 6), round(lng::numeric, 6), nb_name,
+       round(greatest(v, 0)::numeric, 4), unit, ts, round(q::numeric, 2),
+       (meta.as_of())::date - 120,
+       CASE WHEN synth.u(sid * 10000 + doy::bigint, 1030) < 0.15 THEN 'rain' ELSE 'clear' END,
+       NULL,
+       jsonb_build_object('firmware', 'v2.' || (sid % 4), 'battery_pct', round((60 + 40 * synth.u(k, 1031))::numeric, 0))
+FROM readings
+ORDER BY ts, sid;
+
+INSERT INTO meta.ground_truth (entity, entity_id, label, detail)
+SELECT 'mobility.sensor_readings', sr.reading_id, r.anomaly, jsonb_build_object('sensor_code', r.code)
+FROM readings r
+JOIN mobility.sensor_readings sr ON sr.sensor_code = r.code AND sr.reading_time = r.ts
+WHERE r.anomaly IS NOT NULL;
+
+-- ===========================================================================
+-- 6. Points of interest
+-- ===========================================================================
+
+INSERT INTO geo.points_of_interest (name, category, subcategory, phone, website, street_address, zip_code, location_geom,
+                                    neighborhood_id, business_hours, services_offered, accessibility_features,
+                                    average_rating, review_count, permit_required, inspection_required,
+                                    last_inspection_date, is_active, attributes)
+SELECT
+    s.name || ' ' || initcap(replace(cat, '_', ' ')) || ' ' || i, cat::geo.poi_category, NULL,
+    '(469) 555-' || lpad((i % 10000)::text, 4, '0'), NULL,
+    (100 + floor(synth.u(i, 1102) * 9800))::int || ' Civic Ave',
+    '75' || lpad((100 + s.nb)::text, 3, '0'),
+    ST_SetSRID(ST_MakePoint(s.x0 + 0.02 * synth.u(i, 1103), s.y0 + 0.016 * synth.u(i, 1104)), 4326),
+    s.nb,
+    CASE WHEN cat IN ('hospital','emergency') THEN '{"mon-sun": "00:00-24:00"}'::jsonb
+         ELSE '{"mon-fri": "08:00-18:00", "sat": "09:00-14:00"}'::jsonb END,
+    ARRAY[cat || '_services'],
+    CASE floor(synth.u(i, 1105) * 4)::int
+         WHEN 0 THEN ARRAY['wheelchair_ramp','accessible_parking']
+         WHEN 1 THEN ARRAY['elevator']
+         WHEN 2 THEN ARRAY[]::text[]
+         ELSE ARRAY['braille_signage','wheelchair_ramp'] END,
+    round((1 + 4 * (synth.u(i, 1106) + synth.u(i, 1107) + synth.u(i, 1108)) / 3)::numeric, 2),
+    floor(synth.exp(i, 1109, 60))::int,
+    cat IN ('restaurant','retail','gas_station'),
+    cat IN ('restaurant','hospital','school'),
+    CASE WHEN cat IN ('restaurant','hospital','school') THEN (meta.as_of())::date - (synth.u(i, 1110) * 365)::int END,
+    synth.u(i, 1111) < 0.96,
+    jsonb_build_object('source', 'polaris-synthetic-v2')
+FROM generate_series(1, 600) i
+CROSS JOIN LATERAL (SELECT synth.pick(
+    ARRAY['restaurant','retail','park','school','bank','gas_station','worship','government','library','community_center','hospital','emergency','transportation','utility','other'],
+    ARRAY[120,110,60,45,35,30,40,20,12,18,6,14,30,20,40], synth.u(i, 1100)) AS cat) c
+JOIN nb_cdf_pop cd ON synth.u(i, 1101) >= cd.lo AND synth.u(i, 1101) < cd.hi
+JOIN nb_seed s ON s.nb = cd.nb
+ORDER BY i;
+
+-- ===========================================================================
+-- 7. Documents: complaints with planted service-equity gradient, policies
+-- ===========================================================================
+
+CREATE TEMP TABLE hotspots AS
+SELECT h, -96.86 + 0.12 * synth.u(h, 1200) AS hx, 32.948 + 0.064 * synth.u(h, 1201) AS hy,
+       (ARRAY['roads','noise','trash','utilities','parking','graffiti','noise','roads'])[h] AS fav
+FROM generate_series(1, 8) h;
+
+CREATE TEMP TABLE cmp AS
+SELECT i,
+       CASE WHEN synth.u(i, 1210) < 0.6 THEN 1 + floor(synth.u(i, 1211) * 8)::int END AS hs
+FROM generate_series(1, (5000 * :scale)::int) i;
+
+ALTER TABLE cmp ADD COLUMN x float8, ADD COLUMN y float8, ADD COLUMN cat text;
+UPDATE cmp c SET
+    x = least(-96.7401, greatest(-96.8599, coalesce(h.hx + 0.003 * synth.z(c.i, 1212), -96.86 + 0.12 * synth.u(c.i, 1212)))),
+    y = least(33.0119, greatest(32.9481, coalesce(h.hy + 0.003 * synth.z(c.i, 1213), 32.948 + 0.064 * synth.u(c.i, 1213)))),
+    cat = CASE WHEN h.h IS NOT NULL AND synth.u(c.i, 1214) < 0.6 THEN h.fav
+               ELSE synth.pick(ARRAY['roads','noise','utilities','trash','parking','graffiti','animals','other'],
+                               ARRAY[24,20,14,14,10,8,5,5], synth.u(c.i, 1215)) END
+FROM cmp c2 LEFT JOIN hotspots h ON h.h = c2.hs
+WHERE c2.i = c.i;
+
+INSERT INTO documents.complaint_records (
+    reporter_citizen_id, complaint_number, subject, description, category, subcategory, priority_level,
+    incident_address, incident_latitude, incident_longitude, neighborhood_id, status, assigned_to,
+    incident_date, submitted_at, acknowledged_at, resolved_at, resolution_notes, resolution_actions, metadata, created_at, updated_at)
+SELECT
+    1 + floor(synth.u(c.i, 1220) * (10000 * :scale))::bigint,
+    'CMP-' || to_char(sub_at, 'YYYY') || '-' || lpad(c.i::text, 6, '0'),
+    t.subject, t.body, c.cat, t.sub, pr::documents.priority_level,
+    (100 + floor(synth.u(c.i, 1221) * 9800))::int || ' ' || (ARRAY['Main','Oak','Elm','Cedar','Park'])[1 + floor(synth.u(c.i, 1222) * 5)::int] || ' St',
+    round(c.y::numeric, 6), round(c.x::numeric, 6), n.neighborhood_id,
+    st::documents.document_status,
+    CASE WHEN st <> 'submitted' THEN (ARRAY['Public Works','Code Enforcement','Utilities Dept','Sanitation','Parking Authority','Animal Services'])[1 + floor(synth.u(c.i, 1223) * 6)::int] END,
+    sub_at - make_interval(hours => floor(synth.exp(c.i, 1224, 18))::int),
+    sub_at,
+    CASE WHEN st <> 'submitted' THEN sub_at + make_interval(secs => synth.exp(c.i, 1225, 6) * 3600) END,
+    CASE WHEN st IN ('resolved','archived') THEN sub_at + make_interval(secs => res_days * 86400) END,
+    CASE WHEN st IN ('resolved','archived') THEN 'Resolved: ' || t.fix END,
+    CASE WHEN st IN ('resolved','archived') THEN jsonb_build_array(jsonb_build_object('action', t.fix, 'crew_size', 1 + floor(synth.u(c.i, 1226) * 4))) END,
+    t.meta,
+    sub_at, sub_at
+FROM cmp c
+JOIN geo.neighborhood_boundaries n ON ST_Intersects(n.boundary_geom, ST_SetSRID(ST_MakePoint(c.x, c.y), 4326))
+JOIN nb_seed s ON s.nb = n.neighborhood_id
+CROSS JOIN LATERAL (SELECT meta.as_of() - make_interval(secs => synth.u(c.i, 1230) * 365 * 86400) AS sub_at) a
+CROSS JOIN LATERAL (
+    SELECT
+        -- base median days by category, x exp(-0.25 * income_z) planted gradient, lognormal sigma 0.6
+        (CASE c.cat WHEN 'roads' THEN 9 WHEN 'utilities' THEN 3 WHEN 'trash' THEN 2 WHEN 'noise' THEN 4
+                    WHEN 'parking' THEN 2 WHEN 'graffiti' THEN 6 WHEN 'animals' THEN 1.5 ELSE 5 END)
+        * exp(-0.25 * s.income_z + 0.6 * synth.z(c.i, 1231)) AS res_days,
+        synth.pick(ARRAY['low','normal','high','urgent'], ARRAY[20,50,22,8], synth.u(c.i, 1232)) AS pr
+) r
+CROSS JOIN LATERAL (
+    SELECT CASE WHEN sub_at + make_interval(secs => r.res_days * 86400) > meta.as_of()
+                THEN synth.pick(ARRAY['submitted','under_review'], ARRAY[3,7], synth.u(c.i, 1233))
+                WHEN synth.u(c.i, 1234) < 0.04 THEN 'rejected'
+                WHEN sub_at < meta.as_of() - interval '300 days' THEN 'archived'
+                ELSE 'resolved' END AS st
+) z
+CROSS JOIN LATERAL (
+    SELECT
+        CASE c.cat
+          WHEN 'roads'     THEN (ARRAY['Pothole','Damaged pavement','Missing road sign','Faded crosswalk'])[1 + floor(synth.u(c.i, 1240) * 4)::int]
+          WHEN 'noise'     THEN (ARRAY['Loud construction','Late-night party','Barking dog','Leaf blower before 7am'])[1 + floor(synth.u(c.i, 1240) * 4)::int]
+          WHEN 'utilities' THEN (ARRAY['Streetlight out','Water main leak','Power outage','Low water pressure'])[1 + floor(synth.u(c.i, 1240) * 4)::int]
+          WHEN 'trash'     THEN (ARRAY['Missed pickup','Illegal dumping','Overflowing bin','Recycling not collected'])[1 + floor(synth.u(c.i, 1240) * 4)::int]
+          WHEN 'parking'   THEN (ARRAY['Blocked driveway','Abandoned vehicle','Parking in fire lane'])[1 + floor(synth.u(c.i, 1240) * 3)::int]
+          WHEN 'graffiti'  THEN (ARRAY['Graffiti on wall','Vandalized bus shelter','Tagged traffic box'])[1 + floor(synth.u(c.i, 1240) * 3)::int]
+          WHEN 'animals'   THEN (ARRAY['Stray dog','Dead animal on road','Wildlife in yard'])[1 + floor(synth.u(c.i, 1240) * 3)::int]
+          ELSE 'General service request' END AS sub,
+        CASE c.cat WHEN 'roads' THEN 'replaced asphalt patch' WHEN 'noise' THEN 'issued warning notice'
+                   WHEN 'utilities' THEN 'crew repaired fixture' WHEN 'trash' THEN 'collection completed'
+                   WHEN 'parking' THEN 'vehicle cited or towed' WHEN 'graffiti' THEN 'surface cleaned'
+                   WHEN 'animals' THEN 'animal services responded' ELSE 'request closed' END AS fix
+) sx
+CROSS JOIN LATERAL (
+    SELECT
+        sx.sub || ' near ' || s.name AS subject,
+        sx.sub || ' reported by resident in ' || s.name || '. '
+          || (ARRAY['Issue has persisted for several days.','This is a safety hazard for pedestrians.',
+                    'Neighbors have also noticed the problem.','Please send a crew as soon as possible.',
+                    'Problem gets worse during rush hour.','Children walk past this location to school.'])[1 + floor(synth.u(c.i, 1241) * 6)::int]
+          AS body,
+        sx.sub,
+        sx.fix,
+        CASE c.cat
+          WHEN 'noise' THEN jsonb_build_object('category', 'noise', 'decibel_level', round((65 + 20 * synth.u(c.i, 1242))::numeric), 'time_of_day', lpad(floor(synth.u(c.i, 1243) * 24)::text, 2, '0') || ':00')
+          WHEN 'utilities' THEN jsonb_build_object('category', 'utilities', 'utility_type', (ARRAY['lighting','water','power'])[1 + floor(synth.u(c.i, 1242) * 3)::int], 'outage_duration', floor(synth.exp(c.i, 1243, 30)) || 'h')
+          WHEN 'roads' THEN jsonb_build_object('category', 'roads', 'road_condition', (ARRAY['poor','very_poor','hazardous'])[1 + floor(synth.u(c.i, 1242) * 3)::int], 'hazard_type', lower(sx.sub))
+          ELSE jsonb_build_object('category', c.cat, 'channel', (ARRAY['app','phone','web','email'])[1 + floor(synth.u(c.i, 1242) * 4)::int])
+        END AS meta
+) t
+ORDER BY c.i;
+
+INSERT INTO documents.policy_documents (
+    policy_number, title, version, document_content, document_type, department, policy_area, access_level, status,
+    effective_date, expiration_date, review_date, created_by, approved_by, change_log, tags, keywords, metadata)
+SELECT
+    'POL-' || d.code || '-' || lpad(i::text, 4, '0'), title, '1.0',
+    jsonb_build_object('title', title, 'summary', 'Policy governing ' || lower(topic) || ' for the ' || d.dept || ' department.',
+        'sections', jsonb_build_array(
+            jsonb_build_object('heading', 'Purpose', 'body', 'This policy establishes standards for ' || lower(topic) || ' in Polaris City.'),
+            jsonb_build_object('heading', 'Scope', 'body', 'Applies to all ' || d.dept || ' staff, contractors and residents affected by ' || lower(topic) || '.'),
+            jsonb_build_object('heading', 'Requirements', 'body', 'Requests must be acknowledged within ' || (1 + i % 5) || ' business days and resolved according to priority.'),
+            jsonb_build_object('heading', 'Enforcement', 'body', 'Violations may result in fines, permit suspension or corrective action plans.'))),
+    dt::documents.document_type, d.dept, topic,
+    synth.pick(ARRAY['public','internal','restricted','confidential'], ARRAY[60,25,10,5], synth.u(i, 1302))::documents.access_level,
+    synth.pick(ARRAY['published','approved','draft','under_review','archived'], ARRAY[60,10,10,10,10], synth.u(i, 1303))::documents.document_status,
+    eff, eff + 3 * 365, eff + 365,
+    1 + floor(synth.u(i, 1304) * (10000 * :scale))::int, 1 + floor(synth.u(i, 1305) * (10000 * :scale))::int,
+    jsonb_build_array(jsonb_build_object('version', '1.0', 'date', eff, 'note', 'initial adoption')),
+    ARRAY[lower(d.code), lower(replace(topic, ' ', '_'))],
+    string_to_array(lower(topic), ' '),
+    jsonb_build_object('pages', 2 + i % 9, 'language', 'en')
+FROM generate_series(1, 120) i
+CROSS JOIN LATERAL (SELECT (ARRAY['PW','TR','HL','PL','FN','PS'])[1 + i % 6] AS code,
+                           (ARRAY['Public Works','Transportation','Health','Planning','Finance','Public Safety'])[1 + i % 6] AS dept) d
+CROSS JOIN LATERAL (SELECT (ARRAY['Street Maintenance','Noise Control','Waste Collection','Water Quality','Zoning Variance',
+                                  'Transit Accessibility','Data Privacy','Emergency Response','Procurement','Food Safety',
+                                  'Bicycle Infrastructure','Public Records'])[1 + floor(synth.u(i, 1300) * 12)::int] AS topic) tp
+CROSS JOIN LATERAL (SELECT tp.topic || ' Policy ' || i AS title,
+                           synth.pick(ARRAY['policy','notice','report','form'], ARRAY[70,10,15,5], synth.u(i, 1301)) AS dt,
+                           (meta.as_of())::date - (synth.u(i, 1306) * 2000)::int AS eff) x
+ORDER BY i;
+
+-- Version 2.0 of 20% of policies, superseding v1.0.
+INSERT INTO documents.policy_documents (
+    policy_number, title, version, document_content, document_type, department, policy_area, access_level, status,
+    effective_date, expiration_date, review_date, created_by, approved_by, supersedes_policy_id, change_log, tags, keywords, metadata)
+SELECT policy_number, title, '2.0',
+       jsonb_set(document_content, '{summary}', to_jsonb('Revised: ' || (document_content->>'summary'))),
+       document_type, department, policy_area, access_level, 'published',
+       effective_date + 365, effective_date + 4 * 365, effective_date + 2 * 365, created_by, approved_by, policy_id,
+       change_log || jsonb_build_array(jsonb_build_object('version', '2.0', 'date', effective_date + 365, 'note', 'periodic revision')),
+       tags, keywords, metadata
+FROM documents.policy_documents
+WHERE synth.u(policy_id, 1310) < 0.2 AND effective_date + 365 <= (meta.as_of())::date
+ORDER BY policy_id;
+UPDATE documents.policy_documents p SET status = 'archived'
+WHERE EXISTS (SELECT 1 FROM documents.policy_documents n WHERE n.supersedes_policy_id = p.policy_id);
+
+-- ===========================================================================
+-- 8. Finalise: statistics and provenance
+-- ===========================================================================
+
+ANALYZE civics.citizens, civics.permit_applications, civics.tax_payments, civics.voting_records,
+        commerce.merchants, commerce.business_licenses, commerce.orders, commerce.order_items, commerce.payments,
+        mobility.stations, mobility.station_inventory, mobility.trip_segments, mobility.sensor_readings,
+        geo.neighborhood_boundaries, geo.points_of_interest, geo.road_segments,
+        documents.complaint_records, documents.policy_documents, meta.ground_truth;
+
+UPDATE meta.dataset SET
+    generation_ms = round(extract(epoch FROM clock_timestamp() - generated_at) * 1000),
+    row_counts = (
+        SELECT jsonb_object_agg(t, n ORDER BY t) FROM (
+            SELECT 'civics.citizens' t, count(*) n FROM civics.citizens UNION ALL
+            SELECT 'civics.permit_applications', count(*) FROM civics.permit_applications UNION ALL
+            SELECT 'civics.tax_payments', count(*) FROM civics.tax_payments UNION ALL
+            SELECT 'civics.voting_records', count(*) FROM civics.voting_records UNION ALL
+            SELECT 'commerce.merchants', count(*) FROM commerce.merchants UNION ALL
+            SELECT 'commerce.business_licenses', count(*) FROM commerce.business_licenses UNION ALL
+            SELECT 'commerce.orders', count(*) FROM commerce.orders UNION ALL
+            SELECT 'commerce.order_items', count(*) FROM commerce.order_items UNION ALL
+            SELECT 'commerce.payments', count(*) FROM commerce.payments UNION ALL
+            SELECT 'mobility.stations', count(*) FROM mobility.stations UNION ALL
+            SELECT 'mobility.station_inventory', count(*) FROM mobility.station_inventory UNION ALL
+            SELECT 'mobility.trip_segments', count(*) FROM mobility.trip_segments UNION ALL
+            SELECT 'mobility.sensor_readings', count(*) FROM mobility.sensor_readings UNION ALL
+            SELECT 'geo.neighborhood_boundaries', count(*) FROM geo.neighborhood_boundaries UNION ALL
+            SELECT 'geo.points_of_interest', count(*) FROM geo.points_of_interest UNION ALL
+            SELECT 'geo.road_segments', count(*) FROM geo.road_segments UNION ALL
+            SELECT 'documents.complaint_records', count(*) FROM documents.complaint_records UNION ALL
+            SELECT 'documents.policy_documents', count(*) FROM documents.policy_documents UNION ALL
+            SELECT 'meta.ground_truth', count(*) FROM meta.ground_truth) x);
+
+RESET client_min_messages;
+SELECT generator_version, scale, seed, as_of, generation_ms, jsonb_pretty(row_counts) AS row_counts FROM meta.dataset;

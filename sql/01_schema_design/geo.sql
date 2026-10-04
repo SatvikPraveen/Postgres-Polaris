@@ -202,11 +202,14 @@ CREATE INDEX idx_pois_zip ON geo.points_of_interest(zip_code);
 -- SPATIAL FUNCTIONS
 -- =============================================================================
 
--- Function to find POIs within distance of a point
+-- Function to find POIs within distance of a point.
+-- Distances are geodesic (geography type, WGS-84 spheroid). Projecting to
+-- Web Mercator (EPSG:3857) would overstate distances by ~1/cos(latitude),
+-- about 15% at Polaris City's latitude, so it is deliberately avoided.
 CREATE OR REPLACE FUNCTION geo.find_nearby_pois(
     lat DECIMAL(10,8),
     lng DECIMAL(11,8),
-    distance_meters INTEGER DEFAULT 1000,
+    radius_m INTEGER DEFAULT 1000,
     poi_category_filter geo.poi_category DEFAULT NULL
 )
 RETURNS TABLE(
@@ -215,32 +218,23 @@ RETURNS TABLE(
     category geo.poi_category,
     distance_meters INTEGER,
     street_address VARCHAR(500)
-) AS $$
-BEGIN
-    RETURN QUERY
+)
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    WITH origin AS (
+        SELECT ST_SetSRID(ST_MakePoint(lng, lat), 4326)::geography AS g
+    )
     SELECT
         p.poi_id,
         p.name,
         p.category,
-        ST_Distance(
-            ST_Transform(ST_SetSRID(ST_Point(lng, lat), 4326), 3857),
-            ST_Transform(p.location_geom, 3857)
-        )::INTEGER as distance_meters,
+        ST_Distance(p.location_geom::geography, o.g)::INTEGER,
         p.street_address
-    FROM geo.points_of_interest p
-    WHERE p.is_active = true
-        AND ST_DWithin(
-            ST_Transform(ST_SetSRID(ST_Point(lng, lat), 4326), 3857),
-            ST_Transform(p.location_geom, 3857),
-            distance_meters
-        )
-        AND (poi_category_filter IS NULL OR p.category = poi_category_filter)
-    ORDER BY ST_Distance(
-        ST_Transform(ST_SetSRID(ST_Point(lng, lat), 4326), 3857),
-        ST_Transform(p.location_geom, 3857)
-    );
-END;
-$$ LANGUAGE plpgsql;
+    FROM geo.points_of_interest p, origin o
+    WHERE p.is_active
+      AND ST_DWithin(p.location_geom::geography, o.g, radius_m)
+      AND (poi_category_filter IS NULL OR p.category = poi_category_filter)
+    ORDER BY p.location_geom::geography <-> o.g
+$$;
 
 COMMENT ON FUNCTION geo.find_nearby_pois(DECIMAL, DECIMAL, INTEGER, geo.poi_category) IS
 'Find points of interest within specified distance of coordinates, optionally filtered by category';
@@ -305,7 +299,7 @@ CREATE OR REPLACE FUNCTION geo.calculate_neighborhood_metrics()
 RETURNS TRIGGER AS $$
 BEGIN
     -- Calculate area in square kilometers
-    NEW.area_sq_km := ST_Area(ST_Transform(NEW.boundary_geom, 3857)) / 1000000.0;
+    NEW.area_sq_km := ST_Area(NEW.boundary_geom::geography) / 1000000.0;  -- geodesic, not Web Mercator
 
     -- Calculate centroid
     NEW.centroid_geom := ST_Centroid(NEW.boundary_geom);
@@ -327,7 +321,7 @@ CREATE OR REPLACE FUNCTION geo.calculate_road_metrics()
 RETURNS TRIGGER AS $$
 BEGIN
     -- Calculate length in kilometers
-    NEW.length_km := ST_Length(ST_Transform(NEW.segment_geom, 3857)) / 1000.0;
+    NEW.length_km := ST_Length(NEW.segment_geom::geography) / 1000.0;  -- geodesic, not Web Mercator
 
     NEW.updated_at := NOW();
 
