@@ -1,438 +1,354 @@
 -- File: sql/11_perf_tuning/index_advisor_patterns.sql
--- Purpose: Anti-patterns → fixes, automated index recommendations
+-- Purpose: Index hygiene and advice: unused, duplicate/redundant and missing
+--          foreign-key indexes from the catalogs and statistics views, then
+--          "what if" analysis with HypoPG (hypothetical indexes, hidden indexes)
+--          before building anything, and covering-index checks.
+--
+-- Idempotent and non-destructive: advisor functions only RETURN DDL text. The one
+-- real index built for validation is created inside a transaction that is rolled back.
+-- HypoPG objects live only in this session's memory and are reset at the end.
+--
+-- Caveat for every usage-based rule: pg_stat_user_indexes counters start at zero
+-- after a stats reset, a crash, or (as in this lab) when the database is cloned
+-- from a template. "Never scanned" is only meaningful after a representative
+-- period of production traffic, and must be checked on every replica too.
+
+-- Older revisions of this file created functions with other result shapes.
+DROP FUNCTION IF EXISTS analytics.detect_unused_indexes();
+DROP FUNCTION IF EXISTS analytics.detect_redundant_indexes();
+DROP FUNCTION IF EXISTS analytics.comprehensive_index_advisor();
+DROP FUNCTION IF EXISTS analytics.analyze_index_selectivity();
+DROP FUNCTION IF EXISTS analytics.identify_covering_opportunities();
+DROP FUNCTION IF EXISTS analytics.generate_index_maintenance_plan();
+DROP FUNCTION IF EXISTS analytics.execute_index_recommendations(boolean, text);
 
 -- =============================================================================
--- INDEX ANTI-PATTERNS DETECTION
+-- 1. UNUSED INDEXES
 -- =============================================================================
+\echo '== 1. Unused indexes'
 
--- Function to detect unused indexes
-CREATE OR REPLACE FUNCTION analytics.detect_unused_indexes()
-RETURNS TABLE(
-    schema_name TEXT,
-    table_name TEXT,
-    index_name TEXT,
-    index_size TEXT,
-    scans_count BIGINT,
-    recommendation TEXT,
-    drop_command TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        schemaname::TEXT,
-        relname::TEXT,
-        indexrelname::TEXT,
-        pg_size_pretty(pg_relation_size(indexrelid))::TEXT,
-        idx_scan,
-        CASE
-            WHEN idx_scan = 0 AND indexrelname NOT LIKE '%_pkey' THEN 'DROP - Never used'
-            WHEN idx_scan < 10 AND pg_relation_size(indexrelid) > 10485760 THEN 'REVIEW - Rarely used, large size'
-            ELSE 'KEEP - Adequately used'
-        END::TEXT,
-        CASE
-            WHEN idx_scan = 0 AND indexrelname NOT LIKE '%_pkey'
-            THEN format('DROP INDEX IF EXISTS %I.%I;', schemaname, indexrelname)
-            ELSE NULL
-        END::TEXT
-    FROM pg_stat_user_indexes
-    WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-    ORDER BY idx_scan, pg_relation_size(indexrelid) DESC;
-END;
-$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION analytics.detect_unused_indexes(p_min_bytes bigint DEFAULT 0)
+RETURNS TABLE (index_name text, table_name text, index_size text, idx_scan bigint,
+               last_idx_scan timestamptz, recommendation text, suggested_ddl text)
+LANGUAGE sql STABLE AS $$
+    SELECT s.schemaname || '.' || s.indexrelname,
+           s.schemaname || '.' || s.relname,
+           pg_size_pretty(pg_relation_size(s.indexrelid)),
+           s.idx_scan,
+           s.last_idx_scan,                                    -- PG16+
+           CASE WHEN s.idx_scan = 0 THEN 'never scanned since stats reset: candidate to drop'
+                ELSE 'rarely scanned: review' END,
+           format('DROP INDEX CONCURRENTLY IF EXISTS %I.%I;', s.schemaname, s.indexrelname)
+    FROM pg_stat_user_indexes s
+    JOIN pg_index i ON i.indexrelid = s.indexrelid
+    WHERE s.schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+      AND NOT i.indisunique            -- unique/PK indexes enforce constraints even if never scanned
+      AND NOT i.indisexclusion         -- so do exclusion constraints
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = s.indexrelid)
+      AND s.idx_scan < 10
+      AND pg_relation_size(s.indexrelid) >= p_min_bytes;
+$$;
+COMMENT ON FUNCTION analytics.detect_unused_indexes(bigint) IS
+'Non-constraint indexes with fewer than 10 scans since the last stats reset, with DROP INDEX CONCURRENTLY DDL.';
 
--- Function to detect duplicate/redundant indexes
+-- How long have the counters been collecting? (NULL = never reset since the
+-- database was created or the server last crashed: on this fresh clone, minutes.)
+SELECT s.stats_reset AS index_stats_since, now() - s.stats_reset AS observation_window
+FROM pg_stat_database s WHERE s.datname = current_database();
+
+SELECT index_name, index_size, idx_scan, recommendation
+FROM analytics.detect_unused_indexes()
+ORDER BY pg_relation_size(index_name::regclass) DESC, index_name
+LIMIT 8;
+
+-- =============================================================================
+-- 2. DUPLICATE AND REDUNDANT INDEXES
+-- =============================================================================
+\echo '== 2. Duplicate and redundant (prefix) indexes'
+
+-- Exact duplicate: same table, access method, key columns, opclasses, collations,
+-- expressions and predicate. Prefix-redundant: a non-unique btree whose keys are a
+-- leading prefix of another btree on the same table (with the same predicate).
 CREATE OR REPLACE FUNCTION analytics.detect_redundant_indexes()
-RETURNS TABLE(
-    schema_table TEXT,
-    index1_name TEXT,
-    index2_name TEXT,
-    index1_columns TEXT,
-    index2_columns TEXT,
-    redundancy_type TEXT,
-    recommendation TEXT
-) AS $$
-DECLARE
-    rec RECORD;
-BEGIN
-    FOR rec IN
-        SELECT DISTINCT
-            i1.schemaname || '.' || i1.tablename as table_name,
-            i1.indexname as idx1_name,
-            i2.indexname as idx2_name,
-            i1.indexdef as idx1_def,
-            i2.indexdef as idx2_def
-        FROM pg_indexes i1
-        JOIN pg_indexes i2 ON i1.tablename = i2.tablename
-            AND i1.schemaname = i2.schemaname
-            AND i1.indexname < i2.indexname
-        WHERE i1.schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-            AND i1.indexname NOT LIKE '%_pkey'
-            AND i2.indexname NOT LIKE '%_pkey'
-    LOOP
-        -- Extract column lists (simplified)
-        DECLARE
-            cols1 TEXT := substring(rec.idx1_def from '\(([^)]+)\)');
-            cols2 TEXT := substring(rec.idx2_def from '\(([^)]+)\)');
-        BEGIN
-            -- Check for redundancy patterns
-            IF cols1 = cols2 THEN
-                RETURN QUERY SELECT
-                    rec.table_name,
-                    rec.idx1_name,
-                    rec.idx2_name,
-                    cols1,
-                    cols2,
-                    'EXACT_DUPLICATE'::TEXT,
-                    'Drop one of the duplicate indexes'::TEXT;
-            ELSIF position(cols1 in cols2) = 1 THEN
-                RETURN QUERY SELECT
-                    rec.table_name,
-                    rec.idx1_name,
-                    rec.idx2_name,
-                    cols1,
-                    cols2,
-                    'PREFIX_REDUNDANT'::TEXT,
-                    format('Consider dropping %s as %s covers its columns', rec.idx1_name, rec.idx2_name)::TEXT;
-            END IF;
-        END;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- MISSING INDEX DETECTION
--- =============================================================================
-
--- Function to suggest missing indexes based on query patterns
-CREATE OR REPLACE FUNCTION analytics.suggest_missing_indexes()
-RETURNS TABLE(
-    schema_table TEXT,
-    suggested_index TEXT,
-    reasoning TEXT,
-    estimated_benefit TEXT,
-    create_command TEXT
-) AS $$
-BEGIN
-    -- Foreign key columns without indexes
-    RETURN QUERY
-    WITH fk_without_indexes AS (
-        SELECT
-            n.nspname as schema_name,
-            t.relname as table_name,
-            a.attname as column_name
-        FROM pg_constraint c
-        JOIN pg_class t ON c.conrelid = t.oid
-        JOIN pg_namespace n ON t.relnamespace = n.oid
-        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
-        WHERE c.contype = 'f'  -- Foreign key
-        AND n.nspname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-        AND NOT EXISTS (
-            SELECT 1 FROM pg_index i
-            JOIN pg_class ic ON i.indexrelid = ic.oid
-            WHERE i.indrelid = t.oid
-            AND a.attnum = ANY(i.indkey)
-        )
+RETURNS TABLE (table_name text, redundant_index text, covered_by text,
+               redundant_def text, covering_def text, kind text, suggested_ddl text)
+LANGUAGE sql STABLE AS $$
+    WITH idx AS (
+        SELECT i.indexrelid, i.indrelid, c.relam, i.indisunique, i.indisprimary,
+               i.indkey::int2[]           AS keys,
+               i.indclass::oid[]          AS opclasses,
+               i.indcollation::oid[]      AS collations,
+               i.indnkeyatts,
+               COALESCE(pg_get_expr(i.indexprs, i.indrelid), '') AS exprs,
+               COALESCE(pg_get_expr(i.indpred,  i.indrelid), '') AS pred,
+               (SELECT conname FROM pg_constraint k WHERE k.conindid = i.indexrelid LIMIT 1) AS constraint_name
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
     )
-    SELECT
-        (schema_name || '.' || table_name)::TEXT,
-        ('idx_' || table_name || '_' || column_name)::TEXT,
-        'Foreign key column without index - impacts JOIN performance'::TEXT,
-        'HIGH - Significant improvement for JOINs'::TEXT,
-        format('CREATE INDEX idx_%s_%s ON %I.%I (%I);',
-               table_name, column_name, schema_name, table_name, column_name)::TEXT
-    FROM fk_without_indexes
+    -- one row per redundant index, naming the strongest index that covers it
+    SELECT DISTINCT ON (a.indexrelid)
+           a.indrelid::regclass::text,
+           a.indexrelid::regclass::text,
+           b.indexrelid::regclass::text,
+           pg_get_indexdef(a.indexrelid),
+           pg_get_indexdef(b.indexrelid),
+           CASE WHEN a.keys = b.keys THEN 'EXACT DUPLICATE' ELSE 'PREFIX REDUNDANT' END,
+           CASE WHEN a.constraint_name IS NOT NULL
+                THEN format('ALTER TABLE %s DROP CONSTRAINT %I;  -- check dependent FKs first',
+                            a.indrelid::regclass, a.constraint_name)
+                ELSE format('DROP INDEX CONCURRENTLY IF EXISTS %s;', a.indexrelid::regclass)
+           END
+    FROM idx a
+    JOIN idx b ON b.indrelid = a.indrelid
+              AND b.indexrelid <> a.indexrelid
+              AND b.relam = a.relam
+              AND b.exprs = a.exprs
+              AND b.pred  = a.pred
+    WHERE a.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+      AND a.exprs = ''
+      AND (
+            -- exact duplicate: report the "weaker" one (non-unique before unique, then higher oid)
+            (a.keys = b.keys AND a.opclasses = b.opclasses AND a.collations = b.collations
+             AND (NOT a.indisprimary)
+             AND ((b.indisunique AND NOT a.indisunique)
+                  OR (a.indisunique = b.indisunique AND (b.indisprimary OR a.indexrelid > b.indexrelid))))
+         OR
+            -- strict prefix: a's key columns lead b's key columns
+            (NOT a.indisunique
+             AND a.indnkeyatts < b.indnkeyatts
+             AND a.keys[0:a.indnkeyatts - 1] = b.keys[0:a.indnkeyatts - 1]
+             AND a.opclasses = b.opclasses[1:a.indnkeyatts])
+          )
+    ORDER BY a.indexrelid, b.indisprimary DESC, b.indisunique DESC, b.indexrelid;
+$$;
+COMMENT ON FUNCTION analytics.detect_redundant_indexes() IS
+'Exact-duplicate and leading-prefix-redundant btree indexes, with the DDL to remove the weaker one.';
 
-    UNION ALL
-
-    -- Frequently filtered columns without indexes
-    SELECT
-        'civics.citizens'::TEXT,
-        'idx_citizens_status_active'::TEXT,
-        'Status column frequently filtered, partial index more efficient'::TEXT,
-        'MEDIUM - Faster status-based queries'::TEXT,
-        'CREATE INDEX idx_citizens_status_active ON civics.citizens (citizen_id) WHERE status = ''active'';'::TEXT
-    WHERE NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE tablename = 'citizens'
-        AND indexname LIKE '%status%'
-    )
-
-    UNION ALL
-
-    -- Date range queries without indexes
-    SELECT
-        'documents.complaint_records'::TEXT,
-        'idx_complaints_submitted_date'::TEXT,
-        'Date column used for range queries and reporting'::TEXT,
-        'MEDIUM - Faster date range queries'::TEXT,
-        'CREATE INDEX idx_complaints_submitted_date ON documents.complaint_records (submitted_at DESC);'::TEXT
-    WHERE NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE tablename = 'complaint_records'
-        AND indexdef LIKE '%submitted_at%'
-    )
-
-    ORDER BY estimated_benefit;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- INDEX OPTIMIZATION PATTERNS
--- =============================================================================
-
--- Function to analyze index selectivity and effectiveness
-CREATE OR REPLACE FUNCTION analytics.analyze_index_selectivity()
-RETURNS TABLE(
-    schema_table TEXT,
-    index_name TEXT,
-    index_scans BIGINT,
-    tuples_read BIGINT,
-    tuples_fetched BIGINT,
-    selectivity_ratio NUMERIC,
-    effectiveness_score TEXT,
-    optimization_suggestion TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        (pui.schemaname || '.' || pui.relname)::TEXT,
-        pui.indexrelname::TEXT,
-        pui.idx_scan,
-        pui.idx_tup_read,
-        pui.idx_tup_fetch,
-        CASE
-            WHEN pui.idx_tup_read > 0
-            THEN ROUND(pui.idx_tup_fetch::NUMERIC / pui.idx_tup_read, 4)
-            ELSE 0
-        END,
-        CASE
-            WHEN pui.idx_scan = 0 THEN 'UNUSED'
-            WHEN pui.idx_tup_read = 0 THEN 'NO_DATA'
-            WHEN pui.idx_tup_fetch::NUMERIC / pui.idx_tup_read > 0.01 THEN 'POOR_SELECTIVITY'
-            WHEN pui.idx_tup_fetch::NUMERIC / pui.idx_tup_read > 0.001 THEN 'FAIR_SELECTIVITY'
-            ELSE 'GOOD_SELECTIVITY'
-        END::TEXT,
-        CASE
-            WHEN pui.idx_scan = 0 THEN 'Consider dropping if consistently unused'
-            WHEN pui.idx_tup_fetch::NUMERIC / pui.idx_tup_read > 0.01 THEN 'Review query patterns or add WHERE conditions'
-            WHEN pui.idx_scan < 10 AND pg_relation_size(pui.indexrelid) > 50000000 THEN 'Large rarely-used index - review necessity'
-            ELSE 'Index performing well'
-        END::TEXT
-    FROM pg_stat_user_indexes pui
-    WHERE pui.schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-    ORDER BY
-        CASE WHEN pui.idx_scan = 0 THEN 1 ELSE 0 END,
-        pui.idx_tup_fetch::NUMERIC / NULLIF(pui.idx_tup_read, 0) DESC;
-END;
-$$ LANGUAGE plpgsql;
+SELECT kind, redundant_index, covered_by, suggested_ddl
+FROM analytics.detect_redundant_indexes()
+ORDER BY kind, table_name, redundant_index;
 
 -- =============================================================================
--- COVERING INDEX OPPORTUNITIES
+-- 3. FOREIGN KEYS WITHOUT A SUPPORTING INDEX
 -- =============================================================================
+\echo '== 3. Foreign keys without an index on the referencing columns'
 
--- Function to identify covering index opportunities
-CREATE OR REPLACE FUNCTION analytics.identify_covering_opportunities()
-RETURNS TABLE(
-    schema_table TEXT,
-    base_index TEXT,
-    frequently_selected_columns TEXT,
-    suggested_covering_index TEXT,
-    potential_benefit TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    -- Based on common query patterns, suggest covering indexes
-    VALUES
-        ('civics.citizens', 'idx_citizens_email', 'first_name, last_name, phone',
-         'CREATE INDEX idx_citizens_email_covering ON civics.citizens (email) INCLUDE (first_name, last_name, phone);',
-         'Avoid heap lookups for user profile queries'),
-
-        ('civics.permit_applications', 'idx_permits_citizen', 'permit_number, status, application_date',
-         'CREATE INDEX idx_permits_citizen_covering ON civics.permit_applications (citizen_id) INCLUDE (permit_number, status, application_date);',
-         'Faster permit history lookups without heap access'),
-
-        ('commerce.orders', 'idx_orders_customer', 'order_date, total_amount, status',
-         'CREATE INDEX idx_orders_customer_covering ON commerce.orders (customer_citizen_id) INCLUDE (order_date, total_amount, status);',
-         'Improved order history performance'),
-
-        ('documents.complaint_records', 'idx_complaints_status', 'complaint_number, subject, submitted_at',
-         'CREATE INDEX idx_complaints_status_covering ON documents.complaint_records (status) INCLUDE (complaint_number, subject, submitted_at);',
-         'Faster complaint dashboard queries');
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- AUTOMATED INDEX ADVISOR
--- =============================================================================
-
--- Comprehensive index advisor function
-CREATE OR REPLACE FUNCTION analytics.comprehensive_index_advisor()
-RETURNS TABLE(
-    category TEXT,
-    priority INTEGER,
-    schema_table TEXT,
-    issue_description TEXT,
-    recommendation TEXT,
-    sql_command TEXT,
-    estimated_impact TEXT
-) AS $$
-BEGIN
-    -- High Priority: Unused indexes
-    RETURN QUERY
-    SELECT
-        'UNUSED_INDEX'::TEXT,
-        1,
-        (schemaname || '.' || relname)::TEXT,
-        format('Index %s has never been used (%s)', indexrelname, pg_size_pretty(pg_relation_size(indexrelid))),
-        'Drop unused index to save space and maintenance overhead'::TEXT,
-        format('DROP INDEX IF EXISTS %I.%I;', schemaname, indexrelname)::TEXT,
-        'HIGH - Immediate space savings'::TEXT
-    FROM pg_stat_user_indexes
-    WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-        AND idx_scan = 0
-        AND indexrelname NOT LIKE '%_pkey'
-        AND pg_relation_size(indexrelid) > 1048576  -- > 1MB
-
-    UNION ALL
-
-    -- Medium Priority: Missing FK indexes
-    SELECT
-        'MISSING_FK_INDEX'::TEXT,
-        2,
-        (n.nspname || '.' || t.relname)::TEXT,
-        format('Foreign key column %s lacks index', a.attname),
-        'Create index on foreign key column for better JOIN performance'::TEXT,
-        format('CREATE INDEX idx_%s_%s ON %I.%I (%I);',
-               t.relname, a.attname, n.nspname, t.relname, a.attname)::TEXT,
-        'HIGH - Significant JOIN improvement'::TEXT
+-- Without an index on the referencing side, every DELETE/UPDATE of a parent key
+-- scans the whole child table (and holds locks meanwhile), and joins from the
+-- parent to its children cannot use an index. An index "supports" the FK when its
+-- leading key columns are exactly the FK columns (in any order).
+CREATE OR REPLACE FUNCTION analytics.detect_missing_fk_indexes()
+RETURNS TABLE (table_name text, fk_name text, fk_columns text, referenced_table text,
+               child_rows bigint, suggested_ddl text)
+LANGUAGE sql STABLE AS $$
+    SELECT c.conrelid::regclass::text,
+           c.conname,
+           (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord)
+            FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum),
+           c.confrelid::regclass::text,
+           greatest(t.reltuples, 0)::bigint,
+           format('CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %s (%s);',
+                  left('idx_' || t.relname || '_' ||
+                       (SELECT string_agg(a.attname, '_' ORDER BY k.ord)
+                        FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
+                        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum), 63),
+                  c.conrelid::regclass,
+                  (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord)
+                   FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum))
     FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    JOIN pg_namespace n ON t.relnamespace = n.oid
-    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+    JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
     WHERE c.contype = 'f'
-        AND n.nspname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-        AND NOT EXISTS (
-            SELECT 1 FROM pg_index i
-            WHERE i.indrelid = t.oid AND a.attnum = ANY(i.indkey)
-        )
+      AND n.nspname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_index i
+          WHERE i.indrelid = c.conrelid
+            AND i.indpred IS NULL
+            AND i.indnkeyatts >= cardinality(c.conkey)
+            -- the first n key columns, as a set, equal the FK columns
+            -- (schema-qualified operators: the intarray extension adds ambiguous ones)
+            AND (i.indkey::int2[])[0:cardinality(c.conkey) - 1] OPERATOR(pg_catalog.@>) c.conkey
+            AND (i.indkey::int2[])[0:cardinality(c.conkey) - 1] OPERATOR(pg_catalog.<@) c.conkey);
+$$;
+COMMENT ON FUNCTION analytics.detect_missing_fk_indexes() IS
+'Foreign keys whose referencing columns are not the leading columns of any non-partial index.';
 
-    UNION ALL
-
-    -- Low Priority: Large rarely used indexes
-    SELECT
-        'RARELY_USED_LARGE_INDEX'::TEXT,
-        3,
-        (schemaname || '.' || relname)::TEXT,
-        format('Large index %s (%s) used only %s times',
-               indexrelname, pg_size_pretty(pg_relation_size(indexrelid)), idx_scan),
-        'Review if index is still needed or can be optimized'::TEXT,
-        format('-- Review usage: %s', indexrelname)::TEXT,
-        'MEDIUM - Space optimization'::TEXT
-    FROM pg_stat_user_indexes
-    WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-        AND idx_scan > 0 AND idx_scan < 100
-        AND pg_relation_size(indexrelid) > 10485760  -- > 10MB
-        AND indexrelname NOT LIKE '%_pkey'
-
-    ORDER BY priority, estimated_impact DESC;
-END;
-$$ LANGUAGE plpgsql;
+SELECT table_name, fk_columns, referenced_table, child_rows, suggested_ddl
+FROM analytics.detect_missing_fk_indexes()
+ORDER BY child_rows DESC, table_name, fk_name;
 
 -- =============================================================================
--- INDEX MAINTENANCE RECOMMENDATIONS
+-- 4. TABLES THAT LOOK LIKE THEY NEED AN INDEX (scan statistics)
 -- =============================================================================
+\echo '== 4. Sequential-scan-heavy tables'
 
--- Function to generate index maintenance plan
-CREATE OR REPLACE FUNCTION analytics.generate_index_maintenance_plan()
-RETURNS TABLE(
-    maintenance_type TEXT,
-    table_name TEXT,
-    index_name TEXT,
-    current_size TEXT,
-    bloat_estimate TEXT,
-    recommended_action TEXT,
-    maintenance_command TEXT,
-    maintenance_window TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    WITH index_bloat AS (
-        SELECT
-            schemaname,
-            relname,
-            indexrelname,
-            pg_relation_size(indexrelid) as index_size,
-            -- Simplified bloat estimation
-            CASE
-                WHEN pg_relation_size(indexrelid) > 100000000 THEN 'HIGH'
-                WHEN pg_relation_size(indexrelid) > 10000000 THEN 'MEDIUM'
-                ELSE 'LOW'
-            END as bloat_level
-        FROM pg_stat_user_indexes
-        WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-    )
-    SELECT
-        'REINDEX'::TEXT,
-        (schemaname || '.' || relname)::TEXT,
-        indexrelname::TEXT,
-        pg_size_pretty(index_size)::TEXT,
-        bloat_level::TEXT,
-        CASE bloat_level
-            WHEN 'HIGH' THEN 'REINDEX CONCURRENTLY during maintenance window'
-            WHEN 'MEDIUM' THEN 'Schedule REINDEX during low-traffic period'
-            ELSE 'Monitor, no immediate action needed'
-        END::TEXT,
-        CASE bloat_level
-            WHEN 'HIGH' THEN format('REINDEX INDEX CONCURRENTLY %I.%I;', schemaname, indexrelname)
-            WHEN 'MEDIUM' THEN format('REINDEX INDEX %I.%I;', schemaname, indexrelname)
-            ELSE '-- No action needed'
-        END::TEXT,
-        CASE bloat_level
-            WHEN 'HIGH' THEN 'Weekend maintenance window'
-            WHEN 'MEDIUM' THEN 'Off-peak hours'
-            ELSE 'Any time'
-        END::TEXT
-    FROM index_bloat
-    WHERE bloat_level IN ('HIGH', 'MEDIUM')
-    ORDER BY
-        CASE bloat_level WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END,
-        index_size DESC;
-END;
-$$ LANGUAGE plpgsql;
+-- High seq_tup_read per seq_scan on a big table usually means a missing index
+-- (or a report that legitimately reads everything). pg_stat_statements tells you
+-- which queries; HypoPG (next section) tells you whether an index would help.
+SELECT schemaname || '.' || relname AS table_name,
+       seq_scan, seq_tup_read,
+       seq_tup_read / NULLIF(seq_scan, 0) AS avg_rows_per_seq_scan,
+       idx_scan,
+       pg_size_pretty(pg_table_size(relid)) AS size
+FROM pg_stat_user_tables
+WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+ORDER BY seq_tup_read DESC, table_name
+LIMIT 6;
 
--- Function to execute index recommendations (with dry-run mode)
-CREATE OR REPLACE FUNCTION analytics.execute_index_recommendations(
-    dry_run BOOLEAN DEFAULT true,
-    category_filter TEXT DEFAULT NULL
-)
-RETURNS TEXT AS $$
+-- =============================================================================
+-- 5. HYPOPG: EVALUATE A CANDIDATE INDEX BEFORE BUILDING IT
+-- =============================================================================
+\echo '== 5. HypoPG what-if analysis'
+
+CREATE EXTENSION IF NOT EXISTS hypopg;
+SELECT hypopg_reset();
+
+-- Helper: planner cost and chosen access paths of a query (plain EXPLAIN, which is
+-- what HypoPG influences; EXPLAIN ANALYZE would execute without the fake index).
+CREATE OR REPLACE FUNCTION analytics.plan_cost(p_sql text)
+RETURNS TABLE (total_cost numeric, est_rows numeric, access_paths text)
+LANGUAGE plpgsql AS $$
 DECLARE
-    rec RECORD;
-    result TEXT := 'Index recommendation execution:' || E'\n';
-    executed_count INTEGER := 0;
+    plan jsonb;
 BEGIN
-    FOR rec IN
-        SELECT * FROM analytics.comprehensive_index_advisor()
-        WHERE category_filter IS NULL OR category = category_filter
-        AND priority <= 2  -- Only execute high and medium priority
-        ORDER BY priority
-    LOOP
-        IF dry_run THEN
-            result := result || format('[DRY RUN] %s: %s', rec.category, rec.sql_command) || E'\n';
-        ELSE
-            BEGIN
-                EXECUTE rec.sql_command;
-                result := result || format('[EXECUTED] %s: %s', rec.category, rec.sql_command) || E'\n';
-                executed_count := executed_count + 1;
-            EXCEPTION WHEN OTHERS THEN
-                result := result || format('[ERROR] %s: %s - %s', rec.category, rec.sql_command, SQLERRM) || E'\n';
-            END;
-        END IF;
-    END LOOP;
+    EXECUTE 'EXPLAIN (FORMAT JSON) ' || p_sql INTO plan;
+    total_cost := (plan -> 0 -> 'Plan' ->> 'Total Cost')::numeric;
+    est_rows   := (plan -> 0 -> 'Plan' ->> 'Plan Rows')::numeric;
+    SELECT string_agg(DISTINCT (n ->> 'Node Type') || COALESCE(' using ' || (n ->> 'Index Name'), ''), '; ')
+    INTO access_paths
+    FROM jsonb_path_query(plan, 'strict $.**') AS n
+    WHERE jsonb_typeof(n) = 'object' AND n ? 'Node Type'
+      AND (n ->> 'Node Type') LIKE '%Scan%';
+    RETURN NEXT;
+END $$;
+COMMENT ON FUNCTION analytics.plan_cost(text) IS
+'Total cost, estimated rows and scan nodes of EXPLAIN (FORMAT JSON) for trusted SQL; reacts to HypoPG indexes.';
 
-    result := result || format('Processed recommendations. %s executed.',
-                              CASE WHEN dry_run THEN 0 ELSE executed_count END);
+-- Workload: data-quality triage. Sensor dropouts are written with quality 0.25,
+-- so "quality < 0.3" should return exactly the labelled dropouts in meta.ground_truth.
+SELECT (SELECT count(*) FROM mobility.sensor_readings WHERE data_quality_score < 0.3) AS low_quality_rows,
+       (SELECT count(*) FROM meta.ground_truth
+        WHERE entity = 'mobility.sensor_readings' AND label = 'dropout')             AS labelled_dropouts;
 
-    RETURN result;
-END;
-$$ LANGUAGE plpgsql;
+CREATE TEMP TABLE IF NOT EXISTS hypo_results (ord int, scenario text, total_cost numeric,
+                                              est_rows numeric, access_paths text, est_index_size text);
+TRUNCATE hypo_results;
+
+\set hypo_query 'SELECT reading_id, sensor_code, reading_time FROM mobility.sensor_readings WHERE data_quality_score < 0.3'
+
+INSERT INTO hypo_results
+SELECT 1, 'no index (today)', total_cost, est_rows, access_paths, NULL
+FROM analytics.plan_cost(:'hypo_query');
+
+-- Candidate A: plain btree on the column.
+SELECT indexrelid AS hypo_a FROM hypopg_create_index(
+    'CREATE INDEX ON mobility.sensor_readings (data_quality_score)') \gset
+INSERT INTO hypo_results
+SELECT 2, 'A: btree (data_quality_score)', total_cost, est_rows, access_paths,
+       pg_size_pretty(hypopg_relation_size(:hypo_a))
+FROM analytics.plan_cost(:'hypo_query');
+SELECT hypopg_drop_index(:hypo_a);
+
+-- Candidate B: partial index covering only the rows triage ever asks for.
+SELECT indexrelid AS hypo_b FROM hypopg_create_index(
+    'CREATE INDEX ON mobility.sensor_readings (data_quality_score) WHERE data_quality_score < 0.5') \gset
+INSERT INTO hypo_results
+SELECT 3, 'B: partial btree WHERE quality < 0.5', total_cost, est_rows, access_paths,
+       pg_size_pretty(hypopg_relation_size(:hypo_b))
+FROM analytics.plan_cost(:'hypo_query');
+
+SELECT scenario, round(total_cost, 1) AS total_cost, est_rows, access_paths, est_index_size
+FROM hypo_results ORDER BY ord;
+SELECT hypopg_reset();
+
+-- Validate the winner for real, then throw it away (CREATE INDEX is transactional).
+BEGIN;
+CREATE INDEX hypo_validation_idx ON mobility.sensor_readings (data_quality_score)
+    WHERE data_quality_score < 0.5;
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT reading_id, sensor_code, reading_time FROM mobility.sensor_readings WHERE data_quality_score < 0.3;
+SELECT pg_size_pretty(pg_relation_size('mobility.hypo_validation_idx')) AS real_index_size;
+ROLLBACK;
+-- In production build it with CREATE INDEX CONCURRENTLY (no write lock, cannot run
+-- inside a transaction block, leaves an INVALID index behind if it fails).
+
+-- =============================================================================
+-- 6. HYPOPG: WHAT IF WE DROPPED AN INDEX? (hidden indexes)
+-- =============================================================================
+\echo '== 6. Hiding a duplicate index from the planner'
+
+-- civics.idx_citizens_email duplicates the unique index behind citizens_email_key.
+-- Hide it (session-only, nothing is dropped) and confirm lookups still use an index.
+SELECT analytics.plan_cost($q$SELECT citizen_id FROM civics.citizens WHERE email = 'nobody@example.com'$q$) AS before_hiding;
+SELECT hypopg_hide_index('civics.idx_citizens_email'::regclass) AS hidden;
+SELECT analytics.plan_cost($q$SELECT citizen_id FROM civics.citizens WHERE email = 'nobody@example.com'$q$) AS after_hiding;
+SELECT hypopg_unhide_all_indexes();
+
+-- =============================================================================
+-- 7. COVERING INDEXES (INCLUDE) FOR INDEX-ONLY SCANS
+-- =============================================================================
+\echo '== 7. Covering index candidate for "order history of one customer"'
+
+\set cover_query 'SELECT order_date, total_amount FROM commerce.orders WHERE customer_citizen_id = 42 ORDER BY order_date DESC'
+
+SELECT 'existing idx_orders_customer' AS scenario, * FROM analytics.plan_cost(:'cover_query');
+SELECT indexrelid AS hypo_c FROM hypopg_create_index(
+    'CREATE INDEX ON commerce.orders (customer_citizen_id, order_date DESC) INCLUDE (total_amount)') \gset
+SELECT 'hypothetical (customer, order_date DESC) INCLUDE (total_amount)' AS scenario, * FROM analytics.plan_cost(:'cover_query');
+SELECT pg_size_pretty(hypopg_relation_size(:hypo_c)) AS est_size;
+SELECT hypopg_reset();
+-- Index-only scans also need an up-to-date visibility map (VACUUM). If this index
+-- were built, idx_orders_customer would become prefix-redundant (section 2).
+
+-- =============================================================================
+-- 8. INDEX HEALTH: bloat and fragmentation with pgstattuple
+-- =============================================================================
+\echo '== 8. B-tree density (pgstatindex) for the largest indexes'
+
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+-- avg_leaf_density far below the fillfactor (90 for btree) after heavy churn means
+-- bloat: REINDEX INDEX CONCURRENTLY rebuilds it without blocking writes.
+SELECT i.indexrelid::regclass AS index_name,
+       pg_size_pretty(pg_relation_size(i.indexrelid)) AS size,
+       s.avg_leaf_density, s.leaf_fragmentation, s.tree_level
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN LATERAL pgstatindex(i.indexrelid) s
+WHERE n.nspname IN ('commerce', 'mobility')
+  AND c.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+ORDER BY pg_relation_size(i.indexrelid) DESC, index_name
+LIMIT 5;
+
+-- =============================================================================
+-- 9. ONE ADVISOR REPORT (DDL text only; review and run by hand)
+-- =============================================================================
+\echo '== 9. Combined advisor report'
+
+CREATE OR REPLACE FUNCTION analytics.comprehensive_index_advisor()
+RETURNS TABLE (priority int, category text, object text, suggested_ddl text, rationale text)
+LANGUAGE sql STABLE AS $$
+    SELECT 1, 'DUPLICATE/REDUNDANT', redundant_index, suggested_ddl,
+           kind || ' of ' || covered_by || ': pure write and storage overhead'
+    FROM analytics.detect_redundant_indexes()
+    UNION ALL
+    SELECT 2, 'MISSING FK INDEX', table_name || ' (' || fk_columns || ')', suggested_ddl,
+           'Parent DELETE/UPDATE scans ' || child_rows || ' child rows; parent-to-child joins cannot use an index'
+    FROM analytics.detect_missing_fk_indexes()
+    WHERE child_rows >= 1000
+    UNION ALL
+    SELECT 3, 'UNUSED INDEX', index_name, suggested_ddl,
+           'Scanned ' || idx_scan || ' times since stats reset; confirm on replicas and over a full business cycle'
+    FROM analytics.detect_unused_indexes(1024 * 1024);      -- ignore tiny ones
+$$;
+COMMENT ON FUNCTION analytics.comprehensive_index_advisor() IS
+'Prioritised index advice (duplicates, missing FK indexes, unused indexes) as reviewable DDL; executes nothing.';
+
+SELECT priority, category, object, suggested_ddl
+FROM analytics.comprehensive_index_advisor()
+ORDER BY priority, object
+LIMIT 15;

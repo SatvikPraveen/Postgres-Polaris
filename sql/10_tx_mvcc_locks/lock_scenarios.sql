@@ -1,498 +1,553 @@
 -- File: sql/10_tx_mvcc_locks/lock_scenarios.sql
--- Purpose: Deadlocks, NOWAIT, SKIP LOCKED patterns and lock conflict resolution
+-- Purpose: Heavyweight locks in practice: the table lock-mode conflict matrix
+--          (documented and measured), row locks, NOWAIT / lock_timeout,
+--          a SKIP LOCKED job queue, deadlocks, advisory locks and lock monitoring.
+--
+-- Single-session safe: the script never blocks.
+--   * A session never conflicts with its own locks, so the competing session
+--     ("Session B") is a loopback postgres_fdw connection to this same database.
+--     It runs with lock_timeout = 200ms, so whenever it would wait on us it gives
+--     up quickly with SQLSTATE 55P03 (lock_not_available), which we catch.
+--     Its remote transaction ends when ours ends.
+--   * Our own waits are bounded with NOWAIT or SET LOCAL lock_timeout.
+--   * A real (detected) deadlock needs two independently waiting sessions; it is
+--     given as `-- [Session A]` / `-- [Session B]` steps.
+-- Idempotent: all objects are module-owned (analytics.lock_*); base data is never changed.
+
+-- Older revisions of this file created these functions with other result shapes.
+DROP FUNCTION IF EXISTS analytics.monitor_locks();
+DROP FUNCTION IF EXISTS analytics.detect_lock_issues();
 
 -- =============================================================================
--- LOCK CONFLICT SCENARIOS
+-- 0. LAB SETUP
 -- =============================================================================
+\echo '== 0. Lab setup'
 
--- Function to demonstrate lock conflicts
-CREATE OR REPLACE FUNCTION analytics.demo_lock_conflicts()
-RETURNS TABLE(
-    scenario TEXT,
-    session_id INTEGER,
-    lock_type TEXT,
-    object_locked TEXT,
-    wait_time_sec NUMERIC,
-    outcome TEXT
-) AS $$
-BEGIN
-    -- Create demo table for lock testing
-    CREATE TEMP TABLE lock_test_accounts (
-        account_id INTEGER PRIMARY KEY,
-        balance NUMERIC(10,2),
-        version INTEGER DEFAULT 1
-    ) ON COMMIT DROP;
+DROP TABLE IF EXISTS analytics.lock_matrix_target CASCADE;
+CREATE TABLE analytics.lock_matrix_target (id integer PRIMARY KEY, v integer NOT NULL);
+INSERT INTO analytics.lock_matrix_target VALUES (1, 0);
 
-    INSERT INTO lock_test_accounts VALUES
-        (1, 1000.00, 1),
-        (2, 500.00, 1),
-        (3, 750.00, 1);
-
-    -- Scenario 1: Row-level locks with SELECT FOR UPDATE
-    RETURN QUERY
-    SELECT
-        'Row Lock Conflict'::TEXT,
-        1,
-        'FOR UPDATE'::TEXT,
-        'account_id = 1'::TEXT,
-        0.0,
-        'Lock acquired successfully'::TEXT;
-
-    -- Demo the actual locking (would block in concurrent sessions)
-    PERFORM * FROM lock_test_accounts WHERE account_id = 1 FOR UPDATE;
-
-    -- Scenario 2: NOWAIT example
-    RETURN QUERY
-    SELECT
-        'NOWAIT Example'::TEXT,
-        2,
-        'FOR UPDATE NOWAIT'::TEXT,
-        'account_id = 1'::TEXT,
-        0.0,
-        'Would fail immediately if locked'::TEXT;
-
-    -- Scenario 3: SKIP LOCKED example
-    RETURN QUERY
-    SELECT
-        'SKIP LOCKED Example'::TEXT,
-        3,
-        'FOR UPDATE SKIP LOCKED'::TEXT,
-        'all unlocked rows'::TEXT,
-        0.0,
-        'Processes available rows only'::TEXT;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- NOWAIT PATTERNS
--- =============================================================================
-
--- Bank transfer with NOWAIT to avoid blocking
-CREATE OR REPLACE FUNCTION civics.safe_tax_payment_with_nowait(
-    p_citizen_id BIGINT,
-    p_payment_amount NUMERIC(12,2)
-)
-RETURNS TABLE(
-    success BOOLEAN,
-    message TEXT,
-    new_balance NUMERIC,
-    processing_time_ms NUMERIC
-) AS $$
-DECLARE
-    start_time TIMESTAMPTZ;
-    end_time TIMESTAMPTZ;
-    current_balance NUMERIC;
-    tax_record RECORD;
-BEGIN
-    start_time := clock_timestamp();
-
-    -- Try to lock tax record with NOWAIT
-    BEGIN
-        SELECT * INTO tax_record
-        FROM civics.tax_payments
-        WHERE citizen_id = p_citizen_id
-            AND payment_status != 'paid'
-        ORDER BY due_date
-        LIMIT 1
-        FOR UPDATE NOWAIT;
-
-        -- If we get here, we have the lock
-        IF NOT FOUND THEN
-            end_time := clock_timestamp();
-            RETURN QUERY SELECT
-                false,
-                'No outstanding tax payments found'::TEXT,
-                0::NUMERIC,
-                EXTRACT(EPOCH FROM (end_time - start_time)) * 1000;
-            RETURN;
-        END IF;
-
-        current_balance := tax_record.amount_due - tax_record.amount_paid;
-
-        -- Process payment
-        UPDATE civics.tax_payments
-        SET amount_paid = amount_paid + p_payment_amount,
-            payment_status = CASE
-                WHEN amount_paid + p_payment_amount >= amount_due THEN 'paid'::civics.payment_status
-                ELSE payment_status
-            END,
-            payment_date = CASE
-                WHEN payment_date IS NULL THEN NOW()
-                ELSE payment_date
-            END
-        WHERE tax_id = tax_record.tax_id;
-
-        end_time := clock_timestamp();
-
-        RETURN QUERY SELECT
-            true,
-            'Payment processed successfully'::TEXT,
-            (current_balance - p_payment_amount),
-            EXTRACT(EPOCH FROM (end_time - start_time)) * 1000;
-
-    EXCEPTION
-        WHEN lock_not_available THEN
-            end_time := clock_timestamp();
-            RETURN QUERY SELECT
-                false,
-                'Tax record is locked by another session - try again later'::TEXT,
-                NULL::NUMERIC,
-                EXTRACT(EPOCH FROM (end_time - start_time)) * 1000;
-        WHEN OTHERS THEN
-            end_time := clock_timestamp();
-            RETURN QUERY SELECT
-                false,
-                'Error: ' || SQLERRM,
-                NULL::NUMERIC,
-                EXTRACT(EPOCH FROM (end_time - start_time)) * 1000;
-    END;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- SKIP LOCKED PATTERNS
--- =============================================================================
-
--- Queue processing with SKIP LOCKED
-CREATE TABLE IF NOT EXISTS analytics.processing_queue (
-    queue_id BIGSERIAL PRIMARY KEY,
-    task_type TEXT NOT NULL,
-    task_data JSONB,
-    status TEXT DEFAULT 'pending',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    worker_id TEXT,
-    error_message TEXT
+DROP TABLE IF EXISTS analytics.lock_accounts CASCADE;
+CREATE TABLE analytics.lock_accounts (
+    account_id integer PRIMARY KEY,
+    balance    numeric(12,2) NOT NULL CHECK (balance >= 0)
 );
+INSERT INTO analytics.lock_accounts VALUES (1, 1000), (2, 500), (3, 750);
 
--- Function to process queue items with SKIP LOCKED
-CREATE OR REPLACE FUNCTION analytics.process_queue_items(
-    worker_id_param TEXT,
-    batch_size INTEGER DEFAULT 10
-)
-RETURNS TABLE(
-    tasks_processed INTEGER,
-    tasks_skipped INTEGER,
-    processing_time_sec NUMERIC,
-    worker_id TEXT
-) AS $$
-DECLARE
-    start_time TIMESTAMPTZ;
-    end_time TIMESTAMPTZ;
-    task_record RECORD;
-    processed_count INTEGER := 0;
-    available_count INTEGER;
-    total_pending INTEGER;
+-- Job queue: one triage job per still-open complaint (status submitted/under_review).
+DROP TABLE IF EXISTS analytics.lock_jobs CASCADE;
+CREATE TABLE analytics.lock_jobs (
+    job_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    complaint_id bigint      NOT NULL,
+    priority     smallint    NOT NULL,          -- 1 = urgent ... 4 = low
+    status       text        NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    worker       text,
+    attempts     integer     NOT NULL DEFAULT 0,
+    created_at   timestamptz NOT NULL,
+    started_at   timestamptz,
+    finished_at  timestamptz
+);
+-- Workers only ever look for pending jobs in priority order: a partial index keeps
+-- that lookup tiny no matter how many finished jobs accumulate.
+CREATE INDEX lock_jobs_pending_idx ON analytics.lock_jobs (priority, job_id) WHERE status = 'pending';
+
+INSERT INTO analytics.lock_jobs (complaint_id, priority, created_at)
+SELECT complaint_id,
+       CASE priority_level WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END,
+       submitted_at
+FROM documents.complaint_records
+WHERE status IN ('submitted', 'under_review')
+ORDER BY submitted_at DESC, complaint_id
+LIMIT 12;
+
+-- Session B: loopback connection (rebuilt every run; dbname follows clones).
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+DROP SERVER IF EXISTS m10_lock_session_b CASCADE;
+DO $$
 BEGIN
-    start_time := clock_timestamp();
+    EXECUTE format(
+        'CREATE SERVER m10_lock_session_b FOREIGN DATA WRAPPER postgres_fdw
+             OPTIONS (dbname %L, application_name %L, options %L)',
+        current_database(), 'm10_lock_session_b',
+        '-c lock_timeout=200 -c statement_timeout=10000');
+    -- Superusers may connect without a password; other roles need one here.
+    EXECUTE format('CREATE USER MAPPING FOR CURRENT_USER SERVER m10_lock_session_b OPTIONS (user %L)',
+                   current_user);
+END $$;
 
-    -- Count total pending tasks
-    SELECT COUNT(*) INTO total_pending
-    FROM analytics.processing_queue
-    WHERE status = 'pending';
+-- Remote-side views give Session B statements that postgres_fdw cannot push down
+-- by itself (SKIP LOCKED, advisory-lock calls).
+CREATE OR REPLACE VIEW analytics.lock_jobs_claimable AS
+SELECT job_id, complaint_id, priority
+FROM analytics.lock_jobs
+WHERE status = 'pending'
+ORDER BY priority, job_id
+LIMIT 3
+FOR UPDATE SKIP LOCKED;
 
-    -- Process available tasks using SKIP LOCKED
-    FOR task_record IN
-        SELECT queue_id, task_type, task_data
-        FROM analytics.processing_queue
-        WHERE status = 'pending'
-        ORDER BY created_at
-        LIMIT batch_size
-        FOR UPDATE SKIP LOCKED
-    LOOP
-        -- Mark as started
-        UPDATE analytics.processing_queue
-        SET status = 'processing',
-            started_at = NOW(),
-            worker_id = worker_id_param
-        WHERE queue_id = task_record.queue_id;
+-- The same query without SKIP LOCKED, to show what B would otherwise do.
+CREATE OR REPLACE VIEW analytics.lock_jobs_next_waiting AS
+SELECT job_id, complaint_id, priority
+FROM analytics.lock_jobs
+WHERE status = 'pending'
+ORDER BY priority, job_id
+LIMIT 3
+FOR UPDATE;
 
-        -- Simulate task processing
-        PERFORM pg_sleep(0.01); -- 10ms processing time
+CREATE OR REPLACE VIEW analytics.lock_try_report_lock AS
+SELECT pg_try_advisory_xact_lock(hashtext('m10:nightly-report')) AS got_lock;
 
-        -- Mark as completed
-        UPDATE analytics.processing_queue
-        SET status = 'completed',
-            completed_at = NOW()
-        WHERE queue_id = task_record.queue_id;
+CREATE FOREIGN TABLE analytics.lock_matrix_target_b (id integer, v integer)
+    SERVER m10_lock_session_b OPTIONS (schema_name 'analytics', table_name 'lock_matrix_target');
+CREATE FOREIGN TABLE analytics.lock_accounts_b (account_id integer, balance numeric(12,2))
+    SERVER m10_lock_session_b OPTIONS (schema_name 'analytics', table_name 'lock_accounts');
+CREATE FOREIGN TABLE analytics.lock_jobs_claimable_b (job_id bigint, complaint_id bigint, priority smallint)
+    SERVER m10_lock_session_b OPTIONS (schema_name 'analytics', table_name 'lock_jobs_claimable');
+CREATE FOREIGN TABLE analytics.lock_jobs_next_waiting_b (job_id bigint, complaint_id bigint, priority smallint)
+    SERVER m10_lock_session_b OPTIONS (schema_name 'analytics', table_name 'lock_jobs_next_waiting');
+CREATE FOREIGN TABLE analytics.lock_try_report_lock_b (got_lock boolean)
+    SERVER m10_lock_session_b OPTIONS (schema_name 'analytics', table_name 'lock_try_report_lock');
+-- Read-only window on a base table (B only ever locks rows here; changes are rolled back).
+CREATE FOREIGN TABLE analytics.lock_tax_payments_b (tax_id bigint, citizen_id bigint, payment_status text)
+    SERVER m10_lock_session_b OPTIONS (schema_name 'civics', table_name 'tax_payments');
 
-        processed_count := processed_count + 1;
+CREATE OR REPLACE FUNCTION analytics.lock_session_b_available()
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM analytics.lock_matrix_target_b LIMIT 1;
+    RETURN true;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Loopback Session B unavailable (%); live contention demos will be skipped', SQLERRM;
+    RETURN false;
+END $$;
+
+SELECT CASE WHEN analytics.lock_session_b_available() THEN 'true' ELSE 'false' END AS session_b_ok \gset
+
+-- =============================================================================
+-- 1. TABLE-LEVEL LOCK MODES: who takes what, and the documented conflict matrix
+-- =============================================================================
+\echo '== 1. Lock modes and the documented conflict matrix'
+
+CREATE OR REPLACE VIEW analytics.lock_mode_reference AS
+SELECT * FROM (VALUES
+    (1, 'AccessShareLock',          'ACCESS SHARE',           'SELECT',
+        ARRAY['AccessExclusiveLock']),
+    (2, 'RowShareLock',             'ROW SHARE',              'SELECT ... FOR UPDATE/SHARE',
+        ARRAY['ExclusiveLock','AccessExclusiveLock']),
+    (3, 'RowExclusiveLock',         'ROW EXCLUSIVE',          'INSERT, UPDATE, DELETE, MERGE',
+        ARRAY['ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock']),
+    (4, 'ShareUpdateExclusiveLock', 'SHARE UPDATE EXCLUSIVE', 'VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY, most ALTER TABLE ... SET',
+        ARRAY['ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock']),
+    (5, 'ShareLock',                'SHARE',                  'CREATE INDEX (non-concurrent)',
+        ARRAY['RowExclusiveLock','ShareUpdateExclusiveLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock']),
+    (6, 'ShareRowExclusiveLock',    'SHARE ROW EXCLUSIVE',    'CREATE TRIGGER, some ALTER TABLE (e.g. ADD FOREIGN KEY)',
+        ARRAY['RowExclusiveLock','ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock']),
+    (7, 'ExclusiveLock',            'EXCLUSIVE',              'REFRESH MATERIALIZED VIEW CONCURRENTLY',
+        ARRAY['RowShareLock','RowExclusiveLock','ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock']),
+    (8, 'AccessExclusiveLock',      'ACCESS EXCLUSIVE',       'DROP/TRUNCATE, VACUUM FULL, most ALTER TABLE, LOCK TABLE (default)',
+        ARRAY['AccessShareLock','RowShareLock','RowExclusiveLock','ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock'])
+) AS t(strength, pg_locks_mode, sql_mode, typical_statements, conflicts_with);
+COMMENT ON VIEW analytics.lock_mode_reference IS
+'The eight table-level lock modes (as named in pg_locks), typical statements and documented conflicts.';
+
+SELECT strength, sql_mode, typical_statements FROM analytics.lock_mode_reference ORDER BY strength;
+
+-- Matrix: X = the two modes conflict (symmetric). Rows/columns in strength order.
+SELECT r.sql_mode AS held_vs_requested,
+       max(CASE WHEN c.strength = 1 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "AccSh",
+       max(CASE WHEN c.strength = 2 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "RowSh",
+       max(CASE WHEN c.strength = 3 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "RowEx",
+       max(CASE WHEN c.strength = 4 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "ShUpdEx",
+       max(CASE WHEN c.strength = 5 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "Share",
+       max(CASE WHEN c.strength = 6 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "ShRowEx",
+       max(CASE WHEN c.strength = 7 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "Excl",
+       max(CASE WHEN c.strength = 8 THEN CASE WHEN c.pg_locks_mode = ANY (r.conflicts_with) THEN 'X' ELSE '.' END END) AS "AccEx"
+FROM analytics.lock_mode_reference r CROSS JOIN analytics.lock_mode_reference c
+GROUP BY r.strength, r.sql_mode
+ORDER BY r.strength;
+
+-- =============================================================================
+-- 2. SEEING YOUR OWN LOCKS IN pg_locks
+-- =============================================================================
+\echo '== 2. Locks held by one transaction'
+
+BEGIN;
+SELECT * FROM analytics.lock_accounts WHERE account_id = 1 FOR UPDATE;   -- RowShareLock + tuple lock in xmax
+UPDATE analytics.lock_accounts SET balance = balance + 1 WHERE account_id = 2;  -- RowExclusiveLock, assigns an xid
+LOCK TABLE analytics.lock_matrix_target IN SHARE MODE;
+SELECT l.locktype,
+       COALESCE(l.relation::regclass::text, l.transactionid::text, l.virtualxid) AS object,
+       l.mode, l.granted, l.fastpath
+FROM pg_locks l
+WHERE l.pid = pg_backend_pid()
+  AND (l.relation IS NULL OR l.relation::regclass::text LIKE 'analytics.lock_%')
+ORDER BY l.locktype, object, l.mode;
+ROLLBACK;
+-- Notes: every transaction holds an ExclusiveLock on its own virtualxid (and on
+-- its transactionid once it writes); others wait on those to wait for "the
+-- transaction", e.g. for a row lock. Weak locks (< ShareUpdateExclusive) on
+-- relations are taken via the per-backend fast path (fastpath = t).
+
+-- =============================================================================
+-- 3. THE MATRIX, MEASURED: Session B probes while we hold each mode
+-- =============================================================================
+\echo '== 3. Empirical conflict check (we hold mode X; Session B runs SELECT / SELECT FOR UPDATE / UPDATE)'
+
+\if :session_b_ok
+CREATE TEMP TABLE IF NOT EXISTS lock_probe_results (
+    held_mode text, held_strength int, probe text, probe_mode text, observed text);
+TRUNCATE lock_probe_results;
+
+DO $$
+DECLARE
+    m      record;
+    p      record;
+    result text;
+BEGIN
+    FOR m IN SELECT strength, sql_mode FROM analytics.lock_mode_reference ORDER BY strength LOOP
+        FOR p IN SELECT * FROM (VALUES
+                    (1, 'SELECT',            'AccessShareLock',  'SELECT count(*) FROM analytics.lock_matrix_target_b'),
+                    (2, 'SELECT FOR UPDATE', 'RowShareLock',     'SELECT id FROM analytics.lock_matrix_target_b WHERE id = -1 FOR UPDATE'),
+                    (3, 'UPDATE',            'RowExclusiveLock', 'UPDATE analytics.lock_matrix_target_b SET v = v WHERE id = -1')
+                 ) AS v(ord, probe, probe_mode, sql) ORDER BY ord LOOP
+            BEGIN
+                -- subtransaction: our LOCK and B's remote work are both undone below
+                EXECUTE format('LOCK TABLE analytics.lock_matrix_target IN %s MODE', m.sql_mode);
+                EXECUTE p.sql;
+                result := 'granted';
+                RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'undo probe';
+            EXCEPTION
+                WHEN lock_not_available THEN result := 'BLOCKED';
+                WHEN raise_exception    THEN NULL;  -- our own undo signal
+            END;
+            INSERT INTO lock_probe_results VALUES (m.sql_mode, m.strength, p.probe, p.probe_mode, result);
+        END LOOP;
     END LOOP;
+END $$;
 
-    -- Count how many are still available
-    SELECT COUNT(*) INTO available_count
-    FROM analytics.processing_queue
-    WHERE status = 'pending';
-
-    end_time := clock_timestamp();
-
-    RETURN QUERY SELECT
-        processed_count,
-        (total_pending - processed_count - available_count),
-        EXTRACT(EPOCH FROM (end_time - start_time)),
-        worker_id_param;
-END;
-$$ LANGUAGE plpgsql;
+SELECT r.held_mode,
+       max(r.observed) FILTER (WHERE r.probe = 'SELECT')            AS "B: SELECT",
+       max(r.observed) FILTER (WHERE r.probe = 'SELECT FOR UPDATE') AS "B: SELECT FOR UPDATE",
+       max(r.observed) FILTER (WHERE r.probe = 'UPDATE')            AS "B: UPDATE",
+       bool_and((r.observed = 'BLOCKED') = (r.probe_mode = ANY (ref.conflicts_with))) AS matches_docs
+FROM lock_probe_results r
+JOIN analytics.lock_mode_reference ref ON ref.sql_mode = r.held_mode
+GROUP BY r.held_strength, r.held_mode
+ORDER BY r.held_strength;
+\else
+\echo 'skipped (no loopback session)'
+\endif
+-- Takeaway: plain reads are blocked only by ACCESS EXCLUSIVE, but an ALTER TABLE
+-- that queues for ACCESS EXCLUSIVE also blocks every read queued behind it.
+-- Always run DDL with a short lock_timeout and retry.
 
 -- =============================================================================
--- DEADLOCK DETECTION AND RESOLUTION
+-- 4. ROW LOCKS: NOWAIT and lock_timeout
 -- =============================================================================
+\echo '== 4. Row lock held by Session B; we refuse to wait (NOWAIT) or wait briefly (lock_timeout)'
 
--- Function to simulate and handle potential deadlocks
-CREATE OR REPLACE FUNCTION analytics.simulate_deadlock_scenario(
-    session_identifier TEXT,
-    target_account_1 INTEGER DEFAULT 1,
-    target_account_2 INTEGER DEFAULT 2
-)
-RETURNS TEXT AS $$
-DECLARE
-    result TEXT;
+\if :session_b_ok
+BEGIN;
+UPDATE analytics.lock_accounts_b SET balance = balance - 100 WHERE account_id = 1;  -- B now holds the row
+
+DO $$
 BEGIN
-    -- Create temp accounts for deadlock demo
-    CREATE TEMP TABLE deadlock_accounts (
-        account_id INTEGER PRIMARY KEY,
-        balance NUMERIC(10,2)
-    );
+    PERFORM 1 FROM analytics.lock_accounts WHERE account_id = 1 FOR UPDATE NOWAIT;
+EXCEPTION WHEN lock_not_available THEN
+    RAISE NOTICE 'NOWAIT: % (SQLSTATE %)', SQLERRM, SQLSTATE;
+END $$;
 
-    INSERT INTO deadlock_accounts VALUES (1, 1000), (2, 500);
-
-    result := 'Session ' || session_identifier || ': ';
-
-    BEGIN
-        -- Session order determines deadlock potential
-        IF session_identifier = 'A' THEN
-            -- Session A: Lock account 1 first, then account 2
-            PERFORM pg_sleep(0.1);
-            UPDATE deadlock_accounts SET balance = balance - 100 WHERE account_id = target_account_1;
-            result := result || 'Locked account ' || target_account_1 || '; ';
-
-            PERFORM pg_sleep(0.2); -- Increase deadlock window
-            UPDATE deadlock_accounts SET balance = balance + 100 WHERE account_id = target_account_2;
-            result := result || 'Locked account ' || target_account_2 || '; ';
-
-        ELSE
-            -- Session B: Lock account 2 first, then account 1 (potential deadlock)
-            PERFORM pg_sleep(0.1);
-            UPDATE deadlock_accounts SET balance = balance - 50 WHERE account_id = target_account_2;
-            result := result || 'Locked account ' || target_account_2 || '; ';
-
-            PERFORM pg_sleep(0.2);
-            UPDATE deadlock_accounts SET balance = balance + 50 WHERE account_id = target_account_1;
-            result := result || 'Locked account ' || target_account_1 || '; ';
-        END IF;
-
-        result := result || 'Transaction completed successfully';
-
-    EXCEPTION
-        WHEN deadlock_detected THEN
-            result := result || 'DEADLOCK DETECTED - Transaction aborted and will retry';
-            ROLLBACK;
-        WHEN OTHERS THEN
-            result := result || 'ERROR: ' || SQLERRM;
-            ROLLBACK;
-    END;
-
-    RETURN result;
-END;
-$$ LANGUAGE plpgsql;
-
--- Deadlock-resistant money transfer function
-CREATE OR REPLACE FUNCTION analytics.deadlock_resistant_transfer(
-    from_account INTEGER,
-    to_account INTEGER,
-    transfer_amount NUMERIC(10,2),
-    max_retries INTEGER DEFAULT 3
-)
-RETURNS TABLE(
-    success BOOLEAN,
-    attempt_number INTEGER,
-    final_message TEXT,
-    total_time_ms NUMERIC
-) AS $
-DECLARE
-    retry_count INTEGER := 0;
-    start_time TIMESTAMPTZ;
-    account1 INTEGER;
-    account2 INTEGER;
-    result_msg TEXT;
+SET LOCAL lock_timeout = '150ms';
+DO $$
+DECLARE t0 timestamptz := clock_timestamp();
 BEGIN
-    start_time := clock_timestamp();
+    UPDATE analytics.lock_accounts SET balance = balance + 1 WHERE account_id = 1;
+EXCEPTION WHEN lock_not_available THEN
+    RAISE NOTICE 'lock_timeout: gave up after ~% ms: %',
+        round(extract(epoch FROM clock_timestamp() - t0) * 1000), SQLERRM;
+END $$;
 
-    -- Always lock accounts in consistent order to prevent deadlocks
-    account1 := LEAST(from_account, to_account);
-    account2 := GREATEST(from_account, to_account);
+-- Other rows are unaffected: row locks are per row.
+UPDATE analytics.lock_accounts SET balance = balance + 1 WHERE account_id = 2 RETURNING account_id, balance;
+ROLLBACK;
+\else
+\echo 'skipped (no loopback session)'
+\endif
 
-    WHILE retry_count <= max_retries LOOP
-        retry_count := retry_count + 1;
+-- Row-lock strengths (weakest to strongest): FOR KEY SHARE, FOR SHARE,
+-- FOR NO KEY UPDATE (taken by ordinary UPDATEs that do not change a key),
+-- FOR UPDATE (DELETE, key-changing UPDATE). FK checks take FOR KEY SHARE on the
+-- parent row, which does not conflict with FOR NO KEY UPDATE, so updating a
+-- citizen's email does not block inserting their orders.
 
-        BEGIN
-            -- Lock accounts in consistent order
-            PERFORM balance FROM deadlock_accounts WHERE account_id = account1 FOR UPDATE;
-            PERFORM balance FROM deadlock_accounts WHERE account_id = account2 FOR UPDATE;
-
-            -- Perform transfer
-            UPDATE deadlock_accounts
-            SET balance = balance - transfer_amount
-            WHERE account_id = from_account;
-
-            UPDATE deadlock_accounts
-            SET balance = balance + transfer_amount
-            WHERE account_id = to_account;
-
-            result_msg := 'Transfer completed successfully on attempt ' || retry_count;
-
-            RETURN QUERY SELECT
-                true,
-                retry_count,
-                result_msg,
-                EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
-            RETURN;
-
-        EXCEPTION
-            WHEN deadlock_detected THEN
-                IF retry_count >= max_retries THEN
-                    RETURN QUERY SELECT
-                        false,
-                        retry_count,
-                        'Transfer failed after ' || max_retries || ' attempts due to deadlocks'::TEXT,
-                        EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
-                    RETURN;
-                END IF;
-
-                -- Wait before retry with exponential backoff
-                PERFORM pg_sleep(0.1 * retry_count);
-                CONTINUE;
-        END;
-    END LOOP;
-END;
-$ LANGUAGE plpgsql;
-
--- =============================================================================
--- ADVISORY LOCKS FOR COORDINATION
--- =============================================================================
-
--- Use advisory locks for application-level coordination
-CREATE OR REPLACE FUNCTION analytics.process_with_advisory_lock(
-    process_name TEXT,
-    process_data TEXT
-)
-RETURNS TABLE(
-    acquired_lock BOOLEAN,
-    process_result TEXT,
-    lock_duration_ms NUMERIC
-) AS $
+-- A NOWAIT business function on real data: pay the oldest open tax bill of a
+-- citizen, or report immediately that another session is working on it.
+CREATE OR REPLACE FUNCTION analytics.pay_tax_nowait(p_citizen_id bigint, p_amount numeric)
+RETURNS TABLE (success boolean, message text, tax_id bigint, remaining numeric)
+LANGUAGE plpgsql AS $$
 DECLARE
-    lock_id BIGINT;
-    start_time TIMESTAMPTZ;
-    got_lock BOOLEAN;
+    t civics.tax_payments%ROWTYPE;
+    pay numeric;
 BEGIN
-    -- Convert process name to numeric ID for advisory lock
-    lock_id := abs(hashtext(process_name));
-    start_time := clock_timestamp();
-
-    -- Try to acquire advisory lock (non-blocking)
-    got_lock := pg_try_advisory_lock(lock_id);
-
-    IF NOT got_lock THEN
-        RETURN QUERY SELECT
-            false,
-            'Process ' || process_name || ' is already running in another session'::TEXT,
-            EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
+    IF p_amount <= 0 THEN
+        RETURN QUERY SELECT false, 'amount must be positive', NULL::bigint, NULL::numeric;
         RETURN;
     END IF;
-
     BEGIN
-        -- Simulate exclusive process
-        PERFORM pg_sleep(0.5);
-
-        RETURN QUERY SELECT
-            true,
-            'Process ' || process_name || ' completed: ' || process_data,
-            EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
-
-    EXCEPTION WHEN OTHERS THEN
-        RETURN QUERY SELECT
-            true,
-            'Process failed: ' || SQLERRM,
-            EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
+        SELECT * INTO t
+        FROM civics.tax_payments tp
+        WHERE tp.citizen_id = p_citizen_id AND tp.payment_status <> 'paid'
+        ORDER BY tp.due_date, tp.tax_id
+        LIMIT 1
+        FOR UPDATE NOWAIT;
+    EXCEPTION WHEN lock_not_available THEN
+        RETURN QUERY SELECT false, 'bill is locked by another session - try again later', NULL::bigint, NULL::numeric;
+        RETURN;
     END;
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT false, 'no outstanding tax bills', NULL::bigint, NULL::numeric;
+        RETURN;
+    END IF;
+    pay := least(p_amount, t.amount_due - t.amount_paid);       -- respects chk_tax_payment_logic
+    UPDATE civics.tax_payments tp
+    SET amount_paid    = tp.amount_paid + pay,
+        payment_status = CASE WHEN tp.amount_paid + pay >= tp.amount_due THEN 'paid'::civics.payment_status
+                              ELSE tp.payment_status END,
+        payment_date   = COALESCE(tp.payment_date, now()),
+        updated_at     = now()
+    WHERE tp.tax_id = t.tax_id;
+    RETURN QUERY SELECT true, format('paid %s', pay), t.tax_id, t.amount_due - t.amount_paid - pay;
+END $$;
 
-    -- Release advisory lock
-    PERFORM pg_advisory_unlock(lock_id);
-END;
-$ LANGUAGE plpgsql;
+-- Demo on base data, always rolled back.
+\if :session_b_ok
+BEGIN;
+SELECT tax_id FROM analytics.lock_tax_payments_b
+WHERE tax_id = (SELECT tax_id FROM civics.tax_payments
+                WHERE citizen_id = 14 AND payment_status <> 'paid'
+                ORDER BY due_date, tax_id LIMIT 1)
+FOR UPDATE;                                                   -- Session B grabs citizen 14's oldest bill
+SELECT * FROM analytics.pay_tax_nowait(14, 100);              -- we get an immediate, friendly refusal
+SELECT * FROM analytics.pay_tax_nowait(20, 100);              -- a different citizen is not affected
+ROLLBACK;
+\else
+BEGIN;
+SELECT * FROM analytics.pay_tax_nowait(20, 100);
+ROLLBACK;
+\endif
 
 -- =============================================================================
--- LOCK MONITORING AND ANALYSIS
+-- 5. SKIP LOCKED: a concurrent job queue without contention
 -- =============================================================================
+\echo '== 5. Job queue with FOR UPDATE SKIP LOCKED'
 
--- Function to monitor current locks
+-- Claim up to n jobs in one statement. Locked rows (claimed by other workers)
+-- are skipped instead of waited for, so workers never block each other.
+CREATE OR REPLACE FUNCTION analytics.claim_jobs(p_worker text, p_n integer DEFAULT 3)
+RETURNS SETOF analytics.lock_jobs
+LANGUAGE sql AS $$
+    UPDATE analytics.lock_jobs j
+    SET status = 'running', worker = p_worker, attempts = j.attempts + 1, started_at = now()
+    WHERE j.job_id IN (SELECT job_id
+                       FROM analytics.lock_jobs
+                       WHERE status = 'pending'
+                       ORDER BY priority, job_id
+                       LIMIT p_n
+                       FOR UPDATE SKIP LOCKED)
+    RETURNING j.*;
+$$;
+
+\if :session_b_ok
+BEGIN;
+-- Worker A claims 3 jobs; its transaction (and row locks) stay open while it works.
+SELECT job_id, complaint_id, priority, worker FROM analytics.claim_jobs('worker-A', 3) ORDER BY priority, job_id;
+-- Worker B (separate backend) asks for the next 3 claimable jobs at the same time:
+-- it silently skips A's locked rows and gets different ones, without waiting.
+SELECT job_id, complaint_id, priority, 'worker-B' AS worker FROM analytics.lock_jobs_claimable_b ORDER BY priority, job_id;
+-- Without SKIP LOCKED, B queues behind A's locked rows (here its lock_timeout fires).
+DO $$
+BEGIN
+    PERFORM 1 FROM analytics.lock_jobs_next_waiting_b;
+    RAISE NOTICE 'B got rows without waiting (unexpected)';
+EXCEPTION WHEN lock_not_available THEN
+    RAISE NOTICE 'Plain FOR UPDATE: worker B would wait for worker A: %', split_part(SQLERRM, E'\n', 1);
+END $$;
+-- A finishes its work and commits; its row locks vanish with the transaction.
+UPDATE analytics.lock_jobs SET status = 'done', finished_at = now()
+WHERE worker = 'worker-A' AND status = 'running';
+COMMIT;
+\else
+SELECT job_id, complaint_id, priority, worker FROM analytics.claim_jobs('worker-A', 3) ORDER BY priority, job_id;
+UPDATE analytics.lock_jobs SET status = 'done', finished_at = now() WHERE worker = 'worker-A' AND status = 'running';
+\endif
+
+SELECT status, count(*) AS jobs, min(priority) AS best_priority
+FROM analytics.lock_jobs GROUP BY status ORDER BY status;
+-- Production notes: a crashed worker's lock disappears with its session, so
+-- claim-and-hold-in-one-transaction needs no "stuck job" sweeper; if you instead
+-- commit the 'running' state, add a heartbeat/timeout sweep. Keep job
+-- transactions short, and VACUUM the queue table aggressively (see module 11).
+
+-- =============================================================================
+-- 6. DEADLOCKS
+-- =============================================================================
+\echo '== 6. Deadlocks'
+
+-- Classic deadlock (two windows):
+--   [Session A] BEGIN; UPDATE analytics.lock_accounts SET balance = balance - 10 WHERE account_id = 1;
+--   [Session B] BEGIN; UPDATE analytics.lock_accounts SET balance = balance - 10 WHERE account_id = 2;
+--   [Session A] UPDATE analytics.lock_accounts SET balance = balance + 10 WHERE account_id = 2;  -- waits for B
+--   [Session B] UPDATE analytics.lock_accounts SET balance = balance + 10 WHERE account_id = 1;  -- waits for A: cycle
+-- After deadlock_timeout (default 1s) the waiting backend runs the deadlock
+-- detector, finds the cycle and aborts one transaction:
+--   ERROR: deadlock detected (SQLSTATE 40P01)
+--   DETAIL: Process 123 waits for ShareLock on transaction 456; blocked by process 789. ...
+-- The survivor proceeds. The victim must retry the whole transaction.
+SELECT name, setting, unit FROM pg_settings
+WHERE name IN ('deadlock_timeout', 'log_lock_waits', 'lock_timeout', 'max_locks_per_transaction')
+ORDER BY name;
+
+-- Prevention: acquire locks in one global order (here: ascending account_id),
+-- so two transfers in opposite directions queue instead of crossing.
+CREATE OR REPLACE FUNCTION analytics.lock_transfer(p_from integer, p_to integer, p_amount numeric)
+RETURNS TABLE (account_id integer, balance numeric)
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM analytics.lock_accounts a
+    WHERE a.account_id IN (p_from, p_to)
+    ORDER BY a.account_id
+    FOR NO KEY UPDATE;                    -- the same strength an UPDATE would take
+    UPDATE analytics.lock_accounts a SET balance = a.balance - p_amount WHERE a.account_id = p_from;
+    UPDATE analytics.lock_accounts a SET balance = a.balance + p_amount WHERE a.account_id = p_to;
+    RETURN QUERY SELECT a.account_id, a.balance::numeric FROM analytics.lock_accounts a
+                 WHERE a.account_id IN (p_from, p_to) ORDER BY a.account_id;
+END $$;
+
+SELECT * FROM analytics.lock_transfer(2, 1, 50);
+
+-- A deadlock the detector cannot see: the cycle runs through a network
+-- connection. We hold account 1, Session B holds account 2, then we ask B
+-- (synchronously) to take account 1. We wait on the socket, B waits on our lock;
+-- no backend sees a lock-wait cycle. Only B's lock_timeout breaks it. The same
+-- trap exists with dblink/postgres_fdw and with application code that holds a
+-- transaction open while waiting for another connection.
+\if :session_b_ok
+BEGIN;
+UPDATE analytics.lock_accounts   SET balance = balance - 10 WHERE account_id = 1;   -- A holds 1
+UPDATE analytics.lock_accounts_b SET balance = balance - 10 WHERE account_id = 2;   -- B holds 2
+DO $$
+BEGIN
+    UPDATE analytics.lock_accounts_b SET balance = balance + 10 WHERE account_id = 1;  -- B wants 1
+EXCEPTION WHEN lock_not_available THEN
+    RAISE NOTICE 'Distributed deadlock broken only by Session B''s lock_timeout: %', split_part(SQLERRM, E'\n', 1);
+END $$;
+ROLLBACK;
+\else
+\echo 'skipped (no loopback session)'
+\endif
+
+-- =============================================================================
+-- 7. ADVISORY LOCKS: application-defined mutexes
+-- =============================================================================
+\echo '== 7. Advisory locks'
+
+-- Transaction-scoped (released at COMMIT/ROLLBACK) vs session-scoped (held until
+-- unlocked or disconnect, even across ROLLBACK). Keys are bigint or (int, int);
+-- hashtext() maps a name to a key (collisions are possible but rare).
+\if :session_b_ok
+BEGIN;
+SELECT pg_try_advisory_xact_lock(hashtext('m10:nightly-report')) AS a_got_lock;
+SELECT got_lock AS b_got_lock FROM analytics.lock_try_report_lock_b;     -- false: A holds it
+SELECT l.locktype, l.classid, l.objid, l.mode, l.granted,
+       CASE WHEN l.pid = pg_backend_pid() THEN 'A' ELSE 'B' END AS holder
+FROM pg_locks l WHERE l.locktype = 'advisory' AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+ORDER BY holder;
+COMMIT;
+\else
+SELECT pg_try_advisory_xact_lock(hashtext('m10:nightly-report')) AS a_got_lock;
+\endif
+
+-- Run-once guard for a batch job. Session-level lock, released on every path.
+CREATE OR REPLACE FUNCTION analytics.process_with_advisory_lock(p_process text, p_payload text)
+RETURNS TABLE (acquired_lock boolean, process_result text, lock_duration_ms numeric)
+LANGUAGE plpgsql AS $$
+DECLARE
+    k  bigint := hashtext(p_process);
+    t0 timestamptz := clock_timestamp();
+BEGIN
+    IF NOT pg_try_advisory_lock(k) THEN
+        RETURN QUERY SELECT false, format('%s is already running in another session', p_process),
+                            round(extract(epoch FROM clock_timestamp() - t0) * 1000, 2);
+        RETURN;
+    END IF;
+    BEGIN
+        PERFORM pg_sleep(0.05);              -- the exclusive work would go here
+        PERFORM pg_advisory_unlock(k);
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM pg_advisory_unlock(k);       -- session locks survive errors: always unlock
+        RAISE;
+    END;
+    RETURN QUERY SELECT true, format('%s completed: %s', p_process, p_payload),
+                        round(extract(epoch FROM clock_timestamp() - t0) * 1000, 2);
+END $$;
+
+SELECT acquired_lock, process_result FROM analytics.process_with_advisory_lock('m10:recalc-balances', 'ok');
+-- (Module 14 covers advisory-lock coordination patterns in depth.)
+
+-- =============================================================================
+-- 8. LOCK MONITORING
+-- =============================================================================
+\echo '== 8. Lock monitoring'
+
+-- All heavyweight locks in this database, waiting ones first.
 CREATE OR REPLACE FUNCTION analytics.monitor_locks()
-RETURNS TABLE(
-    lock_type TEXT,
-    database_name TEXT,
-    relation_name TEXT,
-    mode_name TEXT,
-    granted BOOLEAN,
-    pid INTEGER,
-    query_start TIMESTAMPTZ,
-    state TEXT,
-    wait_event TEXT
-) AS $
-BEGIN
-    RETURN QUERY
-    SELECT
-        l.locktype::TEXT,
-        d.datname::TEXT,
-        COALESCE(c.relname, 'N/A')::TEXT,
-        l.mode::TEXT,
-        l.granted,
-        l.pid,
-        a.query_start,
-        a.state::TEXT,
-        a.wait_event::TEXT
+RETURNS TABLE (pid integer, application_name text, locktype text, object text, mode text,
+               granted boolean, waiting_for interval, state text, query text)
+LANGUAGE sql STABLE AS $$
+    SELECT l.pid, a.application_name, l.locktype,
+           COALESCE(l.relation::regclass::text, l.transactionid::text, l.virtualxid,
+                    l.locktype || ':' || l.objid),
+           l.mode, l.granted,
+           now() - l.waitstart,                          -- waitstart: PostgreSQL 14+
+           a.state, left(a.query, 60)
     FROM pg_locks l
-    LEFT JOIN pg_database d ON l.database = d.oid
-    LEFT JOIN pg_class c ON l.relation = c.oid
-    LEFT JOIN pg_stat_activity a ON l.pid = a.pid
-    WHERE l.locktype IN ('relation', 'tuple', 'transactionid', 'virtualxid')
-        AND a.datname = current_database()
-    ORDER BY l.granted, a.query_start;
-END;
-$ LANGUAGE plpgsql;
+    LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+    WHERE l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       OR l.locktype IN ('transactionid', 'virtualxid')
+    ORDER BY l.granted, l.waitstart NULLS LAST, l.pid;
+$$;
 
--- Function to detect lock waits and potential deadlocks
+-- Who blocks whom: pg_blocking_pids() understands the conflict matrix, lock
+-- queues and parallel-query groups (joining pg_locks on relation and mode does not).
 CREATE OR REPLACE FUNCTION analytics.detect_lock_issues()
-RETURNS TABLE(
-    issue_type TEXT,
-    blocking_pid INTEGER,
-    blocked_pid INTEGER,
-    blocking_query TEXT,
-    blocked_query TEXT,
-    wait_duration INTERVAL,
-    recommendation TEXT
-) AS $
-BEGIN
-    RETURN QUERY
-    SELECT
-        'Lock Wait'::TEXT,
-        bl.pid as blocking_pid,
-        wa.pid as blocked_pid,
-        bl.query as blocking_query,
-        wa.query as blocked_query,
-        clock_timestamp() - wa.query_start as wait_duration,
-        CASE
-            WHEN clock_timestamp() - wa.query_start > INTERVAL '30 seconds'
-            THEN 'Consider terminating long-running blocking query'
-            ELSE 'Monitor wait time'
-        END::TEXT
-    FROM pg_stat_activity wa
-    JOIN pg_locks wl ON wa.pid = wl.pid AND NOT wl.granted
-    JOIN pg_locks bl ON wl.relation = bl.relation AND wl.mode = bl.mode AND bl.granted
-    JOIN pg_stat_activity bl_act ON bl.pid = bl_act.pid
-    WHERE wa.state = 'active'
-        AND bl_act.state = 'active'
-        AND wa.pid != bl_act.pid;
-END;
-$ LANGUAGE plpgsql;
+RETURNS TABLE (blocked_pid integer, blocking_pid integer, blocked_wait interval,
+               blocked_query text, blocking_state text, blocking_query text, recommendation text)
+LANGUAGE sql STABLE AS $$
+    SELECT w.pid, b.pid,
+           now() - w.query_start,
+           left(w.query, 60), b.state, left(b.query, 60),
+           CASE
+               WHEN b.state = 'idle in transaction'
+                    THEN 'Blocker is idle in transaction: fix the app or set idle_in_transaction_session_timeout'
+               WHEN now() - w.query_start > interval '30 seconds'
+                    THEN 'Long wait: consider pg_cancel_backend(blocking_pid)'
+               ELSE 'Monitor'
+           END
+    FROM pg_stat_activity w
+    CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid)
+    JOIN pg_stat_activity b ON b.pid = bp.pid
+    WHERE w.wait_event_type = 'Lock'
+    ORDER BY now() - w.query_start DESC;
+$$;
+
+SELECT * FROM analytics.detect_lock_issues();       -- empty unless someone is waiting right now
+SELECT pid, locktype, object, mode, granted FROM analytics.monitor_locks()
+WHERE pid = pg_backend_pid() AND locktype = 'relation'
+ORDER BY object LIMIT 5;
+
+-- Close the loopback connection.
+SELECT count(*) FILTER (WHERE d) AS loopback_connections_closed
+FROM (SELECT postgres_fdw_disconnect('m10_lock_session_b') AS d
+      WHERE EXISTS (SELECT 1 FROM postgres_fdw_get_connections() c
+                    WHERE c.server_name = 'm10_lock_session_b')) s;

@@ -1,372 +1,366 @@
 -- File: sql/11_perf_tuning/explain_analyze_playbook.sql
--- Purpose: EXPLAIN ANALYZE demonstrations, join strategies, and plan reading
+-- Purpose: Reading and measuring plans on PostgreSQL 17: EXPLAIN options
+--          (ANALYZE, BUFFERS, SETTINGS, WAL, SERIALIZE, MEMORY), scan and join
+--          strategies, sorts and memory, misestimates and sargability, plus
+--          pg_stat_statements and auto_explain for finding what to tune.
+--
+-- Idempotent; reads base tables only. Write-cost demos run on a module-owned
+-- table (analytics.explain_lab_payments). All planner GUC changes use SET LOCAL
+-- inside a transaction so nothing leaks into the rest of the session.
+-- Timings and buffer counts vary run to run; plan shapes are what to compare.
+-- Recency filters are anchored on meta.as_of() (the dataset's "now").
+
+-- Older revisions of this file created these functions with other result shapes.
+DROP FUNCTION IF EXISTS analytics.analyze_plan_patterns();
+DROP FUNCTION IF EXISTS analytics.identify_slow_patterns();
 
 -- =============================================================================
--- BASIC EXPLAIN ANALYZE EXAMPLES
+-- 0. HELPER: a plan as rows (EXPLAIN ... FORMAT JSON, walked recursively)
 -- =============================================================================
+\echo '== 0. Helper analytics.explain_nodes()'
 
--- Function to demonstrate different EXPLAIN options
-CREATE OR REPLACE FUNCTION analytics.demo_explain_options()
-RETURNS TABLE(
-    explain_type TEXT,
-    query_description TEXT,
-    sample_output TEXT
-) AS $$
-BEGIN
-    RETURN QUERY VALUES
-        ('EXPLAIN', 'Basic plan without execution', 'Shows estimated costs and row counts'),
-        ('EXPLAIN ANALYZE', 'Execute and show actual timing', 'Shows actual time and row counts'),
-        ('EXPLAIN (ANALYZE, BUFFERS)', 'Include buffer usage', 'Shows shared/local/temp buffer hits'),
-        ('EXPLAIN (ANALYZE, VERBOSE)', 'Include detailed output', 'Shows column lists and expressions'),
-        ('EXPLAIN (ANALYZE, COSTS false)', 'Hide cost estimates', 'Focuses on actual execution metrics');
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- JOIN STRATEGY DEMONSTRATIONS
--- =============================================================================
-
--- Nested Loop Join demonstration
-CREATE OR REPLACE FUNCTION analytics.demo_nested_loop_join()
-RETURNS TABLE(
-    join_type TEXT,
-    estimated_cost NUMERIC,
-    actual_time_ms NUMERIC,
-    rows_processed BIGINT,
-    optimization_notes TEXT
-) AS $$
+-- Executes trusted, hand-written SQL under EXPLAIN (ANALYZE, BUFFERS) and returns
+-- one row per plan node with estimates vs actuals: the core of plan debugging.
+CREATE OR REPLACE FUNCTION analytics.explain_nodes(p_sql text)
+RETURNS TABLE (node_id int, depth int, node text, relation text,
+               est_rows numeric, actual_rows numeric, loops numeric,
+               off_by numeric, shared_hit bigint, shared_read bigint, total_ms numeric)
+LANGUAGE plpgsql AS $$
 DECLARE
-    plan_output TEXT;
-    start_time TIMESTAMPTZ;
-    end_time TIMESTAMPTZ;
+    plan jsonb;
 BEGIN
-    start_time := clock_timestamp();
-
-    -- Force nested loop join with small result set
-    SET enable_hashjoin = off;
-    SET enable_mergejoin = off;
-
-    -- Execute query that will use nested loop
-    PERFORM c.citizen_id, c.first_name, p.permit_number
-    FROM civics.citizens c
-    JOIN civics.permit_applications p ON c.citizen_id = p.citizen_id
-    WHERE c.citizen_id <= 3; -- Small result set
-
-    end_time := clock_timestamp();
-
-    -- Reset join settings
-    RESET enable_hashjoin;
-    RESET enable_mergejoin;
-
-    RETURN QUERY SELECT
-        'Nested Loop'::TEXT,
-        15.25::NUMERIC, -- Estimated cost
-        EXTRACT(EPOCH FROM (end_time - start_time)) * 1000,
-        3::BIGINT,
-        'Efficient for small outer relations and indexed inner relations'::TEXT;
-END;
-$$ LANGUAGE plpgsql;
-
--- Hash Join demonstration
-CREATE OR REPLACE FUNCTION analytics.demo_hash_join()
-RETURNS TABLE(
-    join_type TEXT,
-    build_table TEXT,
-    probe_table TEXT,
-    hash_buckets INTEGER,
-    memory_usage_kb INTEGER,
-    efficiency_notes TEXT
-) AS $$
-DECLARE
-    execution_time NUMERIC;
-    start_time TIMESTAMPTZ;
-BEGIN
-    start_time := clock_timestamp();
-
-    -- Force hash join
-    SET enable_nestloop = off;
-    SET enable_mergejoin = off;
-    SET work_mem = '10MB';
-
-    -- Execute hash join query
-    PERFORM c.citizen_id, COUNT(o.order_id)
-    FROM civics.citizens c
-    LEFT JOIN commerce.orders o ON c.citizen_id = o.customer_citizen_id
-    GROUP BY c.citizen_id;
-
-    execution_time := EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
-
-    -- Reset settings
-    RESET enable_nestloop;
-    RESET enable_mergejoin;
-    RESET work_mem;
-
-    RETURN QUERY SELECT
-        'Hash Join'::TEXT,
-        'citizens (smaller)'::TEXT,
-        'orders (larger)'::TEXT,
-        1024,
-        2048,
-        format('Completed in %.2f ms. Good for large unsorted datasets', execution_time);
-END;
-$$ LANGUAGE plpgsql;
-
--- Merge Join demonstration
-CREATE OR REPLACE FUNCTION analytics.demo_merge_join()
-RETURNS TABLE(
-    join_type TEXT,
-    sort_keys TEXT,
-    presorted BOOLEAN,
-    sort_overhead_ms NUMERIC,
-    join_efficiency TEXT
-) AS $$
-DECLARE
-    start_time TIMESTAMPTZ;
-    execution_time NUMERIC;
-BEGIN
-    start_time := clock_timestamp();
-
-    -- Force merge join
-    SET enable_nestloop = off;
-    SET enable_hashjoin = off;
-
-    -- Execute merge join on sorted data
-    PERFORM tp.citizen_id, SUM(tp.amount_paid)
-    FROM civics.tax_payments tp
-    JOIN civics.citizens c ON tp.citizen_id = c.citizen_id
-    WHERE c.status = 'active'
-    GROUP BY tp.citizen_id
-    ORDER BY tp.citizen_id;
-
-    execution_time := EXTRACT(EPOCH FROM (clock_timestamp() - start_time)) * 1000;
-
-    -- Reset settings
-    RESET enable_nestloop;
-    RESET enable_hashjoin;
-
-    RETURN QUERY SELECT
-        'Merge Join'::TEXT,
-        'citizen_id'::TEXT,
-        true, -- Assume pre-sorted by PK
-        0.5::NUMERIC, -- Minimal sort overhead
-        format('Efficient for sorted inputs. Execution time: %.2f ms', execution_time);
-END;
-$$ LANGUAGE plpgsql;
+    EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' || p_sql INTO plan;
+    RETURN QUERY
+    WITH RECURSIVE walk(n, d, path) AS (
+        SELECT plan -> 0 -> 'Plan', 0, ARRAY[0]
+        UNION ALL
+        SELECT c.child, w.d + 1, w.path || c.ord::int
+        FROM walk w
+        CROSS JOIN LATERAL jsonb_array_elements(w.n -> 'Plans') WITH ORDINALITY AS c(child, ord)
+    )
+    SELECT (row_number() OVER (ORDER BY path))::int,
+           d,
+           repeat('  ', d) || (n ->> 'Node Type')
+               || COALESCE(' (' || (n ->> 'Join Type') || ')', '')
+               || COALESCE(' [' || (n ->> 'Index Name') || ']', ''),
+           n ->> 'Relation Name',
+           (n ->> 'Plan Rows')::numeric,
+           (n ->> 'Actual Rows')::numeric,                          -- per loop
+           (n ->> 'Actual Loops')::numeric,
+           round(greatest((n ->> 'Plan Rows')::numeric, 1) / greatest((n ->> 'Actual Rows')::numeric, 1), 2),
+           (n ->> 'Shared Hit Blocks')::bigint,
+           (n ->> 'Shared Read Blocks')::bigint,
+           round((n ->> 'Actual Total Time')::numeric * (n ->> 'Actual Loops')::numeric, 2)
+    FROM walk
+    ORDER BY path;
+END $$;
+COMMENT ON FUNCTION analytics.explain_nodes(text) IS
+'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) of trusted SQL as one row per plan node: estimates vs actuals, buffers, time.';
 
 -- =============================================================================
--- PLAN NODE ANALYSIS
+-- 1. EXPLAIN OPTIONS CHEAT SHEET
 -- =============================================================================
+\echo '== 1. EXPLAIN options'
 
--- Function to analyze common plan nodes
+SELECT * FROM (VALUES
+    ('EXPLAIN',              'Plan + estimated cost/rows only; nothing is executed'),
+    ('ANALYZE',              'Executes the statement; adds actual time, rows, loops (wrap DML in BEGIN/ROLLBACK)'),
+    ('BUFFERS',              'Shared/local/temp blocks hit/read/dirtied/written per node; planning buffers too'),
+    ('SETTINGS',             'Lists non-default planner-relevant settings (PG12+)'),
+    ('WAL',                  'WAL records, full-page images and bytes generated (PG13+), for writes'),
+    ('SERIALIZE',            'PG17: also converts the result to wire format (detoasting!) and reports its cost'),
+    ('MEMORY',               'PG17: memory used by the planner'),
+    ('GENERIC_PLAN',         'PG16: plan a query with $1 parameters without values'),
+    ('TIMING OFF',           'Keep row counts, skip per-node clock calls (cheaper on slow clocks)'),
+    ('FORMAT JSON',          'Machine-readable; feed it to tools or to SQL as in explain_nodes()')
+) AS t(option, what_it_adds);
+
+-- =============================================================================
+-- 2. THE FULL PG17 TOOLKIT ON ONE QUERY
+-- =============================================================================
+\echo '== 2. EXPLAIN (ANALYZE, BUFFERS, SETTINGS, WAL, SERIALIZE, MEMORY)'
+
+-- Top merchants by revenue over the last 30 days of data.
+BEGIN;
+SET LOCAL work_mem = '8MB';            -- shows up under "Settings:"
+SET LOCAL random_page_cost = 1.1;      -- SSD-style costing; also listed
+EXPLAIN (ANALYZE, BUFFERS, SETTINGS, WAL, SERIALIZE, MEMORY)
+SELECT m.merchant_id, m.business_name, count(*) AS orders, sum(o.total_amount) AS revenue
+FROM commerce.orders o
+JOIN commerce.merchants m ON m.merchant_id = o.merchant_id
+WHERE o.order_date >= meta.as_of() - interval '30 days'
+  AND o.status <> 'cancelled'
+GROUP BY m.merchant_id, m.business_name
+ORDER BY revenue DESC
+LIMIT 10;
+COMMIT;
+-- How to read it: start at the most indented node; compare "rows=" estimate with
+-- "actual ... rows=" (per loop, multiply by loops); look for big gaps, then for the
+-- node where time or buffers jump. "Buffers: shared read" = came from disk/OS cache.
+
+-- =============================================================================
+-- 3. WAL AND SERIALIZE: costs plain EXPLAIN ANALYZE hides
+-- =============================================================================
+\echo '== 3a. WAL generated by an UPDATE (module-owned copy of payments)'
+
+DROP TABLE IF EXISTS analytics.explain_lab_payments;
+CREATE TABLE analytics.explain_lab_payments AS
+SELECT * FROM commerce.payments ORDER BY payment_id;
+ALTER TABLE analytics.explain_lab_payments ADD PRIMARY KEY (payment_id);
+VACUUM (ANALYZE) analytics.explain_lab_payments;
+CHECKPOINT;   -- the next change to each page after a checkpoint writes a full-page image (FPI)
+
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS, WAL, COSTS OFF)
+UPDATE analytics.explain_lab_payments SET failure_reason = failure_reason WHERE payment_id <= 5000;
+-- Same rows again in the same transaction: no FPIs this time, so fewer WAL bytes.
+EXPLAIN (ANALYZE, BUFFERS, WAL, COSTS OFF)
+UPDATE analytics.explain_lab_payments SET failure_reason = failure_reason WHERE payment_id <= 5000;
+ROLLBACK;
+
+\echo '== 3b. SERIALIZE: the cost of sending wide/TOASTed columns to the client'
+-- Plain EXPLAIN ANALYZE never detoasts or converts output, so it under-reports
+-- queries that return big jsonb/text. SERIALIZE measures that work (PG17).
+EXPLAIN (ANALYZE, SERIALIZE TEXT, COSTS OFF, TIMING OFF)
+SELECT complaint_id, description, metadata, resolution_actions
+FROM documents.complaint_records;
+EXPLAIN (ANALYZE, SERIALIZE TEXT, COSTS OFF, TIMING OFF)
+SELECT complaint_id
+FROM documents.complaint_records;
+
+-- =============================================================================
+-- 4. SCAN STRATEGIES
+-- =============================================================================
+\echo '== 4. Seq Scan / Index Scan / Index Only Scan / Bitmap Heap Scan'
+
+-- Low selectivity -> Seq Scan (reading everything sequentially is cheapest).
+EXPLAIN (COSTS OFF) SELECT * FROM commerce.orders WHERE status <> 'cancelled';
+-- Single row by key -> Index Scan.
+EXPLAIN (COSTS OFF) SELECT * FROM commerce.orders WHERE order_id = 4242;
+-- Only indexed columns needed -> Index Only Scan; "Heap Fetches" counts pages whose
+-- visibility-map bit was not set (VACUUM sets them).
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT order_date FROM commerce.orders
+WHERE order_date >= meta.as_of() - interval '7 days';
+-- Medium selectivity or OR/AND of indexes -> Bitmap Index Scan(s) + Bitmap Heap Scan.
+EXPLAIN (COSTS OFF)
+SELECT * FROM commerce.orders WHERE customer_citizen_id = 17 OR merchant_id = 3;
+
+-- =============================================================================
+-- 5. JOIN STRATEGIES (planner's choice, then forced alternatives)
+-- =============================================================================
+\echo '== 5. Nested Loop vs Hash Join vs Merge Join'
+
+-- Same query three ways. enable_* = off does not forbid a method, it makes it
+-- look prohibitively expensive: a diagnosis tool, never a production setting.
+CREATE TEMP TABLE IF NOT EXISTS join_compare (strategy text, node_id int, node text, est_rows numeric,
+                                              actual_rows numeric, loops numeric, shared_hit bigint, total_ms numeric);
+TRUNCATE join_compare;
+
+BEGIN;   -- planner's choice
+INSERT INTO join_compare
+SELECT 'planner choice', node_id, node, est_rows, actual_rows, loops, shared_hit, total_ms
+FROM analytics.explain_nodes($q$
+    SELECT c.zip_code, count(*) AS trips, avg(t.duration_minutes) AS avg_minutes
+    FROM mobility.trip_segments t
+    JOIN civics.citizens c ON c.citizen_id = t.user_id
+    WHERE t.start_time >= meta.as_of() - interval '14 days'
+    GROUP BY c.zip_code $q$);
+COMMIT;
+
+BEGIN;
+SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
+INSERT INTO join_compare
+SELECT 'nested loop forced', node_id, node, est_rows, actual_rows, loops, shared_hit, total_ms
+FROM analytics.explain_nodes($q$
+    SELECT c.zip_code, count(*) AS trips, avg(t.duration_minutes) AS avg_minutes
+    FROM mobility.trip_segments t
+    JOIN civics.citizens c ON c.citizen_id = t.user_id
+    WHERE t.start_time >= meta.as_of() - interval '14 days'
+    GROUP BY c.zip_code $q$);
+COMMIT;
+
+BEGIN;
+SET LOCAL enable_hashjoin = off; SET LOCAL enable_nestloop = off;
+INSERT INTO join_compare
+SELECT 'merge join forced', node_id, node, est_rows, actual_rows, loops, shared_hit, total_ms
+FROM analytics.explain_nodes($q$
+    SELECT c.zip_code, count(*) AS trips, avg(t.duration_minutes) AS avg_minutes
+    FROM mobility.trip_segments t
+    JOIN civics.citizens c ON c.citizen_id = t.user_id
+    WHERE t.start_time >= meta.as_of() - interval '14 days'
+    GROUP BY c.zip_code $q$);
+COMMIT;
+
+SELECT strategy, node, est_rows, actual_rows, loops, shared_hit
+FROM join_compare ORDER BY strategy, node_id;
+-- Nested Loop: cheap when the outer side is small and the inner side has an index
+--   (cost ~ outer rows x index probe); loops= shows how often the inner ran.
+-- Hash Join: builds a hash of the smaller input once; best for large unsorted inputs
+--   (watch "Batches" > 1 = spilled because work_mem * hash_mem_multiplier was too small).
+-- Merge Join: both inputs sorted on the key (by index or Sort node); good for big,
+--   presorted inputs and range-ish joins.
+
+-- =============================================================================
+-- 6. SORTS, MEMORY AND INCREMENTAL SORT
+-- =============================================================================
+\echo '== 6. Sort spilling to disk vs in memory'
+
+BEGIN;
+SET LOCAL work_mem = '64kB';
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT order_id, total_amount FROM commerce.orders ORDER BY total_amount DESC, order_id;
+SET LOCAL work_mem = '32MB';
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT order_id, total_amount FROM commerce.orders ORDER BY total_amount DESC, order_id;
+COMMIT;
+-- "external merge Disk: ...kB" + temp buffers = spilled; "quicksort Memory" = fit.
+
+\echo '== 6b. Incremental Sort: index provides the leading sort key'
+EXPLAIN (COSTS OFF)
+SELECT order_id, order_date, total_amount
+FROM commerce.orders
+ORDER BY order_date, total_amount DESC
+LIMIT 10;
+-- Rows arrive ordered by order_date from idx_orders_date; only groups with equal
+-- order_date need sorting by total_amount, and LIMIT stops early.
+
+-- =============================================================================
+-- 7. SARGABILITY AND MISESTIMATES: measured before/after
+-- =============================================================================
+\echo '== 7. Non-sargable predicate vs equivalent range predicate'
+
+-- One calendar day (UTC), a week before the dataset's "now", written two ways.
+-- Wrapping the column in a function hides it from the index and from the
+-- column statistics (the planner falls back to a default 0.5% guess).
+SELECT 'date_trunc(column) = day' AS variant, node, est_rows, actual_rows, total_ms
+FROM analytics.explain_nodes($q$
+    SELECT order_id, total_amount FROM commerce.orders
+    WHERE date_trunc('day', order_date AT TIME ZONE 'UTC') = (meta.as_of() AT TIME ZONE 'UTC')::date - 7 $q$)
+WHERE depth = 0
+UNION ALL
+SELECT 'column range [day, day+1)', node, est_rows, actual_rows, total_ms
+FROM analytics.explain_nodes($q$
+    SELECT order_id, total_amount FROM commerce.orders
+    WHERE order_date >= ((meta.as_of() AT TIME ZONE 'UTC')::date - 7) AT TIME ZONE 'UTC'
+      AND order_date <  ((meta.as_of() AT TIME ZONE 'UTC')::date - 6) AT TIME ZONE 'UTC' $q$)
+WHERE depth = 0;
+
+-- Implicit casts: comparing a varchar column with a numeric literal forces a cast
+-- of the column (text = numeric is not even allowed); keep literal types aligned.
+-- Correlated columns misestimate even with good per-column stats: see
+-- stats_and_autovacuum.sql (CREATE STATISTICS) for the fix.
+
+-- =============================================================================
+-- 8. PLAN NODE AND ANTI-PATTERN REFERENCE
+-- =============================================================================
+\echo '== 8. Plan node reference'
+
 CREATE OR REPLACE FUNCTION analytics.analyze_plan_patterns()
-RETURNS TABLE(
-    node_type TEXT,
-    when_used TEXT,
-    performance_characteristics TEXT,
-    optimization_tips TEXT
-) AS $$
-BEGIN
-    RETURN QUERY VALUES
-        ('Seq Scan', 'No suitable index available', 'O(n) - reads entire table', 'Add appropriate indexes or use LIMIT'),
-        ('Index Scan', 'Using index for lookup', 'O(log n) for lookup + fetch', 'Good for selective queries'),
-        ('Index Only Scan', 'All needed columns in index', 'O(log n) - no table access', 'Use covering indexes'),
-        ('Bitmap Heap Scan', 'Multiple index conditions', 'Efficient for medium selectivity', 'Consider combining indexes'),
-        ('Sort', 'ORDER BY without index', 'O(n log n) in memory/disk', 'Add index on sort columns'),
-        ('Hash Aggregate', 'GROUP BY operations', 'O(n) with hash table', 'Increase work_mem if spilling'),
-        ('Nested Loop', 'Small outer, indexed inner', 'O(n*m) worst case', 'Ensure inner has good index'),
-        ('Hash Join', 'Large unsorted relations', 'O(n+m) with hash build', 'Increase work_mem for large joins'),
-        ('Merge Join', 'Pre-sorted relations', 'O(n+m) linear scan', 'Works well with ordered data');
-END;
-$$ LANGUAGE plpgsql;
+RETURNS TABLE (node_type text, when_used text, cost_shape text, tuning_tip text)
+LANGUAGE sql IMMUTABLE AS $$
+    VALUES
+    ('Seq Scan',          'No usable index or low selectivity',  'O(pages), sequential I/O',          'Fine for large fractions; else add a selective index'),
+    ('Index Scan',        'Selective predicate or ORDER BY',     'O(log n) per probe + random heap',  'Good for few rows; correlation affects cost'),
+    ('Index Only Scan',   'All columns in the index',            'O(log n), heap only for non-all-visible pages', 'Covering index (INCLUDE) + keep tables vacuumed'),
+    ('Bitmap Heap Scan',  'Medium selectivity, OR/AND of indexes','Index bitmap then heap in page order', '"lossy" blocks => raise work_mem'),
+    ('Sort',              'ORDER BY/merge join without index order','O(n log n); spills beyond work_mem', 'Index on sort key or more work_mem'),
+    ('Incremental Sort',  'Input already sorted by a prefix',    'Sorts small groups',                 'Multi-column index on leading keys'),
+    ('HashAggregate',     'GROUP BY, unsorted input',            'O(n), memory for groups',            'Spills to disk in PG13+; watch "Disk Usage"'),
+    ('Nested Loop',       'Small outer side, indexed inner',     'outer rows x inner probe',           'Wrong when outer estimate is far too low'),
+    ('Hash Join',         'Large unsorted inputs, equality',     'O(n+m) + hash build',                'Batches > 1 means spill: raise work_mem/hash_mem_multiplier'),
+    ('Merge Join',        'Both sides sorted on join key',       'O(n+m) after sorts',                 'Cheap with index-ordered inputs'),
+    ('Memoize',           'Nested loop with repeating inner keys','Caches inner results (PG14+)',      'Check hit/miss counts in ANALYZE output'),
+    ('Gather / Gather Merge','Parallel query',                    'Workers scan partitions of the work','max_parallel_workers_per_gather, table size')
+$$;
+SELECT * FROM analytics.analyze_plan_patterns();
 
--- =============================================================================
--- PERFORMANCE ANALYSIS FUNCTIONS
--- =============================================================================
-
--- Function to capture and analyze query performance
-CREATE OR REPLACE FUNCTION analytics.analyze_query_performance(
-    query_sql TEXT,
-    iterations INTEGER DEFAULT 3
-)
-RETURNS TABLE(
-    iteration INTEGER,
-    execution_time_ms NUMERIC,
-    rows_returned BIGINT,
-    buffer_hits BIGINT,
-    buffer_reads BIGINT,
-    plan_summary TEXT
-) AS $$
-DECLARE
-    i INTEGER;
-    start_time TIMESTAMPTZ;
-    end_time TIMESTAMPTZ;
-    row_count BIGINT;
-BEGIN
-    -- Enable timing and buffer tracking
-    SET track_io_timing = on;
-
-    FOR i IN 1..iterations LOOP
-        start_time := clock_timestamp();
-
-        -- Execute the query (simplified - would need dynamic SQL in practice)
-        -- This is a placeholder since we can't execute arbitrary SQL directly
-        EXECUTE 'SELECT COUNT(*) FROM civics.citizens' INTO row_count;
-
-        end_time := clock_timestamp();
-
-        RETURN QUERY SELECT
-            i,
-            EXTRACT(EPOCH FROM (end_time - start_time)) * 1000,
-            row_count,
-            100::BIGINT, -- Placeholder buffer hits
-            5::BIGINT,   -- Placeholder buffer reads
-            'Sample execution plan summary'::TEXT;
-    END LOOP;
-
-    RESET track_io_timing;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- INDEX USAGE ANALYSIS
--- =============================================================================
-
--- Function to check index usage effectiveness
-CREATE OR REPLACE FUNCTION analytics.analyze_index_effectiveness()
-RETURNS TABLE(
-    table_name TEXT,
-    index_name TEXT,
-    index_scans BIGINT,
-    tuples_read BIGINT,
-    tuples_fetched BIGINT,
-    selectivity_ratio NUMERIC,
-    usage_recommendation TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        (schemaname || '.' || relname)::TEXT as table_name,
-        indexrelname::TEXT as index_name,
-        idx_scan as index_scans,
-        idx_tup_read as tuples_read,
-        idx_tup_fetch as tuples_fetched,
-        CASE
-            WHEN idx_tup_read > 0
-            THEN ROUND(idx_tup_fetch::NUMERIC / idx_tup_read, 4)
-            ELSE 0
-        END as selectivity_ratio,
-        CASE
-            WHEN idx_scan = 0 THEN 'UNUSED - Consider dropping'
-            WHEN idx_tup_read > idx_tup_fetch * 10 THEN 'LOW SELECTIVITY - Review queries'
-            WHEN idx_scan > 1000 THEN 'HIGHLY USED - Good index'
-            ELSE 'MODERATE USE - Monitor'
-        END::TEXT as usage_recommendation
-    FROM pg_stat_user_indexes
-    WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
-    ORDER BY idx_scan DESC;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- SLOW QUERY ANALYSIS
--- =============================================================================
-
--- Function to identify potentially slow query patterns
 CREATE OR REPLACE FUNCTION analytics.identify_slow_patterns()
-RETURNS TABLE(
-    pattern_type TEXT,
-    description TEXT,
-    example_fix TEXT,
-    impact_level TEXT
-) AS $$
-BEGIN
-    RETURN QUERY VALUES
-        ('Missing WHERE clause', 'Full table scans on large tables', 'Add appropriate WHERE conditions', 'HIGH'),
-        ('Function calls in WHERE', 'Non-sargable predicates', 'Rewrite conditions or use functional indexes', 'HIGH'),
-        ('SELECT *', 'Unnecessary column retrieval', 'Select only needed columns', 'MEDIUM'),
-        ('N+1 queries', 'Multiple single-row lookups', 'Use JOINs or batch operations', 'HIGH'),
-        ('Subqueries in SELECT', 'Correlated subqueries', 'Convert to JOINs when possible', 'MEDIUM'),
-        ('ORDER BY without LIMIT', 'Sorting entire result set', 'Add LIMIT or use partial sorting', 'MEDIUM'),
-        ('GROUP BY large text', 'Expensive grouping operations', 'Group by ID then JOIN for display', 'MEDIUM'),
-        ('Implicit type conversion', 'Index not used due to casting', 'Match column and parameter types', 'HIGH');
-END;
-$$ LANGUAGE plpgsql;
+RETURNS TABLE (pattern_type text, symptom_in_plan text, example_fix text, impact_level text)
+LANGUAGE sql IMMUTABLE AS $$
+    VALUES
+    ('Function on indexed column', 'Seq Scan + Filter with function(col); rows= default guess', 'Rewrite as range on the bare column, or expression index', 'HIGH'),
+    ('Correlated predicates',      'Estimate 10-100x below actual on multi-column filters', 'CREATE STATISTICS (dependencies, mcv)', 'HIGH'),
+    ('N+1 queries',                'Many identical single-row statements in pg_stat_statements', 'Batch with JOIN / = ANY($1)', 'HIGH'),
+    ('Type mismatch',              'Index ignored, Filter shows a cast on the column', 'Match parameter and column types', 'HIGH'),
+    ('Huge OFFSET pagination',     'Limit node with large rows removed by offset', 'Keyset pagination (WHERE key > last_seen)', 'MEDIUM'),
+    ('SELECT * of wide rows',      'High Serialization output in EXPLAIN (SERIALIZE)', 'Select only needed columns', 'MEDIUM'),
+    ('Sort/Hash spills',           'external merge / Batches > 1 / Disk Usage', 'Raise work_mem for that query (SET LOCAL)', 'MEDIUM'),
+    ('Stale statistics',           'Estimates off after bulk loads', 'ANALYZE after loads; tune autovacuum_analyze_*', 'MEDIUM')
+$$;
+SELECT * FROM analytics.identify_slow_patterns();
 
 -- =============================================================================
--- EXECUTION PLAN COMPARISON
+-- 9. pg_stat_statements: WHICH queries deserve an EXPLAIN?
 -- =============================================================================
+\echo '== 9. pg_stat_statements top-N (this database only)'
 
--- Function to compare execution plans before/after optimization
-CREATE OR REPLACE FUNCTION analytics.compare_execution_plans()
-RETURNS TABLE(
-    scenario TEXT,
-    query_type TEXT,
-    before_time_ms NUMERIC,
-    after_time_ms NUMERIC,
-    improvement_pct NUMERIC,
-    optimization_applied TEXT
-) AS $$
+-- Reset counters for THIS database only (other databases share the view).
+SELECT pg_stat_statements_reset(0, d.oid, 0) IS NOT NULL AS reset_done
+FROM pg_database d WHERE d.datname = current_database();
+
+-- A small, repeatable workload (statements inside the DO block are tracked because
+-- pg_stat_statements.track = all on this server; with 'top' only the DO would be).
+DO $$
+DECLARE i int; r record;
 BEGIN
-    RETURN QUERY VALUES
-        ('Index Addition', 'Citizen lookup by email', 125.4, 2.1, 98.3, 'Added btree index on email column'),
-        ('Query Rewrite', 'Order history with customer details', 380.2, 45.7, 88.0, 'Replaced correlated subquery with JOIN'),
-        ('Partial Index', 'Active merchant search', 67.8, 12.3, 81.9, 'Created partial index WHERE is_active = true'),
-        ('Covering Index', 'Citizen name and contact lookup', 28.9, 8.2, 71.6, 'Added covering index with INCLUDE clause'),
-        ('Statistics Update', 'Tax payment aggregation', 156.3, 89.1, 43.0, 'Ran ANALYZE to update table statistics'),
-        ('Work_mem Increase', 'Large GROUP BY operation', 234.5, 156.8, 33.1, 'Increased work_mem from 4MB to 16MB');
-END;
-$$ LANGUAGE plpgsql;
+    FOR i IN 1..25 LOOP
+        SELECT count(*), sum(total_amount) INTO r FROM commerce.orders WHERE customer_citizen_id = i;
+        SELECT count(*) INTO r FROM mobility.trip_segments WHERE user_id = i AND trip_mode = 'bus';
+    END LOOP;
+    FOR i IN 1..5 LOOP
+        SELECT count(*) INTO r FROM commerce.order_items oi JOIN commerce.orders o USING (order_id)
+        WHERE o.order_date >= meta.as_of() - make_interval(days => 7 * i);
+        SELECT sensor_code, avg(reading_value) AS a INTO r FROM mobility.sensor_readings
+        GROUP BY sensor_code ORDER BY a DESC LIMIT 1;
+    END LOOP;
+END $$;
+
+-- Top 5 by total execution time: the usual "where does the time go" list.
+SELECT s.calls,
+       round(s.total_exec_time::numeric, 1)  AS total_ms,
+       round(s.mean_exec_time::numeric, 2)   AS mean_ms,
+       s.rows,
+       round(100.0 * s.shared_blks_hit / NULLIF(s.shared_blks_hit + s.shared_blks_read, 0), 1) AS cache_hit_pct,
+       s.temp_blks_written,
+       s.toplevel,
+       left(regexp_replace(s.query, '\s+', ' ', 'g'), 70) AS query
+FROM pg_stat_statements s
+JOIN pg_database d ON d.oid = s.dbid AND d.datname = current_database()
+WHERE s.query NOT ILIKE '%pg_stat_statements%'
+ORDER BY s.total_exec_time DESC
+LIMIT 5;
+
+-- Other useful orderings: mean_exec_time (slow individually), calls (chatty / N+1),
+-- shared_blks_read (I/O heavy), temp_blks_written (spills), wal_bytes (write heavy).
+-- Join live sessions to their statistics via query_id (PG14+):
+SELECT a.pid, a.state, a.query_id, s.calls, round(s.mean_exec_time::numeric, 2) AS mean_ms
+FROM pg_stat_activity a
+LEFT JOIN pg_stat_statements s ON s.queryid = a.query_id AND s.dbid = a.datid AND s.userid = a.usesysid AND s.toplevel
+WHERE a.datname = current_database() AND a.state = 'active'
+LIMIT 5;
 
 -- =============================================================================
--- REAL-TIME PLAN ANALYSIS
+-- 10. auto_explain: plans of slow statements, captured automatically
 -- =============================================================================
+\echo '== 10. auto_explain (session-level demo; plans printed as NOTICE)'
 
--- Function to capture live query plans
-CREATE OR REPLACE FUNCTION analytics.capture_live_plans()
-RETURNS TABLE(
-    query_start TIMESTAMPTZ,
-    duration_ms INTEGER,
-    state TEXT,
-    query_text TEXT,
-    estimated_cost NUMERIC,
-    plan_type TEXT
-) AS $$
+-- In production: shared_preload_libraries or session_preload_libraries, with
+-- auto_explain.log_min_duration = '500ms' and log_analyze = on (log_timing = off
+-- if the clock is slow). Here we load it into this session only and send the plan
+-- to the client instead of the server log.
+DO $$
 BEGIN
-    RETURN QUERY
-    SELECT
-        sa.query_start,
-        EXTRACT(EPOCH FROM (NOW() - sa.query_start))::INTEGER * 1000 as duration_ms,
-        sa.state::TEXT,
-        LEFT(sa.query, 100)::TEXT as query_text,
-        -- Estimated cost would come from pg_stat_statements or auto_explain
-        random() * 1000 as estimated_cost, -- Placeholder
-        'Sequential Scan'::TEXT as plan_type -- Placeholder
-    FROM pg_stat_activity sa
-    WHERE sa.datname = current_database()
-        AND sa.state = 'active'
-        AND sa.pid != pg_backend_pid()
-        AND sa.query NOT LIKE '%pg_stat_activity%'
-    ORDER BY sa.query_start DESC;
-END;
-$$ LANGUAGE plpgsql;
+    EXECUTE 'LOAD ''auto_explain''';
+    PERFORM set_config('auto_explain.log_level', 'notice', false);
+    PERFORM set_config('auto_explain.log_analyze', 'on', false);
+    PERFORM set_config('auto_explain.log_timing', 'off', false);
+    PERFORM set_config('auto_explain.log_min_duration', '0', false);   -- last: enables logging
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'auto_explain not available (%), skipping', SQLERRM;
+END $$;
 
--- Function to format and explain plan output
-CREATE OR REPLACE FUNCTION analytics.format_plan_explanation(
-    plan_text TEXT
-)
-RETURNS TABLE(
-    plan_level INTEGER,
-    node_type TEXT,
-    operation_detail TEXT,
-    cost_estimate TEXT,
-    performance_notes TEXT
-) AS $$
-BEGIN
-    -- This would parse actual EXPLAIN output in a real implementation
-    RETURN QUERY VALUES
-        (1, 'HashAggregate', 'GROUP BY operation using hash table', 'cost=45.2..67.8', 'Efficient for moderate group counts'),
-        (2, 'Hash Join', 'Join citizens and tax_payments', 'cost=12.5..45.2', 'Good choice for unsorted relations'),
-        (3, 'Seq Scan', 'Sequential scan on citizens', 'cost=0.0..12.5', 'Consider adding index if selective'),
-        (3, 'Seq Scan', 'Sequential scan on tax_payments', 'cost=0.0..8.7', 'Acceptable for small table');
-END;
-$$ LANGUAGE plpgsql;
+SELECT count(*) AS citizens_in_zip_75105 FROM civics.citizens WHERE zip_code = '75105';
+
+-- Switch it off again for the rest of the session.
+SELECT set_config('auto_explain.log_min_duration', '-1', false) AS auto_explain_min_duration;

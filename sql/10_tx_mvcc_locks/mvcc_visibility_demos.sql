@@ -1,422 +1,330 @@
 -- File: sql/10_tx_mvcc_locks/mvcc_visibility_demos.sql
--- Purpose: MVCC visibility, hint bits, bloat illustrations and vacuum demos
+-- Purpose: MVCC from the inside: tuple headers (xmin/xmax/ctid), raw heap pages
+--          (pageinspect), hint bits, dead tuples and VACUUM (pgstattuple), the
+--          visibility map (pg_visibility), HOT updates and freezing.
+--
+-- Runs in a single session and is idempotent: every object it touches is
+-- module-owned (analytics.mvcc_*) and rebuilt on each run. Base tables are only read.
+-- Requires the pageinspect, pgstattuple and pg_visibility extensions (installed
+-- in the base image; CREATE EXTENSION IF NOT EXISTS below is a no-op then).
+--
+-- Mental model:
+--   * Every row version ("tuple") carries xmin (inserting xact) and xmax (deleting
+--     or locking xact, 0 if none). UPDATE = mark old version dead (set xmax) +
+--     insert a new version with a new ctid (block, line pointer).
+--   * A snapshot decides which versions are visible; nothing is overwritten in place.
+--   * Old versions become garbage only once no snapshot can see them; VACUUM
+--     reclaims them, sets visibility-map bits, and freezes old xmin values.
+
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+CREATE EXTENSION IF NOT EXISTS pg_visibility;
 
 -- =============================================================================
--- MVCC VISIBILITY DEMONSTRATIONS
+-- 0. LAB SETUP (module-owned table, autovacuum disabled so output is stable)
 -- =============================================================================
+\echo '== 0. Lab setup: analytics.mvcc_lab'
 
--- Create demo table to show MVCC behavior
-CREATE TEMP TABLE mvcc_demo (
-    id SERIAL PRIMARY KEY,
-    data TEXT,
-    version INTEGER DEFAULT 1,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+DROP TABLE IF EXISTS analytics.mvcc_lab;
+CREATE TABLE analytics.mvcc_lab (
+    id      integer PRIMARY KEY,
+    label   text    NOT NULL,       -- indexed: updating it prevents HOT
+    amount  integer NOT NULL,
+    note    text                    -- not indexed: updating it allows HOT
+) WITH (autovacuum_enabled = off, fillfactor = 70);  -- 30% free space per page for HOT
+CREATE INDEX mvcc_lab_label_idx ON analytics.mvcc_lab (label);
 
--- Function to demonstrate snapshot isolation
-CREATE OR REPLACE FUNCTION analytics.demo_snapshot_isolation()
-RETURNS TABLE(
-    step TEXT,
-    transaction_id BIGINT,
-    snapshot_time TIMESTAMPTZ,
-    visible_rows INTEGER,
-    row_data TEXT[]
-) AS $$
-DECLARE
-    initial_txid BIGINT;
-    step_counter INTEGER := 1;
-BEGIN
-    -- Get current transaction ID
-    initial_txid := txid_current();
+-- Seed from real data so the lab is tied to the city dataset: the five oldest
+-- neighbourhoods by id, using their population as the amount.
+INSERT INTO analytics.mvcc_lab (id, label, amount, note)
+SELECT neighborhood_id, neighborhood_name, population_estimate, 'v1'
+FROM geo.neighborhood_boundaries
+ORDER BY neighborhood_id
+LIMIT 5;
 
-    -- Insert initial data
-    INSERT INTO mvcc_demo (data) VALUES ('Row 1'), ('Row 2'), ('Row 3');
-
-    -- Step 1: Show initial state
-    RETURN QUERY
-    SELECT
-        ('Step ' || step_counter || ': Initial state')::TEXT,
-        initial_txid,
-        NOW(),
-        COUNT(*)::INTEGER,
-        array_agg(data ORDER BY id)
-    FROM mvcc_demo;
-
-    step_counter := step_counter + 1;
-
-    -- Step 2: Update a row (creates new version)
-    UPDATE mvcc_demo SET data = 'Row 1 Updated', version = 2 WHERE id = 1;
-
-    RETURN QUERY
-    SELECT
-        ('Step ' || step_counter || ': After update')::TEXT,
-        txid_current(),
-        NOW(),
-        COUNT(*)::INTEGER,
-        array_agg(data ORDER BY id)
-    FROM mvcc_demo;
-
-    step_counter := step_counter + 1;
-
-    -- Step 3: Delete a row (marks as deleted)
-    DELETE FROM mvcc_demo WHERE id = 2;
-
-    RETURN QUERY
-    SELECT
-        ('Step ' || step_counter || ': After delete')::TEXT,
-        txid_current(),
-        NOW(),
-        COUNT(*)::INTEGER,
-        array_agg(data ORDER BY id)
-    FROM mvcc_demo;
-END;
-$$ LANGUAGE plpgsql;
+-- Reusable helper: decode every line pointer on one heap page.
+-- lp_flags: 0 = unused, 1 = normal, 2 = redirect (HOT chain head after pruning), 3 = dead.
+CREATE OR REPLACE FUNCTION analytics.mvcc_page(p_rel regclass, p_blk integer DEFAULT 0)
+RETURNS TABLE (lp smallint, lp_state text, t_xmin xid, t_xmax xid, t_ctid tid,
+               flags text[])
+LANGUAGE sql STRICT AS $$
+    SELECT h.lp,
+           CASE h.lp_flags WHEN 0 THEN 'unused' WHEN 1 THEN 'normal'
+                           WHEN 2 THEN 'redirect->' || h.lp_off WHEN 3 THEN 'dead' END,
+           h.t_xmin, h.t_xmax, h.t_ctid,
+           -- keep only the flags that matter for MVCC lessons
+           ARRAY(SELECT f FROM unnest(fl.raw_flags || fl.combined_flags) AS f
+                 WHERE f IN ('HEAP_XMIN_COMMITTED','HEAP_XMIN_INVALID','HEAP_XMIN_FROZEN',
+                             'HEAP_XMAX_COMMITTED','HEAP_XMAX_INVALID','HEAP_XMAX_LOCK_ONLY',
+                             'HEAP_XMAX_EXCL_LOCK','HEAP_KEYS_UPDATED',
+                             'HEAP_HOT_UPDATED','HEAP_ONLY_TUPLE','HEAP_UPDATED')
+                 ORDER BY f)
+    FROM heap_page_items(get_raw_page(p_rel::text, p_blk)) AS h
+    LEFT JOIN LATERAL heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS fl ON true
+    ORDER BY h.lp;
+$$;
+COMMENT ON FUNCTION analytics.mvcc_page(regclass, integer) IS
+'Decodes a heap page with pageinspect: line pointer state, xmin/xmax, ctid chain and MVCC infomask flags.';
 
 -- =============================================================================
--- TRANSACTION ID AND SYSTEM COLUMNS ANALYSIS
+-- 1. SYSTEM COLUMNS: ctid, xmin, xmax
 -- =============================================================================
+\echo '== 1. System columns after INSERT (xmax = 0 means "not deleted or locked")'
 
--- Function to show system columns (xmin, xmax, ctid)
-CREATE OR REPLACE FUNCTION analytics.show_system_columns(table_name TEXT)
-RETURNS TABLE(
-    physical_location TID,
-    insert_txid BIGINT,
-    delete_txid BIGINT,
-    row_data TEXT,
-    is_visible_now BOOLEAN
-) AS $$
-DECLARE
-    query_sql TEXT;
-BEGIN
-    -- Build dynamic query to show system columns
-    query_sql := format('
-        SELECT
-            ctid as physical_location,
-            xmin::text::bigint as insert_txid,
-            CASE WHEN xmax = 0 THEN NULL ELSE xmax::text::bigint END as delete_txid,
-            %I::text as row_data,
-            CASE WHEN xmax = 0 OR xmax::text::bigint > txid_current() THEN true ELSE false END as is_visible_now
-        FROM %I
-        ORDER BY ctid',
-        'data', table_name  -- Assuming 'data' column exists
-    );
+SELECT ctid, xmin, xmax, id, label, amount, note
+FROM analytics.mvcc_lab
+ORDER BY id;
 
-    RETURN QUERY EXECUTE query_sql;
-END;
-$$ LANGUAGE plpgsql;
-
--- Demonstrate tuple visibility with explicit transaction IDs
-CREATE OR REPLACE FUNCTION analytics.demo_tuple_visibility()
-RETURNS TABLE(
-    demo_step TEXT,
-    tuple_ctid TID,
-    xmin_txid TEXT,
-    xmax_txid TEXT,
-    visibility_status TEXT,
-    data_content TEXT
-) AS $$
-BEGIN
-    -- Create demo table with system column access
-    CREATE TEMP TABLE visibility_demo (
-        id SERIAL PRIMARY KEY,
-        content TEXT,
-        modified_at TIMESTAMPTZ DEFAULT NOW()
-    );
-
-    -- Insert initial data
-    INSERT INTO visibility_demo (content) VALUES
-        ('Original content 1'),
-        ('Original content 2'),
-        ('Original content 3');
-
-    -- Show initial state
-    RETURN QUERY
-    SELECT
-        'Initial Insert'::TEXT as demo_step,
-        ctid,
-        xmin::TEXT,
-        CASE WHEN xmax::TEXT = '0' THEN 'NULL' ELSE xmax::TEXT END,
-        CASE WHEN xmax::TEXT = '0' THEN 'VISIBLE' ELSE 'DELETED' END,
-        content
-    FROM visibility_demo
-    ORDER BY id;
-
-    -- Update one row (creates new tuple, marks old as deleted)
-    UPDATE visibility_demo
-    SET content = 'Updated content 1', modified_at = NOW()
-    WHERE id = 1;
-
-    -- Show state after update
-    RETURN QUERY
-    SELECT
-        'After Update'::TEXT as demo_step,
-        ctid,
-        xmin::TEXT,
-        CASE WHEN xmax::TEXT = '0' THEN 'NULL' ELSE xmax::TEXT END,
-        CASE WHEN xmax::TEXT = '0' THEN 'VISIBLE' ELSE 'DELETED' END,
-        content
-    FROM visibility_demo
-    ORDER BY id;
-
-    -- Delete one row
-    DELETE FROM visibility_demo WHERE id = 2;
-
-    -- Show final state (deleted row still physically present but marked deleted)
-    RETURN QUERY
-    SELECT
-        'After Delete'::TEXT as demo_step,
-        ctid,
-        xmin::TEXT,
-        CASE WHEN xmax::TEXT = '0' THEN 'NULL' ELSE xmax::TEXT END,
-        CASE WHEN xmax::STRING = '0' THEN 'VISIBLE' ELSE 'DELETED' END,
-        COALESCE(content, '[DELETED]')
-    FROM visibility_demo
-    ORDER BY id;
-END;
-$$ LANGUAGE plpgsql;
+-- pg_current_xact_id() (xid8, 64-bit, epoch-aware) replaces the deprecated txid_current().
+-- pg_current_snapshot() shows xmin:xmax:in-progress-list for this statement.
+SELECT pg_current_xact_id_if_assigned() AS xid_before_any_write,  -- NULL: reads never consume an xid
+       pg_current_snapshot()            AS snapshot;
 
 -- =============================================================================
--- BLOAT ANALYSIS AND DEMONSTRATION
+-- 2. UPDATE = NEW TUPLE VERSION (and the old one stays on the page)
 -- =============================================================================
+\echo '== 2. UPDATE creates a new row version; the old version is still on the page'
 
--- Function to create bloated table for demonstration
-CREATE OR REPLACE FUNCTION analytics.create_bloat_demo()
-RETURNS TEXT AS $$
-DECLARE
-    i INTEGER;
-    initial_size BIGINT;
-    final_size BIGINT;
-    bloat_ratio NUMERIC;
-BEGIN
-    -- Create table for bloat demonstration
-    CREATE TABLE analytics.bloat_demo_table (
-        id SERIAL PRIMARY KEY,
-        data TEXT,
-        filler CHAR(100) DEFAULT 'X',
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+BEGIN;
+SELECT pg_current_xact_id() AS updating_xid;            -- assigns an xid now
+UPDATE analytics.mvcc_lab SET amount = amount + 1, label = label || ' (renamed)' WHERE id = 1;
+-- Inside the transaction we see only the new version (new ctid, xmin = our xid).
+SELECT ctid, xmin, xmax, id, label FROM analytics.mvcc_lab WHERE id = 1;
+COMMIT;
 
-    -- Insert initial data
-    INSERT INTO analytics.bloat_demo_table (data)
-    SELECT 'Initial data ' || generate_series(1, 10000);
-
-    initial_size := pg_relation_size('analytics.bloat_demo_table');
-
-    -- Create bloat by repeatedly updating all rows
-    FOR i IN 1..5 LOOP
-        UPDATE analytics.bloat_demo_table
-        SET data = 'Updated ' || i || ' times: ' || data,
-            updated_at = NOW();
-    END LOOP;
-
-    final_size := pg_relation_size('analytics.bloat_demo_table');
-    bloat_ratio := final_size::NUMERIC / initial_size;
-
-    RETURN format('Bloat demo created: Initial size: %s, Final size: %s, Bloat ratio: %sx',
-                  pg_size_pretty(initial_size),
-                  pg_size_pretty(final_size),
-                  ROUND(bloat_ratio, 2));
-END;
-$$ LANGUAGE plpgsql;
-
--- Function to analyze table bloat
-CREATE OR REPLACE FUNCTION analytics.analyze_table_bloat(
-    schema_name TEXT DEFAULT 'public',
-    table_name TEXT DEFAULT 'bloat_demo_table'
-)
-RETURNS TABLE(
-    table_name TEXT,
-    live_tuples BIGINT,
-    dead_tuples BIGINT,
-    table_size TEXT,
-    bloat_percentage NUMERIC,
-    vacuum_recommended BOOLEAN,
-    pages_total BIGINT,
-    pages_free BIGINT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        (schema_name || '.' || t.table_name)::TEXT,
-        pg_stat_get_live_tuples(c.oid) as live_tuples,
-        pg_stat_get_dead_tuples(c.oid) as dead_tuples,
-        pg_size_pretty(pg_relation_size(c.oid))::TEXT as table_size,
-        CASE
-            WHEN pg_stat_get_live_tuples(c.oid) > 0
-            THEN ROUND(pg_stat_get_dead_tuples(c.oid) * 100.0 /
-                      (pg_stat_get_live_tuples(c.oid) + pg_stat_get_dead_tuples(c.oid)), 2)
-            ELSE 0
-        END as bloat_percentage,
-        (pg_stat_get_dead_tuples(c.oid) > pg_stat_get_live_tuples(c.oid) * 0.2) as vacuum_recommended,
-        (pg_relation_size(c.oid) / 8192) as pages_total,
-        0::BIGINT as pages_free  -- Simplified
-    FROM information_schema.tables t
-    JOIN pg_class c ON c.relname = t.table_name
-    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.table_schema
-    WHERE t.table_schema = schema_name
-        AND (table_name IS NULL OR t.table_name = table_name)
-        AND t.table_type = 'BASE TABLE'
-    ORDER BY bloat_percentage DESC;
-END;
-$$ LANGUAGE plpgsql;
+-- The raw page still holds both versions: the old one has xmax set and its
+-- t_ctid points at the new version. label is indexed, so this was NOT a HOT update.
+SELECT * FROM analytics.mvcc_page('analytics.mvcc_lab');
 
 -- =============================================================================
--- VACUUM DEMONSTRATIONS
+-- 3. ROLLED-BACK DELETE: xmax is set, yet the row is still visible
 -- =============================================================================
+\echo '== 3. A rolled-back DELETE leaves xmax pointing at an aborted transaction'
 
--- Function to demonstrate vacuum effects
-CREATE OR REPLACE FUNCTION analytics.demo_vacuum_effects()
-RETURNS TABLE(
-    operation TEXT,
-    dead_tuples_before BIGINT,
-    table_size_before TEXT,
-    dead_tuples_after BIGINT,
-    table_size_after TEXT,
-    space_reclaimed TEXT,
-    duration_ms NUMERIC
-) AS $$
-DECLARE
-    start_time TIMESTAMPTZ;
-    end_time TIMESTAMPTZ;
-    dead_before BIGINT;
-    dead_after BIGINT;
-    size_before BIGINT;
-    size_after BIGINT;
-BEGIN
-    -- Ensure bloat demo table exists
-    PERFORM analytics.create_bloat_demo();
+BEGIN;
+SELECT pg_current_xact_id() AS deleter_xid \gset
+DELETE FROM analytics.mvcc_lab WHERE id = 2;
+SELECT count(*) AS rows_visible_inside_deleting_tx FROM analytics.mvcc_lab;  -- 4
+ROLLBACK;
 
-    -- Get initial stats
-    SELECT pg_stat_get_dead_tuples(oid), pg_relation_size(oid)
-    INTO dead_before, size_before
-    FROM pg_class WHERE relname = 'bloat_demo_table';
-
-    -- VACUUM (not FULL)
-    start_time := clock_timestamp();
-    VACUUM analytics.bloat_demo_table;
-    end_time := clock_timestamp();
-
-    SELECT pg_stat_get_dead_tuples(oid), pg_relation_size(oid)
-    INTO dead_after, size_after
-    FROM pg_class WHERE relname = 'bloat_demo_table';
-
-    RETURN QUERY SELECT
-        'VACUUM'::TEXT,
-        dead_before,
-        pg_size_pretty(size_before)::TEXT,
-        dead_after,
-        pg_size_pretty(size_after)::TEXT,
-        CASE WHEN size_after < size_before
-             THEN pg_size_pretty(size_before - size_after)::TEXT
-             ELSE 'No space reclaimed' END,
-        EXTRACT(EPOCH FROM (end_time - start_time)) * 1000;
-
-    -- Create more bloat
-    UPDATE analytics.bloat_demo_table SET data = 'More bloat: ' || data;
-
-    -- Get stats before VACUUM FULL
-    SELECT pg_stat_get_dead_tuples(oid), pg_relation_size(oid)
-    INTO dead_before, size_before
-    FROM pg_class WHERE relname = 'bloat_demo_table';
-
-    -- VACUUM FULL
-    start_time := clock_timestamp();
-    VACUUM FULL analytics.bloat_demo_table;
-    end_time := clock_timestamp();
-
-    SELECT pg_stat_get_dead_tuples(oid), pg_relation_size(oid)
-    INTO dead_after, size_after
-    FROM pg_class WHERE relname = 'bloat_demo_table';
-
-    RETURN QUERY SELECT
-        'VACUUM FULL'::TEXT,
-        dead_before,
-        pg_size_pretty(size_before)::TEXT,
-        dead_after,
-        pg_size_pretty(size_after)::TEXT,
-        pg_size_pretty(size_before - size_after)::TEXT,
-        EXTRACT(EPOCH FROM (end_time - start_time)) * 1000;
-
-    -- Cleanup
-    DROP TABLE analytics.bloat_demo_table;
-END;
-$$ LANGUAGE plpgsql;
+-- Visible again, but xmax <> 0: visibility checks consult the commit log (pg_xact)
+-- and find the deleter aborted. xmax alone never decides visibility.
+SELECT ctid, xmin, xmax, id, label,
+       pg_xact_status(:'deleter_xid'::xid8) AS deleter_status
+FROM analytics.mvcc_lab WHERE id = 2;
 
 -- =============================================================================
--- AUTOVACUUM MONITORING
+-- 4. ROW LOCKS ALSO LIVE IN xmax
 -- =============================================================================
+\echo '== 4. SELECT ... FOR UPDATE writes the locker into xmax (HEAP_XMAX_LOCK_ONLY)'
 
--- Function to check autovacuum settings and activity
-CREATE OR REPLACE FUNCTION analytics.check_autovacuum_status()
-RETURNS TABLE(
-    table_name TEXT,
-    last_vacuum TIMESTAMPTZ,
-    last_autovacuum TIMESTAMPTZ,
-    last_analyze TIMESTAMPTZ,
-    last_autoanalyze TIMESTAMPTZ,
-    vacuum_count BIGINT,
-    autovacuum_count BIGINT,
-    n_live_tup BIGINT,
-    n_dead_tup BIGINT,
-    autovacuum_threshold BIGINT,
-    needs_vacuum BOOLEAN
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        (schemaname || '.' || relname)::TEXT as table_name,
-        last_vacuum,
-        last_autovacuum,
-        last_analyze,
-        last_autoanalyze,
-        vacuum_count,
-        autovacuum_count,
-        n_live_tup,
-        n_dead_tup,
-        -- Simplified autovacuum threshold calculation
-        (50 + 0.2 * n_live_tup)::BIGINT as autovacuum_threshold,
-        (n_dead_tup > (50 + 0.2 * n_live_tup)) as needs_vacuum
-    FROM pg_stat_user_tables
-    WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents', 'analytics')
-    ORDER BY n_dead_tup DESC, n_live_tup DESC;
-END;
-$$ LANGUAGE plpgsql;
+BEGIN;
+SELECT id FROM analytics.mvcc_lab WHERE id = 3 FOR UPDATE;
+SELECT lp, t_xmin, t_xmax, flags
+FROM analytics.mvcc_page('analytics.mvcc_lab')
+WHERE t_ctid = (SELECT ctid FROM analytics.mvcc_lab WHERE id = 3);
+COMMIT;
+-- Row locks are not kept in shared memory (pg_locks); that is why millions of
+-- locked rows cost nothing in the lock table, and why FOR UPDATE dirties pages.
 
 -- =============================================================================
--- HINT BITS DEMONSTRATION
+-- 5. HINT BITS
 -- =============================================================================
+\echo '== 5. Hint bits: HEAP_XMIN_COMMITTED is set lazily by the first reader'
 
--- Function to show hint bit effects (simplified demonstration)
-CREATE OR REPLACE FUNCTION analytics.demo_hint_bits()
-RETURNS TEXT AS $$
-DECLARE
-    result TEXT := 'Hint bits demonstration:' || E'\n';
-BEGIN
-    -- Create table for hint bit demo
-    CREATE TEMP TABLE hint_bits_demo (
-        id SERIAL PRIMARY KEY,
-        data TEXT,
-        created_txid BIGINT DEFAULT txid_current()
-    );
+INSERT INTO analytics.mvcc_lab (id, label, amount, note) VALUES (100, 'hint-bit probe', 0, 'v1');
 
-    -- Insert data in current transaction
-    INSERT INTO hint_bits_demo (data)
-    SELECT 'Data row ' || generate_series(1, 1000);
+-- Right after the inserting transaction commits, nobody has checked the new
+-- tuple's visibility yet, so it carries no XMIN hint. (We locate it by line pointer
+-- number, without reading the table through a snapshot.)
+SELECT lp, t_xmin, flags AS flags_before_first_read
+FROM analytics.mvcc_page('analytics.mvcc_lab')
+WHERE lp = (SELECT max(lp) FROM heap_page_items(get_raw_page('analytics.mvcc_lab', 0)));
 
-    result := result || 'Created 1000 rows in transaction ' || txid_current() || E'\n';
+-- The first reader looks the xid up in pg_xact, finds it committed, and caches
+-- that answer in the tuple header (HEAP_XMIN_COMMITTED). Later readers skip the
+-- lookup. Setting hint bits dirties the page: this is the "first SELECT after a
+-- bulk load writes to disk" surprise.
+SELECT count(*) AS first_read FROM analytics.mvcc_lab;
 
-    -- Commit transaction (hint bits will be set on next access)
-    -- Note: In real scenario, hint bits are set when tuples are accessed
-    -- after their creating/deleting transactions commit
+SELECT lp, t_xmin, flags AS flags_after_first_read
+FROM analytics.mvcc_page('analytics.mvcc_lab')
+WHERE lp = (SELECT max(lp) FROM heap_page_items(get_raw_page('analytics.mvcc_lab', 0)));
 
-    result := result || 'Hint bits help avoid repeated transaction status lookups' || E'\n';
-    result := result || 'They are set automatically during tuple access after commit' || E'\n';
+-- =============================================================================
+-- 6. HOT (HEAP-ONLY TUPLE) UPDATES
+-- =============================================================================
+\echo '== 6. HOT updates: no indexed column changed + room on the same page'
 
-    -- Show transaction status functions that hint bits help optimize
-    result := result || 'Current transaction: ' || txid_current() || E'\n';
-    result := result || 'Transaction visible: ' || txid_visible_in_snapshot(txid_current(), txid_current_snapshot()) || E'\n';
+-- pg_stat_xact_user_tables shows counters not yet flushed to the cumulative
+-- stats system. Force a flush first so it reflects only the next transaction.
+SELECT pg_stat_force_next_flush();
+BEGIN;
+UPDATE analytics.mvcc_lab SET note = 'v2' WHERE id IN (3, 4, 5);       -- note is not indexed -> HOT
+UPDATE analytics.mvcc_lab SET label = 'Relabelled' WHERE id = 100;     -- indexed column -> regular update
+SELECT n_tup_upd, n_tup_hot_upd,
+       round(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_xact_user_tables
+WHERE relid = 'analytics.mvcc_lab'::regclass;
+COMMIT;
 
-    RETURN result;
-END;
-$$ LANGUAGE plpgsql;
+-- HOT chain on the page: old version = HEAP_HOT_UPDATED, new = HEAP_ONLY_TUPLE.
+-- The index still points at the old line pointer; readers follow t_ctid.
+SELECT * FROM analytics.mvcc_page('analytics.mvcc_lab') WHERE flags && ARRAY['HEAP_HOT_UPDATED','HEAP_ONLY_TUPLE'];
+
+-- Cumulative view (flushed when the backend goes idle, at most once per second
+-- unless forced). Watch the HOT ratio on busy tables; lower fillfactor or drop
+-- indexes on frequently-updated columns when it is poor.
+SELECT pg_stat_force_next_flush();
+SELECT relname, n_tup_upd, n_tup_hot_upd, n_dead_tup
+FROM pg_stat_user_tables WHERE relid = 'analytics.mvcc_lab'::regclass;
+
+-- =============================================================================
+-- 7. VACUUM: dead tuples, page pruning and the visibility map
+-- =============================================================================
+\echo '== 7. Before VACUUM: dead versions and an empty visibility map'
+
+SELECT tuple_count, dead_tuple_count, round(dead_tuple_percent::numeric, 1) AS dead_pct,
+       round(free_percent::numeric, 1) AS free_pct
+FROM pgstattuple('analytics.mvcc_lab');
+SELECT * FROM pg_visibility_map_summary('analytics.mvcc_lab');
+
+VACUUM analytics.mvcc_lab;
+
+\echo '== 7b. After VACUUM: dead tuples gone, HOT chain heads become redirects, page all-visible'
+SELECT tuple_count, dead_tuple_count, round(dead_tuple_percent::numeric, 1) AS dead_pct,
+       round(free_percent::numeric, 1) AS free_pct
+FROM pgstattuple('analytics.mvcc_lab');
+SELECT lp, lp_state, t_xmin, t_xmax, t_ctid, flags FROM analytics.mvcc_page('analytics.mvcc_lab');
+SELECT blkno, all_visible, all_frozen, pd_all_visible FROM pg_visibility('analytics.mvcc_lab');
+-- all_visible = true is what lets index-only scans skip the heap.
+
+-- =============================================================================
+-- 8. BLOAT AT SCALE: VACUUM vs VACUUM FULL
+-- =============================================================================
+\echo '== 8. Bloat lab: 10k rows updated 3 times'
+
+DROP TABLE IF EXISTS analytics.mvcc_bloat_lab;
+CREATE TABLE analytics.mvcc_bloat_lab (
+    id      integer PRIMARY KEY,
+    payload text,
+    filler  char(100) DEFAULT 'x'
+) WITH (autovacuum_enabled = off);
+INSERT INTO analytics.mvcc_bloat_lab (id, payload)
+SELECT g, 'row ' || g FROM generate_series(1, 10000) AS g;
+VACUUM (ANALYZE) analytics.mvcc_bloat_lab;
+
+CREATE TEMP TABLE IF NOT EXISTS mvcc_bloat_log (step text, size_bytes bigint, live bigint, dead bigint, free_pct numeric);
+TRUNCATE mvcc_bloat_log;
+INSERT INTO mvcc_bloat_log
+SELECT '1 fresh load', pg_relation_size('analytics.mvcc_bloat_lab'), tuple_count, dead_tuple_count, round(free_percent::numeric, 1)
+FROM pgstattuple('analytics.mvcc_bloat_lab');
+
+UPDATE analytics.mvcc_bloat_lab SET payload = payload || '.';   -- every UPDATE writes 10k new versions
+UPDATE analytics.mvcc_bloat_lab SET payload = payload || '.';
+UPDATE analytics.mvcc_bloat_lab SET payload = payload || '.';
+INSERT INTO mvcc_bloat_log
+SELECT '2 after 3 full-table updates', pg_relation_size('analytics.mvcc_bloat_lab'), tuple_count, dead_tuple_count, round(free_percent::numeric, 1)
+FROM pgstattuple('analytics.mvcc_bloat_lab');
+
+VACUUM analytics.mvcc_bloat_lab;      -- marks space reusable; file size normally stays
+INSERT INTO mvcc_bloat_log
+SELECT '3 after VACUUM', pg_relation_size('analytics.mvcc_bloat_lab'), tuple_count, dead_tuple_count, round(free_percent::numeric, 1)
+FROM pgstattuple('analytics.mvcc_bloat_lab');
+
+VACUUM FULL analytics.mvcc_bloat_lab; -- rewrites the table (ACCESS EXCLUSIVE lock!) and returns space to the OS
+INSERT INTO mvcc_bloat_log
+SELECT '4 after VACUUM FULL', pg_relation_size('analytics.mvcc_bloat_lab'), tuple_count, dead_tuple_count, round(free_percent::numeric, 1)
+FROM pgstattuple('analytics.mvcc_bloat_lab');
+
+SELECT step, pg_size_pretty(size_bytes) AS table_size, live, dead, free_pct
+FROM mvcc_bloat_log ORDER BY step;
+-- Lesson: plain VACUUM turns dead space into free space (free_pct up) without
+-- shrinking the file; VACUUM FULL / pg_repack / CLUSTER shrink it but rewrite.
+
+-- =============================================================================
+-- 9. FREEZING AND XID WRAPAROUND
+-- =============================================================================
+\echo '== 9. Freezing: VACUUM (FREEZE) marks xmin as frozen (visible to everyone forever)'
+
+SELECT relname, relfrozenxid, age(relfrozenxid) AS xid_age
+FROM pg_class WHERE oid = 'analytics.mvcc_lab'::regclass;
+
+VACUUM (FREEZE) analytics.mvcc_lab;
+
+SELECT relname, relfrozenxid, age(relfrozenxid) AS xid_age
+FROM pg_class WHERE oid = 'analytics.mvcc_lab'::regclass;
+-- HEAP_XMIN_FROZEN = XMIN_COMMITTED + XMIN_INVALID bits together (since 9.4 the
+-- original xmin is kept for forensics instead of being overwritten with 2).
+SELECT lp, t_xmin, flags FROM analytics.mvcc_page('analytics.mvcc_lab') WHERE lp_state = 'normal';
+SELECT * FROM pg_visibility_map_summary('analytics.mvcc_lab');   -- all_frozen pages are skipped by anti-wraparound vacuums
+
+-- Wraparound watch-list: 32-bit xids wrap after ~2^31 transactions; autovacuum
+-- forces an aggressive vacuum when age(relfrozenxid) > autovacuum_freeze_max_age.
+SELECT datname,
+       age(datfrozenxid)      AS xid_age,
+       mxid_age(datminmxid)   AS multixact_age,
+       round(100.0 * age(datfrozenxid) / current_setting('autovacuum_freeze_max_age')::bigint, 2)
+                              AS pct_of_freeze_max_age
+FROM pg_database WHERE datname = current_database();
+
+SELECT c.oid::regclass AS table_name,
+       age(c.relfrozenxid)    AS xid_age,
+       mxid_age(c.relminmxid) AS multixact_age,
+       pg_size_pretty(pg_table_size(c.oid)) AS size
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'm', 't')
+  AND n.nspname IN ('civics', 'commerce', 'mobility', 'geo', 'documents', 'analytics')
+ORDER BY age(c.relfrozenxid) DESC, c.oid::regclass::text
+LIMIT 5;
+
+-- =============================================================================
+-- 10. WHO IS HOLDING BACK VACUUM? (the xmin horizon)
+-- =============================================================================
+\echo '== 10. Backends whose snapshot pins old row versions (long transactions are the #1 bloat cause)'
+
+-- A dead tuple can only be removed if it is older than every running snapshot.
+-- backend_xmin of an idle-in-transaction session therefore blocks cleanup in
+-- the whole database. Also check replication slots and prepared transactions.
+SELECT pid, datname, state, backend_xid, backend_xmin,
+       age(backend_xmin) AS xmin_age,
+       now() - xact_start AS xact_duration,     -- wall-clock: genuinely now()
+       left(query, 60) AS query
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+  AND pid <> pg_backend_pid()
+ORDER BY age(backend_xmin) DESC
+LIMIT 5;
+
+SELECT 'replication slot' AS holder, slot_name::text AS name, xmin, catalog_xmin
+FROM pg_replication_slots WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL
+UNION ALL
+SELECT 'prepared xact', gid, transaction, NULL FROM pg_prepared_xacts;
+
+-- =============================================================================
+-- 11. DEAD-TUPLE OVERVIEW FOR THE CITY SCHEMAS (reusable view)
+-- =============================================================================
+\echo '== 11. Dead-tuple overview (analytics.v_dead_tuple_overview)'
+
+CREATE OR REPLACE VIEW analytics.v_dead_tuple_overview AS
+SELECT s.schemaname, s.relname,
+       s.n_live_tup, s.n_dead_tup,
+       round(100.0 * s.n_dead_tup / NULLIF(s.n_live_tup + s.n_dead_tup, 0), 2) AS dead_pct,
+       pg_size_pretty(pg_table_size(s.relid)) AS table_size,
+       s.last_vacuum, s.last_autovacuum, s.vacuum_count, s.autovacuum_count
+FROM pg_stat_user_tables s
+WHERE s.schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents', 'analytics');
+COMMENT ON VIEW analytics.v_dead_tuple_overview IS
+'Per-table live/dead tuple counts from the cumulative statistics system (estimates; use pgstattuple for exact numbers).';
+
+SELECT * FROM analytics.v_dead_tuple_overview
+ORDER BY n_dead_tup DESC, schemaname, relname
+LIMIT 8;
+
+-- Exercises
+--  1. In two psql sessions: [Session A] BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;
+--     [Session B] UPDATE analytics.mvcc_lab SET note = 'x'; VACUUM analytics.mvcc_lab;
+--     then rerun section 7: the dead versions stay until Session A ends.
+--  2. Recreate mvcc_lab with fillfactor = 100 and rerun section 6 many times:
+--     when the page fills up, updates stop being HOT.
