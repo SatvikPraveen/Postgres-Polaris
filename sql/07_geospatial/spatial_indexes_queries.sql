@@ -1,278 +1,259 @@
 -- File: sql/07_geospatial/spatial_indexes_queries.sql
--- Purpose: KNN, buffers, intersections, and spatial query optimization
+-- Purpose: GiST indexes, KNN, buffers, intersections, clustering and spatial query optimization
+--
+-- Conventions (see postgis_basics.sql):
+--   * Data is stored as geometry(…, 4326).
+--   * Anything in metres uses ::geography (ST_DWithin / ST_Distance / ST_Area / ST_Buffer).
+--   * We never project to 3857 to measure: it inflates lengths ~19% at this latitude.
+--
+-- Idempotent: indexes use IF NOT EXISTS, scratch objects are TEMP tables.
 
--- =============================================================================
--- K-NEAREST NEIGHBOR (KNN) QUERIES
--- =============================================================================
+\echo '== 1. Spatial indexes: geometry GiST vs geography expression GiST =='
+-- What teaches: the base already has GiST indexes on the geometry columns. A query
+-- that casts to geography (ST_DWithin(geom::geography, ..., metres)) can only use an
+-- index built on that SAME expression, so we add expression indexes.
+CREATE INDEX IF NOT EXISTS idx_pois_geog
+    ON geo.points_of_interest USING gist ((location_geom::geography));
+CREATE INDEX IF NOT EXISTS idx_roads_geog
+    ON geo.road_segments USING gist ((segment_geom::geography));
+-- Stations store latitude/longitude numerics; an expression index makes them spatial.
+CREATE INDEX IF NOT EXISTS idx_stations_geog
+    ON mobility.stations USING gist ((ST_SetSRID(ST_MakePoint(longitude::float8, latitude::float8), 4326)::geography));
+ANALYZE geo.points_of_interest;
+ANALYZE geo.road_segments;
+ANALYZE mobility.stations;
 
--- Find 5 nearest POIs to a given point using KNN (<-> operator)
-SELECT
-    poi.name,
-    poi.category,
-    poi.street_address,
-    -- Distance in meters using geography
-    ROUND(ST_Distance(poi.location_geom::geography, ST_SetSRID(ST_Point(-96.8040, 32.9855), 4326)::geography)) as distance_meters,
-    -- KNN distance (for ordering)
-    poi.location_geom <-> ST_SetSRID(ST_Point(-96.8040, 32.9855), 4326) as knn_distance
-FROM geo.points_of_interest poi
-WHERE poi.is_active = true
-ORDER BY poi.location_geom <-> ST_SetSRID(ST_Point(-96.8040, 32.9855), 4326)
+SELECT indexrelid::regclass AS index_name, indrelid::regclass AS table_name,
+       pg_get_indexdef(indexrelid) AS definition
+FROM pg_index
+WHERE indexrelid::regclass::text IN ('geo.idx_pois_geom', 'geo.idx_pois_geog',
+                                     'geo.idx_roads_geog', 'mobility.idx_stations_geog')
+ORDER BY 1;
+
+-- On 600 rows the planner may prefer a seq scan; disable it briefly to SHOW the
+-- index being usable. (Never do this in production code.)
+BEGIN;
+SET LOCAL enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT poi_id, name
+FROM geo.points_of_interest
+WHERE ST_DWithin(location_geom::geography,
+                 ST_SetSRID(ST_MakePoint(-96.8040, 32.9855), 4326)::geography, 500);
+COMMIT;
+
+\echo '== 2. K-nearest-neighbour (KNN) with <-> =='
+-- What teaches: ORDER BY a <-> b LIMIT k is answered by a GiST index scan that walks
+-- the tree in distance order (no need to compute every distance).
+--   geometry <-> geometry : distance in DEGREES (fine for ranking in a small area,
+--                           but 1 deg of longitude is shorter than 1 deg of latitude)
+--   geography <-> geography: true spheroid distance in METRES (index-assisted too)
+EXPLAIN (COSTS OFF)
+SELECT poi_id
+FROM geo.points_of_interest
+ORDER BY location_geom::geography <-> ST_SetSRID(ST_MakePoint(-96.8040, 32.9855), 4326)::geography
 LIMIT 5;
 
--- Find nearest POI of each category to city hall
+-- 5 nearest active POIs to City Hall
+SELECT
+    poi.poi_id,
+    poi.name,
+    poi.category,
+    round((poi.location_geom::geography <-> ch.g)::numeric) AS distance_m
+FROM geo.points_of_interest poi,
+     LATERAL (SELECT ST_SetSRID(ST_MakePoint(-96.8040, 32.9855), 4326)::geography AS g) ch
+WHERE poi.is_active
+ORDER BY poi.location_geom::geography <-> ch.g, poi.poi_id
+LIMIT 5;
+
+-- Nearest POI of each category: a LATERAL KNN per category is far cheaper than
+-- ROW_NUMBER() over every POI because each lateral probe stops after 1 row.
 WITH city_hall AS (
-    SELECT ST_SetSRID(ST_Point(-96.8040, 32.9855), 4326) as location
-),
-ranked_pois AS (
-    SELECT
-        poi.name,
-        poi.category,
-        poi.street_address,
-        ST_Distance(poi.location_geom::geography, ch.location::geography) as distance_meters,
-        ROW_NUMBER() OVER (PARTITION BY poi.category ORDER BY poi.location_geom <-> ch.location) as rn
-    FROM geo.points_of_interest poi
-    CROSS JOIN city_hall ch
-    WHERE poi.is_active = true
+    SELECT ST_SetSRID(ST_MakePoint(-96.8040, 32.9855), 4326)::geography AS g
 )
 SELECT
-    category,
-    name,
-    street_address,
-    ROUND(distance_meters) as distance_meters
-FROM ranked_pois
-WHERE rn = 1
-ORDER BY distance_meters;
+    c.category,
+    nearest.name,
+    round(nearest.distance_m::numeric) AS distance_m
+FROM unnest(enum_range(NULL::geo.poi_category)) AS c(category)
+CROSS JOIN city_hall ch
+CROSS JOIN LATERAL (
+    SELECT poi.name, poi.location_geom::geography <-> ch.g AS distance_m
+    FROM geo.points_of_interest poi
+    WHERE poi.category = c.category AND poi.is_active
+    ORDER BY poi.location_geom::geography <-> ch.g, poi.poi_id
+    LIMIT 1
+) nearest
+ORDER BY distance_m, c.category;
 
--- =============================================================================
--- BUFFER OPERATIONS
--- =============================================================================
-
--- Find all POIs within 1km buffer of transit stations
+\echo '== 3. Radius searches and walk-shed buffers =='
+-- What teaches: "within N metres" should be ST_DWithin(geography), not
+-- ST_Buffer + ST_Contains (slower and less accurate). Ring counts use FILTER.
 SELECT
     s.station_name,
     s.station_type,
-    COUNT(poi.poi_id) as pois_within_1km,
-    STRING_AGG(poi.name, ', ' ORDER BY poi.name) as poi_names
+    COUNT(poi.poi_id) FILTER (WHERE ST_DWithin(sg.g, poi.location_geom::geography, 400)) AS pois_within_400m,
+    COUNT(poi.poi_id) FILTER (WHERE NOT ST_DWithin(sg.g, poi.location_geom::geography, 400)) AS pois_400_to_800m,
+    COUNT(poi.poi_id)                                                                       AS pois_within_800m
 FROM mobility.stations s
-LEFT JOIN geo.points_of_interest poi ON ST_DWithin(
-    ST_Transform(ST_SetSRID(ST_Point(s.longitude, s.latitude), 4326), 3857),
-    ST_Transform(poi.location_geom, 3857),
-    1000  -- 1000 meters
-)
-WHERE poi.is_active = true OR poi.poi_id IS NULL
+CROSS JOIN LATERAL (SELECT ST_SetSRID(ST_MakePoint(s.longitude::float8, s.latitude::float8), 4326)::geography AS g) sg
+LEFT JOIN geo.points_of_interest poi
+       ON poi.is_active
+      AND ST_DWithin(sg.g, poi.location_geom::geography, 800)
+WHERE s.status = 'active'
 GROUP BY s.station_id, s.station_name, s.station_type
-ORDER BY pois_within_1km DESC;
+ORDER BY pois_within_800m DESC, s.station_name
+LIMIT 10;
 
--- Create walkability analysis with multiple buffer zones
-WITH station_buffers AS (
-    SELECT
-        s.station_id,
-        s.station_name,
-        s.station_type,
-        ST_SetSRID(ST_Point(s.longitude, s.latitude), 4326) as station_point,
-        ST_Buffer(ST_Transform(ST_SetSRID(ST_Point(s.longitude, s.latitude), 4326), 3857), 400) as walk_buffer_400m,
-        ST_Buffer(ST_Transform(ST_SetSRID(ST_Point(s.longitude, s.latitude), 4326), 3857), 800) as walk_buffer_800m
-    FROM mobility.stations s
-    WHERE s.status = 'active'
-)
+-- When you DO need a buffer polygon (e.g. to draw it or union it), buffer the
+-- geography: PostGIS picks a suitable local projection internally and the radius
+-- is in metres. Here: area of an 800 m walk-shed should be ~ pi * 800^2 = 2.01 km^2.
 SELECT
-    sb.station_name,
-    sb.station_type,
-    COUNT(CASE WHEN ST_Contains(ST_Transform(sb.walk_buffer_400m, 4326), poi.location_geom) THEN 1 END) as pois_within_400m,
-    COUNT(CASE WHEN ST_Contains(ST_Transform(sb.walk_buffer_800m, 4326), poi.location_geom)
-               AND NOT ST_Contains(ST_Transform(sb.walk_buffer_400m, 4326), poi.location_geom) THEN 1 END) as pois_400m_to_800m,
-    COUNT(poi.poi_id) as total_within_800m
-FROM station_buffers sb
-LEFT JOIN geo.points_of_interest poi ON ST_Contains(ST_Transform(sb.walk_buffer_800m, 4326), poi.location_geom)
-WHERE poi.is_active = true OR poi.poi_id IS NULL
-GROUP BY sb.station_id, sb.station_name, sb.station_type
-ORDER BY total_within_800m DESC;
+    round((ST_Area(ST_Buffer(ST_SetSRID(ST_MakePoint(-96.80, 32.98), 4326)::geography, 800)) / 1e6)::numeric, 3)
+        AS buffer_area_sq_km,
+    round((pi() * 800 ^ 2 / 1e6)::numeric, 3) AS expected_sq_km;
 
--- =============================================================================
--- INTERSECTION OPERATIONS
--- =============================================================================
-
--- Find which roads intersect with each neighborhood
+\echo '== 4. Intersections =='
+-- What teaches: ST_Intersects (index-assisted predicate) vs ST_Intersection (geometry
+-- construction). Lengths of the clipped pieces are measured as geography.
 SELECT
     nb.neighborhood_name,
-    COUNT(rs.segment_id) as intersecting_roads,
-    COUNT(CASE WHEN rs.road_type = 'arterial' THEN 1 END) as arterial_roads,
-    COUNT(CASE WHEN rs.road_type = 'local' THEN 1 END) as local_roads,
-    -- Total road length within neighborhood (km)
-    ROUND(
-        SUM(ST_Length(ST_Intersection(
-            ST_Transform(nb.boundary_geom, 3857),
-            ST_Transform(rs.segment_geom, 3857)
-        ))) / 1000.0, 2
-    ) as total_road_length_km
+    COUNT(rs.segment_id)                                          AS intersecting_segments,
+    COUNT(*) FILTER (WHERE rs.road_type = 'arterial')             AS arterial,
+    COUNT(*) FILTER (WHERE rs.road_type = 'collector')            AS collector,
+    COUNT(*) FILTER (WHERE rs.road_type = 'residential')          AS residential,
+    round((SUM(ST_Length(ST_Intersection(nb.boundary_geom, rs.segment_geom)::geography)) / 1000.0)::numeric, 2)
+                                                                  AS road_km_inside
 FROM geo.neighborhood_boundaries nb
 LEFT JOIN geo.road_segments rs ON ST_Intersects(nb.boundary_geom, rs.segment_geom)
 GROUP BY nb.neighborhood_id, nb.neighborhood_name
-ORDER BY total_road_length_km DESC;
+ORDER BY road_km_inside DESC NULLS LAST, nb.neighborhood_name
+LIMIT 10;
 
--- Find POIs that are within 100m of major roads
-WITH major_roads AS (
-    SELECT
-        rs.segment_id,
-        rs.road_name,
-        rs.road_type,
-        ST_Buffer(ST_Transform(rs.segment_geom, 3857), 100) as road_buffer_100m
-    FROM geo.road_segments rs
-    WHERE rs.road_type IN ('arterial', 'highway', 'collector')
-)
+-- POIs within 100 m of an arterial/collector road, with the nearest such road
+-- found by a LATERAL KNN probe (one row per POI, no duplicates).
 SELECT
-    poi.name,
     poi.category,
-    mr.road_name,
-    mr.road_type,
-    -- Exact distance to road centerline
-    ROUND(ST_Distance(
-        ST_Transform(poi.location_geom, 3857),
-        ST_Transform(rs.segment_geom, 3857)
-    )) as distance_to_road_meters
+    COUNT(*)                                   AS pois_near_major_road,
+    round(AVG(nr.distance_m)::numeric, 1)      AS avg_distance_m
 FROM geo.points_of_interest poi
-JOIN major_roads mr ON ST_Contains(mr.road_buffer_100m, ST_Transform(poi.location_geom, 3857))
-JOIN geo.road_segments rs ON mr.segment_id = rs.segment_id
-WHERE poi.is_active = true
-ORDER BY poi.category, distance_to_road_meters;
+CROSS JOIN LATERAL (
+    SELECT rs.road_name, rs.road_type,
+           ST_Distance(poi.location_geom::geography, rs.segment_geom::geography) AS distance_m
+    FROM geo.road_segments rs
+    WHERE rs.road_type IN ('arterial', 'collector', 'highway')
+    ORDER BY rs.segment_geom::geography <-> poi.location_geom::geography, rs.segment_id
+    LIMIT 1
+) nr
+WHERE poi.is_active
+  AND nr.distance_m <= 100
+GROUP BY poi.category
+ORDER BY pois_near_major_road DESC, poi.category;
 
--- =============================================================================
--- SPATIAL AGGREGATIONS
--- =============================================================================
-
--- Density analysis: POIs per square kilometer by neighborhood
+\echo '== 5. Spatial aggregations =='
+-- What teaches: density per km^2 and service-coverage via unioned geography buffers.
 SELECT
     nb.neighborhood_name,
     nb.area_sq_km,
-    COUNT(poi.poi_id) as poi_count,
-    ROUND(COUNT(poi.poi_id)::NUMERIC / NULLIF(nb.area_sq_km, 0), 2) as poi_density_per_sq_km,
-    -- Breakdown by category
-    COUNT(CASE WHEN poi.category = 'restaurant' THEN 1 END) as restaurants,
-    COUNT(CASE WHEN poi.category = 'retail' THEN 1 END) as retail,
-    COUNT(CASE WHEN poi.category = 'government' THEN 1 END) as government,
-    COUNT(CASE WHEN poi.category = 'park' THEN 1 END) as parks
+    COUNT(poi.poi_id)                                                    AS poi_count,
+    round(COUNT(poi.poi_id)::numeric / NULLIF(nb.area_sq_km, 0), 2)      AS poi_per_sq_km,
+    COUNT(*) FILTER (WHERE poi.category = 'restaurant')                  AS restaurants,
+    COUNT(*) FILTER (WHERE poi.category = 'retail')                      AS retail,
+    COUNT(*) FILTER (WHERE poi.category = 'park')                        AS parks
 FROM geo.neighborhood_boundaries nb
-LEFT JOIN geo.points_of_interest poi ON ST_Contains(nb.boundary_geom, poi.location_geom)
-    AND poi.is_active = true
+LEFT JOIN geo.points_of_interest poi
+       ON ST_Contains(nb.boundary_geom, poi.location_geom) AND poi.is_active
 GROUP BY nb.neighborhood_id, nb.neighborhood_name, nb.area_sq_km
-ORDER BY poi_density_per_sq_km DESC;
+ORDER BY poi_per_sq_km DESC, nb.neighborhood_name
+LIMIT 10;
 
--- Service coverage analysis: percentage of neighborhood area within 500m of essential services
-WITH essential_services AS (
-    SELECT location_geom
-    FROM geo.points_of_interest
-    WHERE category IN ('hospital', 'school', 'library', 'government')
-        AND is_active = true
-),
-service_buffers AS (
-    SELECT ST_Union(ST_Buffer(ST_Transform(location_geom, 3857), 500)) as coverage_area
-    FROM essential_services
-)
+-- Share of each neighbourhood within 500 m of an essential service.
+-- Buffers are built on geography (metres) and cast back to geometry for ST_Union.
+DROP TABLE IF EXISTS tmp_service_coverage;
+CREATE TEMP TABLE tmp_service_coverage AS
+SELECT ST_Union(ST_Buffer(location_geom::geography, 500)::geometry) AS coverage_geom
+FROM geo.points_of_interest
+WHERE category IN ('hospital', 'school', 'library', 'government')
+  AND is_active;
+
 SELECT
     nb.neighborhood_name,
-    nb.area_sq_km,
-    -- Calculate coverage percentage
-    ROUND(
-        (ST_Area(ST_Intersection(
-            ST_Transform(nb.boundary_geom, 3857),
-            sb.coverage_area
-        )) / ST_Area(ST_Transform(nb.boundary_geom, 3857))) * 100, 1
-    ) as service_coverage_pct,
-    -- Check if entire neighborhood is covered
-    ST_Contains(sb.coverage_area, ST_Transform(nb.boundary_geom, 3857)) as fully_covered
+    round((100 * ST_Area(ST_Intersection(nb.boundary_geom, sc.coverage_geom)::geography)
+               / ST_Area(nb.boundary_geom::geography))::numeric, 1)  AS service_coverage_pct,
+    ST_Covers(sc.coverage_geom, nb.boundary_geom)                     AS fully_covered
 FROM geo.neighborhood_boundaries nb
-CROSS JOIN service_buffers sb
-ORDER BY service_coverage_pct DESC;
+CROSS JOIN tmp_service_coverage sc
+ORDER BY service_coverage_pct DESC, nb.neighborhood_name
+LIMIT 10;
 
--- =============================================================================
--- SPATIAL CLUSTERING ANALYSIS
--- =============================================================================
-
--- Find clusters of restaurants using ST_ClusterDBSCAN
+\echo '== 6. Clustering with ST_ClusterDBSCAN =='
+-- What teaches: density-based clustering. eps is in the units of the input, so we
+-- cluster in UTM 14N (metres, accurate locally) rather than in degrees or 3857.
 WITH restaurant_clusters AS (
     SELECT
         poi.poi_id,
         poi.name,
         poi.location_geom,
-        -- Cluster restaurants within 200m of each other (minimum 3 in cluster)
-        ST_ClusterDBSCAN(ST_Transform(poi.location_geom, 3857), 200, 3) OVER () as cluster_id
+        ST_ClusterDBSCAN(ST_Transform(poi.location_geom, 32614), eps => 250, minpoints => 3) OVER () AS cluster_id
     FROM geo.points_of_interest poi
-    WHERE poi.category = 'restaurant' AND poi.is_active = true
+    WHERE poi.category = 'restaurant' AND poi.is_active
 )
 SELECT
     cluster_id,
-    COUNT(*) as restaurants_in_cluster,
-    STRING_AGG(name, ', ' ORDER BY name) as restaurant_names,
-    -- Calculate cluster centroid
-    ST_AsText(ST_Centroid(ST_Collect(location_geom))) as cluster_center,
-    -- Calculate cluster area (convex hull)
-    ROUND(ST_Area(ST_Transform(ST_ConvexHull(ST_Collect(location_geom)), 3857))) as cluster_area_sq_meters
+    COUNT(*)                                                        AS restaurants_in_cluster,
+    left(string_agg(name, ', ' ORDER BY name), 80)                  AS sample_names,
+    ST_AsText(ST_Centroid(ST_Collect(location_geom)), 5)            AS cluster_center,
+    round(ST_Area(ST_ConvexHull(ST_Collect(location_geom))::geography)::numeric) AS hull_area_sq_m
 FROM restaurant_clusters
 WHERE cluster_id IS NOT NULL
 GROUP BY cluster_id
-ORDER BY restaurants_in_cluster DESC;
+ORDER BY restaurants_in_cluster DESC, cluster_id
+LIMIT 10;
 
--- =============================================================================
--- ADVANCED SPATIAL QUERIES
--- =============================================================================
-
--- Find the most "central" POI in each category (closest to neighborhood geometric center)
-WITH neighborhood_centers AS (
-    SELECT
-        neighborhood_id,
-        neighborhood_name,
-        ST_Centroid(boundary_geom) as center_point
-    FROM geo.neighborhood_boundaries
-),
-poi_distances_to_centers AS (
-    SELECT
-        poi.poi_id,
-        poi.name,
-        poi.category,
-        nc.neighborhood_name,
-        ST_Distance(poi.location_geom::geography, nc.center_point::geography) as distance_to_center,
-        ROW_NUMBER() OVER (PARTITION BY nc.neighborhood_id, poi.category
-                          ORDER BY poi.location_geom <-> nc.center_point) as centrality_rank
+\echo '== 7. Advanced: centrality and underserved areas =='
+-- Most central POI per (neighbourhood, category): LATERAL KNN to the centroid.
+SELECT
+    nb.neighborhood_name,
+    c.category,
+    central.name                          AS most_central_poi,
+    round(central.distance_m::numeric)    AS distance_from_center_m
+FROM geo.neighborhood_boundaries nb
+CROSS JOIN unnest(ARRAY['restaurant', 'retail', 'park', 'school']::geo.poi_category[]) AS c(category)
+CROSS JOIN LATERAL (
+    SELECT poi.name,
+           ST_Distance(poi.location_geom::geography, ST_Centroid(nb.boundary_geom)::geography) AS distance_m
     FROM geo.points_of_interest poi
-    JOIN neighborhood_centers nc ON ST_Contains(
-        (SELECT boundary_geom FROM geo.neighborhood_boundaries WHERE neighborhood_id = nc.neighborhood_id),
-        poi.location_geom
-    )
-    WHERE poi.is_active = true
-)
-SELECT
-    neighborhood_name,
-    category,
-    name as most_central_poi,
-    ROUND(distance_to_center) as distance_from_center_meters
-FROM poi_distances_to_centers
-WHERE centrality_rank = 1
-    AND category IN ('restaurant', 'retail', 'park', 'school')
-ORDER BY neighborhood_name, category;
+    WHERE poi.category = c.category
+      AND poi.is_active
+      AND ST_Contains(nb.boundary_geom, poi.location_geom)
+    ORDER BY poi.location_geom <-> ST_Centroid(nb.boundary_geom), poi.poi_id
+    LIMIT 1
+) central
+ORDER BY nb.neighborhood_name, c.category
+LIMIT 16;
 
--- Accessibility analysis: Find underserved areas (far from any POI)
-WITH poi_coverage AS (
-    SELECT ST_Union(ST_Buffer(ST_Transform(location_geom, 3857), 800)) as covered_area
-    FROM geo.points_of_interest
-    WHERE category IN ('restaurant', 'retail', 'school', 'hospital', 'library')
-        AND is_active = true
-),
-underserved_areas AS (
-    SELECT
-        nb.neighborhood_id,
-        nb.neighborhood_name,
-        -- Calculate underserved area
-        ST_Difference(ST_Transform(nb.boundary_geom, 3857), pc.covered_area) as underserved_geom
+-- Underserved area: parts of each neighbourhood more than 800 m from any
+-- everyday service. ST_Difference of the polygon minus the unioned coverage.
+DROP TABLE IF EXISTS tmp_everyday_coverage;
+CREATE TEMP TABLE tmp_everyday_coverage AS
+SELECT ST_Union(ST_Buffer(location_geom::geography, 800)::geometry) AS covered_geom
+FROM geo.points_of_interest
+WHERE category IN ('restaurant', 'retail', 'school', 'hospital', 'library')
+  AND is_active;
+
+WITH underserved AS (
+    SELECT nb.neighborhood_name,
+           nb.boundary_geom,
+           ST_Difference(nb.boundary_geom, pc.covered_geom) AS underserved_geom
     FROM geo.neighborhood_boundaries nb
-    CROSS JOIN poi_coverage pc
+    CROSS JOIN tmp_everyday_coverage pc
 )
 SELECT
     neighborhood_name,
-    -- Convert back to WGS84 for display
-    ST_AsGeoJSON(ST_Transform(underserved_geom, 4326))::json as underserved_areas_geojson,
-    ROUND(ST_Area(underserved_geom) / 1000000.0, 3) as underserved_area_sq_km,
-    ROUND(ST_Area(underserved_geom) * 100.0 /
-          ST_Area(ST_Transform((SELECT boundary_geom FROM geo.neighborhood_boundaries WHERE neighborhood_id = ua.neighborhood_id), 3857)), 1) as underserved_pct
-FROM underserved_areas ua
-WHERE ST_Area(underserved_geom) > 10000  -- Only show areas > 10,000 sq meters
-ORDER BY underserved_area_sq_km DESC;
+    round((ST_Area(underserved_geom::geography) / 1e6)::numeric, 3)                          AS underserved_sq_km,
+    round((100 * ST_Area(underserved_geom::geography) / ST_Area(boundary_geom::geography))::numeric, 1) AS underserved_pct,
+    left(ST_AsGeoJSON(underserved_geom, 5), 60) || '...'                                     AS geojson_preview
+FROM underserved
+WHERE NOT ST_IsEmpty(underserved_geom)
+  AND ST_Area(underserved_geom::geography) > 10000   -- ignore slivers < 1 ha
+ORDER BY underserved_sq_km DESC, neighborhood_name
+LIMIT 10;
