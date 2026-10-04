@@ -238,34 +238,55 @@ CREATE INDEX idx_payments_transaction ON commerce.payments(transaction_id) WHERE
 -- =============================================================================
 
 -- Update order totals when items change
+-- Order totals are derived from line items. The recomputation is done in a
+-- single UPDATE so subtotal, tax and total are always mutually consistent
+-- (the CHECK chk_order_total added in module 02 sees no intermediate state),
+-- and it runs once per statement using transition tables, so a bulk insert
+-- of N items touches each affected order once instead of N times.
+CREATE OR REPLACE FUNCTION commerce.recompute_order_totals(order_ids bigint[])
+RETURNS void LANGUAGE sql AS $$
+    UPDATE commerce.orders o
+    SET subtotal     = s.sub,
+        tax_amount   = round(s.sub * 0.0825, 2),           -- Texas combined rate
+        total_amount = s.sub + round(s.sub * 0.0825, 2) + o.tip_amount,
+        updated_at   = now()
+    FROM (
+        SELECT id AS order_id,
+               coalesce((SELECT sum(line_total) FROM commerce.order_items i WHERE i.order_id = id), 0) AS sub
+        FROM unnest(order_ids) AS id
+    ) s
+    WHERE o.order_id = s.order_id
+$$;
+
 CREATE OR REPLACE FUNCTION commerce.update_order_totals()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE commerce.orders
-    SET
-        subtotal = (
-            SELECT COALESCE(SUM(line_total), 0)
-            FROM commerce.order_items
-            WHERE order_id = COALESCE(NEW.order_id, OLD.order_id)
-        ),
-        updated_at = NOW()
-    WHERE order_id = COALESCE(NEW.order_id, OLD.order_id);
-
-    -- Recalculate total_amount (assuming tax is 8.25%)
-    UPDATE commerce.orders
-    SET
-        tax_amount = subtotal * 0.0825,
-        total_amount = subtotal + (subtotal * 0.0825) + tip_amount,
-        updated_at = NOW()
-    WHERE order_id = COALESCE(NEW.order_id, OLD.order_id);
-
-    RETURN COALESCE(NEW, OLD);
+    IF TG_OP = 'INSERT' THEN
+        PERFORM commerce.recompute_order_totals(ARRAY(SELECT DISTINCT order_id FROM new_items));
+    ELSIF TG_OP = 'DELETE' THEN
+        PERFORM commerce.recompute_order_totals(ARRAY(SELECT DISTINCT order_id FROM old_items));
+    ELSE
+        PERFORM commerce.recompute_order_totals(ARRAY(
+            SELECT order_id FROM new_items UNION SELECT order_id FROM old_items));
+    END IF;
+    RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
-CREATE TRIGGER trg_order_items_totals
-    AFTER INSERT OR UPDATE OR DELETE ON commerce.order_items
-    FOR EACH ROW EXECUTE FUNCTION commerce.update_order_totals();
+CREATE TRIGGER trg_order_items_totals_ins
+    AFTER INSERT ON commerce.order_items
+    REFERENCING NEW TABLE AS new_items
+    FOR EACH STATEMENT EXECUTE FUNCTION commerce.update_order_totals();
+
+CREATE TRIGGER trg_order_items_totals_upd
+    AFTER UPDATE ON commerce.order_items
+    REFERENCING OLD TABLE AS old_items NEW TABLE AS new_items
+    FOR EACH STATEMENT EXECUTE FUNCTION commerce.update_order_totals();
+
+CREATE TRIGGER trg_order_items_totals_del
+    AFTER DELETE ON commerce.order_items
+    REFERENCING OLD TABLE AS old_items
+    FOR EACH STATEMENT EXECUTE FUNCTION commerce.update_order_totals();
 
 COMMENT ON FUNCTION commerce.update_order_totals() IS
-'Automatically recalculates order subtotal, tax, and total when items change';
+'Statement-level trigger: recomputes subtotal, tax (8.25%) and total for every order whose items changed';
