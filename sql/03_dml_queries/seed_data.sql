@@ -117,7 +117,7 @@ COMMENT ON TABLE meta.dataset IS
 'One row describing how the current dataset was produced. Cite scale, seed and generator_version when reporting results.';
 
 INSERT INTO meta.dataset (generator_version, scale, seed, as_of, server_version)
-VALUES ('2.0.0', :'scale', :'seed', '2025-12-31 23:59:59+00', current_setting('server_version'));
+VALUES ('2.1.0', :'scale', :'seed', '2025-12-31 23:59:59+00', current_setting('server_version'));
 
 CREATE OR REPLACE FUNCTION meta.as_of()
 RETURNS timestamptz LANGUAGE sql STABLE PARALLEL SAFE AS $$
@@ -420,7 +420,10 @@ FROM (
     JOIN cit c ON c.citizen_id = 1 + floor(synth.u(i, 200) * (10000 * :scale))::bigint
 ) p
 ORDER BY p.i;
--- pending/expired permits must be consistent with as_of
+-- Status must be consistent with as_of: nothing is decided in the future.
+UPDATE civics.permit_applications
+SET status = 'pending', approval_date = NULL, expiration_date = NULL, fee_paid = 0
+WHERE approval_date > meta.as_of();
 UPDATE civics.permit_applications SET status = 'expired'
 WHERE status = 'approved' AND expiration_date < meta.as_of();
 
@@ -431,7 +434,8 @@ INSERT INTO civics.tax_payments (
 SELECT
     citizen_id, ttype::civics.tax_type, yr, assessed, due,
     paid, pstatus::civics.payment_status, due_date,
-    CASE WHEN paid > 0 THEN (due_date - (synth.u(k, 306) * 40)::int)::timestamptz + interval '10 hours' END,
+    CASE WHEN paid > 0 THEN least((due_date - (synth.u(k, 306) * 40)::int)::timestamptz + interval '10 hours',
+                                  meta.as_of() - make_interval(hours => 1 + (synth.u(k, 307) * 1000)::int)) END,
     CASE WHEN ttype = 'property' THEN 'Parcel of citizen ' || citizen_id END,
     CASE WHEN ttype = 'property' THEN assessed END,
     mill, due_date - 90, due_date - 90
@@ -533,7 +537,7 @@ SELECT
     CASE WHEN iss + 365 > (meta.as_of())::date THEN 'active' ELSE 'expired' END::commerce.license_status,
     iss - 14, iss, iss + 365, CASE WHEN iss + 365 > (meta.as_of())::date THEN iss + 335 END,
     lt.fee, lt.fee, lt.inspect,
-    CASE WHEN lt.inspect THEN iss + (synth.u(m.merchant_id * 10 + lt.n, 602) * 200)::int END,
+    CASE WHEN lt.inspect THEN least(iss + (synth.u(m.merchant_id * 10 + lt.n, 602) * 200)::int, (meta.as_of())::date) END,
     CASE WHEN lt.inspect THEN iss + 365 END
 FROM commerce.merchants m
 CROSS JOIN LATERAL (VALUES ('general_business', 'GB', 1, 150.00, false),
@@ -638,6 +642,10 @@ UPDATE commerce.orders o SET
 FROM (SELECT order_id, sum(line_total) sub FROM commerce.order_items GROUP BY order_id) s,
      commerce.merchants m
 WHERE s.order_id = o.order_id AND m.merchant_id = o.merchant_id;
+
+-- A delivery that would land after as_of has not happened yet.
+UPDATE commerce.orders SET status = 'shipped', actual_delivery = NULL
+WHERE actual_delivery > meta.as_of();
 
 INSERT INTO meta.ground_truth (entity, entity_id, label, detail)
 SELECT 'commerce.orders', order_id, 'order_amount_outlier', jsonb_build_object('multiplier_range', '15-25')
@@ -806,6 +814,9 @@ LEFT JOIN st_range r ON r.stype = CASE seg.mode WHEN 'bus' THEN 'bus' WHEN 'rail
 LEFT JOIN mobility.stations ss ON ss.station_id = r.lo + floor(synth.u(seg.k, 925) * r.n)::bigint
 LEFT JOIN mobility.stations es ON es.station_id = r.lo + floor(synth.u(seg.k, 926) * r.n)::bigint
 ORDER BY b.trip_no, seg.ord;
+
+-- Trips still in progress at as_of are not yet recorded.
+DELETE FROM mobility.trip_segments WHERE end_time > meta.as_of();
 
 -- Sensors: hourly series with daily/weekly/annual structure and labelled anomalies.
 CREATE TEMP TABLE sensors AS
@@ -1009,6 +1020,11 @@ CROSS JOIN LATERAL (
         END AS meta
 ) t
 ORDER BY c.i;
+
+-- Acknowledgements that would happen after as_of have not happened yet.
+UPDATE documents.complaint_records
+SET acknowledged_at = NULL, assigned_to = NULL, status = 'submitted'
+WHERE acknowledged_at > meta.as_of();
 
 INSERT INTO documents.policy_documents (
     policy_number, title, version, document_content, document_type, department, policy_area, access_level, status,

@@ -155,6 +155,8 @@ Business Rules: Only tracks participation, not actual votes for privacy';
 -- =============================================================================
 
 -- Citizens indexes
+-- Deliberately redundant with the UNIQUE index behind citizens_email_key:
+-- module 11 (index_advisor_patterns.sql) uses it as its duplicate-index example.
 CREATE INDEX idx_citizens_email ON civics.citizens(email);
 CREATE INDEX idx_citizens_name ON civics.citizens(last_name, first_name);
 CREATE INDEX idx_citizens_zip ON civics.citizens(zip_code);

@@ -27,7 +27,7 @@
 \pset pager off
 
 BEGIN;
-SELECT plan(113);
+SELECT plan(119);
 
 -- Helpers live in pg_temp, so they disappear with the session (and the ROLLBACK).
 CREATE FUNCTION pg_temp.rejects_check(tbl text, con text, stmt text)
@@ -338,7 +338,13 @@ FROM (VALUES
     ('documents.complaint_records', 'submitted_at'),
     ('documents.complaint_records', 'incident_date'),
     ('documents.complaint_records', 'resolved_at'),
-    ('documents.policy_documents', 'effective_date')
+    ('documents.complaint_records', 'acknowledged_at'),
+    ('documents.policy_documents', 'effective_date'),
+    ('civics.tax_payments', 'payment_date'),
+    ('civics.permit_applications', 'approval_date'),
+    ('commerce.orders', 'actual_delivery'),
+    ('commerce.business_licenses', 'last_inspection_date'),
+    ('mobility.trip_segments', 'end_time')
 ) AS v(t, c);
 
 -- =============================================================================

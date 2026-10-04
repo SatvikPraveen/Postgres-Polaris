@@ -180,7 +180,6 @@ Business Rules: average_rating 1.00-5.00 or NULL, coordinates must be within cit
 -- Neighborhood boundaries indexes
 CREATE INDEX idx_neighborhoods_geom ON geo.neighborhood_boundaries USING GIST(boundary_geom);
 CREATE INDEX idx_neighborhoods_centroid ON geo.neighborhood_boundaries USING GIST(centroid_geom);
-CREATE INDEX idx_neighborhoods_name ON geo.neighborhood_boundaries(neighborhood_name);
 CREATE INDEX idx_neighborhoods_district ON geo.neighborhood_boundaries(city_council_district);
 
 -- Road segments indexes
@@ -233,7 +232,9 @@ LANGUAGE sql STABLE PARALLEL SAFE AS $$
     WHERE p.is_active
       AND ST_DWithin(p.location_geom::geography, o.g, radius_m)
       AND (poi_category_filter IS NULL OR p.category = poi_category_filter)
-    ORDER BY p.location_geom::geography <-> o.g
+    -- order by the same spheroidal distance that is reported; <-> on
+    -- geography uses a sphere and can swap near-ties by a few metres
+    ORDER BY 4, p.poi_id
 $$;
 
 COMMENT ON FUNCTION geo.find_nearby_pois(DECIMAL, DECIMAL, INTEGER, geo.poi_category) IS
@@ -259,7 +260,7 @@ BEGIN
     WHERE ST_Contains(n.boundary_geom, ST_SetSRID(ST_Point(lng, lat), 4326))
     LIMIT 1;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
 
 COMMENT ON FUNCTION geo.point_to_neighborhood(DECIMAL, DECIMAL) IS
 'Determine which neighborhood contains the given coordinates';

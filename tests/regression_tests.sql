@@ -101,12 +101,8 @@ SELECT is((SELECT count(*) FROM nearby WHERE distance_meters > 1500), 0::bigint,
 SELECT ok((SELECT bool_and(d >= prev_d * 0.995 - 1)
            FROM (SELECT distance_meters AS d, lag(distance_meters, 1, 0) OVER (ORDER BY pos) AS prev_d FROM nearby) s),
           'results are sorted by distance (to within sphere-vs-spheroid tolerance)');
--- Strict ordering by the reported distance. Marked TODO only while the known
--- bug is present (fix: ORDER BY ST_Distance(...) or by the 4th output column);
--- once fixed this becomes an ordinary, enforcing test.
-SELECT todo('KNOWN BUG in sql/01_schema_design/geo.sql: find_nearby_pois orders by <-> (sphere) but reports ST_Distance (spheroid)', 1)
-WHERE (SELECT array_agg(distance_meters ORDER BY pos) FROM nearby)
-   <> (SELECT array_agg(distance_meters ORDER BY distance_meters, pos) FROM nearby);
+-- Strict ordering by the reported distance. Guards against a past bug where
+-- the function ordered by <-> (sphere) but reported ST_Distance (spheroid).
 SELECT is((SELECT array_agg(distance_meters ORDER BY pos) FROM nearby),
           (SELECT array_agg(distance_meters ORDER BY distance_meters, pos) FROM nearby),
           'results are strictly sorted by the reported distance_meters');
@@ -176,26 +172,9 @@ CREATE TEMP TABLE before_order ON COMMIT DROP AS
 SELECT order_id, subtotal, tip_amount FROM commerce.orders
 WHERE order_id = (SELECT min(order_id) FROM commerce.orders WHERE tip_amount > 0);
 
--- Probe: does an item write survive the trigger + chk_order_total at all?
--- (The probe runs in a subtransaction that is always rolled back.)
-CREATE FUNCTION pg_temp.order_trigger_broken() RETURNS boolean LANGUAGE plpgsql AS $$
-BEGIN
-    BEGIN
-        INSERT INTO commerce.order_items (item_id, order_id, item_name, unit_price, quantity, line_total)
-        SELECT -99, order_id, 'probe', 1.00, 1, 1.00 FROM before_order;
-        RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'probe ok';
-    EXCEPTION
-        WHEN check_violation THEN RETURN true;
-        WHEN raise_exception THEN RETURN false;
-    END;
-END $$;
-
--- Historical bug guard: an earlier row-level trigger updated subtotal and
--- total in two statements, so the first UPDATE violated chk_order_total and
--- every item write failed. If that regression ever comes back, the 10 tests
--- below are reported as TODO (with the diagnosis) instead of aborting the run.
-SELECT todo('REGRESSION in commerce.update_order_totals(): an item write violates chk_order_total', 10)
-WHERE pg_temp.order_trigger_broken();
+-- Regression guard: an earlier row-level trigger updated subtotal and total
+-- in two statements, so the intermediate row violated chk_order_total and
+-- every item write failed. The tests below fail loudly if that returns.
 
 SELECT lives_ok(
     $$INSERT INTO commerce.order_items (item_id, order_id, item_name, unit_price, quantity, line_total)

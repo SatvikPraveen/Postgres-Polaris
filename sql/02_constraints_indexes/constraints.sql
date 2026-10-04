@@ -7,7 +7,7 @@
 
 -- Citizens constraints
 ALTER TABLE civics.citizens
-    ADD CONSTRAINT chk_citizens_age CHECK (date_of_birth <= CURRENT_DATE AND date_of_birth >= '1900-01-01'),
+    ADD CONSTRAINT chk_citizens_age CHECK (date_of_birth >= '1900-01-01'),  -- 'not in the future' is enforced by trigger below
     ADD CONSTRAINT chk_citizens_email CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
     ADD CONSTRAINT chk_citizens_zip CHECK (zip_code ~ '^\d{5}(-\d{4})?$');
 
@@ -15,7 +15,7 @@ ALTER TABLE civics.citizens
 ALTER TABLE civics.tax_payments
     ADD CONSTRAINT chk_tax_amounts CHECK (assessment_amount >= 0 AND amount_due >= 0 AND amount_paid >= 0),
     ADD CONSTRAINT chk_tax_payment_logic CHECK (amount_paid <= amount_due),
-    ADD CONSTRAINT chk_tax_year CHECK (tax_year BETWEEN 1970 AND EXTRACT(YEAR FROM CURRENT_DATE) + 1),
+    ADD CONSTRAINT chk_tax_year CHECK (tax_year BETWEEN 1970 AND 2100),
     ADD CONSTRAINT chk_mill_rate CHECK (mill_rate IS NULL OR mill_rate > 0);
 
 -- Permit constraints
@@ -112,36 +112,40 @@ ALTER TABLE documents.complaint_records
         (resolved_at IS NULL OR resolved_at >= submitted_at)
     );
 
+-- Why no CURRENT_DATE inside CHECK: a CHECK is evaluated only when a row is
+-- written, and PostgreSQL assumes its result never changes. A clock-based
+-- CHECK therefore passes on insert and can "fail" later during pg_restore or
+-- ALTER TABLE ... VALIDATE, breaking backups. Time-relative rules belong in
+-- a trigger, which is explicitly evaluated at write time.
+CREATE OR REPLACE FUNCTION civics.reject_future_birth_date()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.date_of_birth > CURRENT_DATE THEN
+        RAISE EXCEPTION 'date_of_birth % is in the future', NEW.date_of_birth
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'chk_citizens_birth_not_future';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS trg_citizens_birth_not_future ON civics.citizens;
+CREATE TRIGGER trg_citizens_birth_not_future
+    BEFORE INSERT OR UPDATE OF date_of_birth ON civics.citizens
+    FOR EACH ROW EXECUTE FUNCTION civics.reject_future_birth_date();
+
 -- =============================================================================
 -- UNIQUE CONSTRAINTS
 -- =============================================================================
 
--- Additional unique constraints beyond primary keys
-ALTER TABLE civics.citizens
-    ADD CONSTRAINT uq_citizens_ssn_hash UNIQUE (ssn_hash);
-
-ALTER TABLE civics.permit_applications
-    ADD CONSTRAINT uq_permit_number UNIQUE (permit_number);
-
-ALTER TABLE commerce.merchants
-    ADD CONSTRAINT uq_merchants_tax_id UNIQUE (tax_id);
-
-ALTER TABLE commerce.business_licenses
-    ADD CONSTRAINT uq_license_number UNIQUE (license_number);
-
-ALTER TABLE commerce.orders
-    ADD CONSTRAINT uq_order_number UNIQUE (order_number);
-
-ALTER TABLE mobility.stations
-    ADD CONSTRAINT uq_station_code UNIQUE (station_code);
-
-ALTER TABLE geo.neighborhood_boundaries
-    ADD CONSTRAINT uq_neighborhood_name UNIQUE (neighborhood_name),
-    ADD CONSTRAINT uq_neighborhood_code UNIQUE (neighborhood_code);
-
-ALTER TABLE documents.complaint_records
-    ADD CONSTRAINT uq_complaint_number UNIQUE (complaint_number);
-
+-- Single-column natural keys (citizens.email/ssn_hash, permit_number, tax_id,
+-- license_number, order_number, station_code, neighbourhood name/code,
+-- complaint_number) are already declared UNIQUE inline in 01_schema_design.
+-- Declaring them again here would build a second, identical unique index
+-- per key: double the write cost and storage for zero extra integrity.
+-- Check with:  SELECT conrelid::regclass, conname FROM pg_constraint WHERE contype = 'u';
+--
+-- Composite keys belong here. A policy number may have many versions, but
+-- each (number, version) pair is unique:
 ALTER TABLE documents.policy_documents
     ADD CONSTRAINT uq_policy_number_version UNIQUE (policy_number, version);
 

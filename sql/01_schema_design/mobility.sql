@@ -169,7 +169,6 @@ Business Rules: reading_value units must match sensor_type, quality_score 0-1';
 -- =============================================================================
 
 -- Stations indexes
-CREATE INDEX idx_stations_code ON mobility.stations(station_code);
 CREATE INDEX idx_stations_type ON mobility.stations(station_type);
 CREATE INDEX idx_stations_location ON mobility.stations(latitude, longitude);
 CREATE INDEX idx_stations_status ON mobility.stations(status) WHERE status != 'active';
