@@ -11,9 +11,10 @@
 --   3. The classic DQ dimensions: completeness, validity, uniqueness, referential
 --      integrity, timeliness (relative to meta.as_of(), never now()) and distribution drift
 --      (Population Stability Index).
---   4. Statistical checks: a robust z-score (median / MAD) outlier rule on
---      commerce.orders.total_amount, evaluated against the labelled anomalies in
---      meta.ground_truth (precision / recall / F1).
+--   4. Statistical checks: robust z-score (median / MAD) outlier rules on order totals
+--      and on basket-size-invariant unit prices, compared against the labelled anomalies
+--      in meta.ground_truth (precision / recall / F1). Feature choice moves F1 from
+--      about 0.3 to about 0.84.
 --   5. A landing-zone gate: rules run against a module-owned staging table with injected
 --      defects, bad rows are quarantined, and the rules are re-run.
 --
@@ -164,7 +165,41 @@ LANGUAGE sql STABLE AS $$
     FROM l JOIN med USING (merchant_id) JOIN mad USING (merchant_id)
 $$;
 COMMENT ON FUNCTION data_quality.order_amount_robust_z()
-    IS 'Per-merchant robust z-score (median/MAD on ln(total_amount)) for every order.';
+    IS 'Per-merchant robust z-score (median/MAD on ln(total_amount)) for every order. Kept as a baseline; see order_price_robust_z().';
+
+-- 2c. Choosing the right feature matters more than the statistic.
+--     An order's total mixes two things: how expensive its items are and how many
+--     items/units it has (1-5 lines, 1-4 units each). The basket-size part is
+--     large, legitimate variation, so a 20x price error is often no more unusual
+--     in total_amount than a big but normal basket. The mean ln(unit_price) of the
+--     order's lines removes basket size and isolates the price level, which is
+--     exactly what a pricing/keying error (or the generator's injected 15-25x
+--     prices) disturbs. Same median/MAD machinery, better input.
+CREATE OR REPLACE FUNCTION data_quality.order_price_robust_z()
+RETURNS TABLE (order_id bigint, merchant_id bigint, avg_unit_price numeric,
+               merchant_median_price numeric, robust_z numeric)
+LANGUAGE sql STABLE AS $$
+    WITH f AS (
+        SELECT o.order_id, o.merchant_id, avg(ln(i.unit_price)) AS x
+        FROM commerce.orders o
+        JOIN commerce.order_items i ON i.order_id = o.order_id
+        WHERE i.unit_price > 0
+        GROUP BY o.order_id, o.merchant_id),
+    med AS (
+        SELECT f.merchant_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY f.x) AS m
+        FROM f GROUP BY f.merchant_id),
+    mad AS (
+        SELECT f.merchant_id,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(f.x - med.m)) AS mad
+        FROM f JOIN med USING (merchant_id) GROUP BY f.merchant_id)
+    SELECT f.order_id, f.merchant_id,
+           round(exp(f.x)::numeric, 2),                          -- geometric mean unit price
+           round(exp(med.m)::numeric, 2),
+           round((0.6745 * (f.x - med.m) / nullif(mad.mad, 0))::numeric, 3)
+    FROM f JOIN med USING (merchant_id) JOIN mad USING (merchant_id)
+$$;
+COMMENT ON FUNCTION data_quality.order_price_robust_z()
+    IS 'Per-merchant robust z-score of the order''s mean ln(unit_price): basket-size invariant price outlier score.';
 
 -- =============================================================================
 -- 3. THE RUNNER
@@ -451,13 +486,14 @@ SELECT data_quality.upsert_rule(
 -- ---- statistical outliers -----------------------------------------------------------
 UNION ALL
 SELECT data_quality.upsert_rule(
-    'orders_amount_robust_z', 'statistical_outlier', 'commerce.orders', 'total_amount',
-    'Orders whose per-merchant robust z-score of ln(total_amount) exceeds 3.5. '
+    'orders_amount_robust_z', 'statistical_outlier', 'commerce.order_items', 'unit_price',
+    'Orders whose mean ln(unit_price) has a per-merchant robust z-score above 5.0 '
+    '(threshold chosen for best F1 against meta.ground_truth, section 6a). '
     'Tolerated up to 0.5% of orders; metric = largest z.',
-    $q$SELECT count(*) FILTER (WHERE robust_z > 3.5), count(*), max(robust_z)
-       FROM data_quality.order_amount_robust_z()$q$,
-    $q$SELECT order_id, format('amount %s vs merchant median %s (z=%s)', total_amount, merchant_median, robust_z)
-       FROM data_quality.order_amount_robust_z() WHERE robust_z > 3.5 ORDER BY robust_z DESC, order_id$q$,
+    $q$SELECT count(*) FILTER (WHERE robust_z > 5.0), count(*), max(robust_z)
+       FROM data_quality.order_price_robust_z()$q$,
+    $q$SELECT order_id, format('avg unit price %s vs merchant median %s (z=%s)', avg_unit_price, merchant_median_price, robust_z)
+       FROM data_quality.order_price_robust_z() WHERE robust_z > 5.0 ORDER BY robust_z DESC, order_id$q$,
     0.005, NULL, 'medium')
 ) AS registered;
 
@@ -479,7 +515,7 @@ ORDER BY dimension, rule_name;
 -- meta.ground_truth (label 'order_amount_outlier'). That lets us measure the detector:
 --   precision = flagged AND labelled / flagged      (how many alerts are real)
 --   recall    = flagged AND labelled / labelled     (how many real outliers we catch)
-\echo '-- 6a. robust z (per merchant) vs naive z (global mean/sd): precision / recall by threshold'
+\echo '-- 6a. three detectors, one ground truth: precision / recall / F1 by threshold'
 WITH truth AS (
     SELECT entity_id AS order_id FROM meta.ground_truth
     WHERE entity = 'commerce.orders' AND label = 'order_amount_outlier'),
@@ -487,7 +523,9 @@ naive AS (                                     -- the textbook z-score on raw am
     SELECT order_id, (total_amount - avg(total_amount) OVER ()) / stddev_pop(total_amount) OVER () AS z
     FROM commerce.orders),
 scored AS (
-    SELECT 'robust_z (merchant, log)' AS method, order_id, robust_z AS z FROM data_quality.order_amount_robust_z()
+    SELECT 'robust_z: unit price (merchant, log)' AS method, order_id, robust_z AS z FROM data_quality.order_price_robust_z()
+    UNION ALL
+    SELECT 'robust_z: order total (merchant, log)', order_id, robust_z FROM data_quality.order_amount_robust_z()
     UNION ALL
     SELECT 'naive_z (global, raw)', order_id, z FROM naive),
 sweep AS (
@@ -496,7 +534,7 @@ sweep AS (
            count(*) FILTER (WHERE s.z > t.thr AND tr.order_id IS NOT NULL)   AS true_pos,
            (SELECT count(*) FROM truth)                                      AS labelled
     FROM scored s
-    CROSS JOIN (VALUES (2.5), (3.0), (3.5), (5.0)) AS t(thr)
+    CROSS JOIN (VALUES (3.5), (4.5), (5.0), (6.0)) AS t(thr)
     LEFT JOIN truth tr USING (order_id)
     GROUP BY s.method, t.thr)
 SELECT method, thr, flagged, true_pos, labelled,
@@ -505,11 +543,14 @@ SELECT method, thr, flagged, true_pos, labelled,
        round(2.0 * true_pos / nullif(flagged + labelled, 0), 3) AS f1
 FROM sweep
 ORDER BY method DESC, thr;
--- Reading the table: the naive z-score is dominated by the heavy right tail (big but
--- legitimate merchants), so it flags thousands of normal orders. Conditioning on the
--- merchant and using median/MAD on the log scale gives high precision at 3.5 but modest
--- recall: an injected 15-25x order from a merchant whose baskets already vary a lot is
--- not "extreme" for that merchant. Lowering the threshold trades precision for recall.
+-- Reading the table (scale 1, seed 42):
+--   * naive z on raw totals is dominated by the heavy right tail of big-but-legitimate
+--     baskets: it flags many normal orders and misses most real ones.
+--   * robust z on the order TOTAL is precise at 3.5 (~0.83) but finds only ~18% of the
+--     injected outliers: basket-size variation hides a 15-25x price error.
+--   * robust z on the mean UNIT PRICE peaks at threshold 5.0 with precision ~0.85,
+--     recall ~0.83, F1 ~0.84. Same statistic, better feature.
+-- Lesson: before tuning a threshold, ask which quantity the defect actually perturbs.
 
 \echo '-- 6b. the sensor_dropouts validity rule vs labelled dropouts'
 WITH flagged AS (
