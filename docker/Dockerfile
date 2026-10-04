@@ -1,43 +1,54 @@
-# File: docker/Dockerfile
-# PostgreSQL with PostGIS for postgres-polaris project
+# syntax=docker/dockerfile:1.7
+# PostgreSQL Polaris image
+#
+# Built on the official multi-arch postgres image (linux/amd64 + linux/arm64)
+# with PostGIS and the extension set used across the curriculum installed
+# from the PGDG apt repository that the base image already configures.
+#
+#   docker build --build-arg PG_MAJOR=17 -t polaris-db .
+#
+# Supported PG_MAJOR values: 16, 17, 18 (CI tests all three).
 
-FROM postgis/postgis:16-3.4
+ARG PG_MAJOR=17
+FROM postgres:${PG_MAJOR}-bookworm
 
-# Install additional extensions and tools
-RUN apt-get update && apt-get install -y \
-    postgresql-16-cron \
-    postgresql-16-partman \
-    postgresql-contrib-16 \
-    postgresql-16-pgtap \
-    curl \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+ARG PG_MAJOR
+ARG POSTGIS_MAJOR=3
 
-# Copy initialization scripts
+LABEL org.opencontainers.image.title="PostgreSQL Polaris" \
+      org.opencontainers.image.description="PostgreSQL ${PG_MAJOR} + PostGIS ${POSTGIS_MAJOR} with pg_cron, pg_partman, pgTAP, HypoPG, pgvector" \
+      org.opencontainers.image.source="https://github.com/SatvikPraveen/Postgres-Polaris" \
+      org.opencontainers.image.licenses="MIT"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        postgresql-${PG_MAJOR}-postgis-${POSTGIS_MAJOR} \
+        postgresql-${PG_MAJOR}-postgis-${POSTGIS_MAJOR}-scripts \
+        postgresql-${PG_MAJOR}-cron \
+        postgresql-${PG_MAJOR}-partman \
+        postgresql-${PG_MAJOR}-pgtap \
+        postgresql-${PG_MAJOR}-hypopg \
+        postgresql-${PG_MAJOR}-pgvector \
+        postgresql-${PG_MAJOR}-pg-stat-kcache \
+        libtap-parser-sourcehandler-pgtap-perl \
+        ca-certificates \
+        curl \
+        jq \
+        ; \
+    rm -rf /var/lib/apt/lists/*
+
+# Server configuration lives outside PGDATA so it is versioned with the repo
+# and identical across fresh volumes. docker-compose passes
+# `-c config_file=/etc/postgresql/postgresql.conf`.
+COPY conf/postgresql.conf /etc/postgresql/postgresql.conf
+
+# First-boot initialisation (only runs when the data volume is empty).
 COPY initdb/ /docker-entrypoint-initdb.d/
 
-# Create directories for SQL modules and data (read-only mounts)
-RUN mkdir -p /sql /data
+# Mount points for the curriculum (read-only bind mounts in compose).
+RUN mkdir -p /sql /data /tests /examples /benchmarks \
+    && chown postgres:postgres /sql /data /tests /examples /benchmarks
 
-# Set permissions
-RUN chown postgres:postgres /sql /data
-
-# Set default database configuration
-ENV POSTGRES_DB=polaris
-ENV POSTGRES_USER=polaris_admin
-ENV POSTGRES_PASSWORD=polaris_secure_2024
-ENV POSTGRES_INITDB_ARGS="--encoding=UTF8 --locale=en_US.UTF-8"
-
-# Configure PostgreSQL
-ENV POSTGRES_HOST_AUTH_METHOD=md5
-ENV POSTGRES_MULTIPLE_DATABASES=polaris,polaris_test
-
-# Expose PostgreSQL port
+ENV PG_MAJOR=${PG_MAJOR}
 EXPOSE 5432
-
-# Health check with proper escaping
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" || exit 1
-
-# Set proper user
-USER postgres

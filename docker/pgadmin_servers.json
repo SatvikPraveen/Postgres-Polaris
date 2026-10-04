@@ -1,15 +1,14 @@
 {
   "Servers": {
     "1": {
-      "Name": "Polaris PostgreSQL",
-      "Group": "Local Development",
-      "Host": "postgres",
+      "Name": "Polaris",
+      "Group": "Local",
+      "Host": "db",
       "Port": 5432,
       "MaintenanceDB": "polaris",
-      "Username": "polaris_admin",
-      "PassFile": "/tmp/pgpassfile",
+      "Username": "polaris",
       "SSLMode": "prefer",
-      "Comment": "postgres-polaris development database"
+      "Comment": "PostgreSQL Polaris development database"
     }
   }
 }
