@@ -1,408 +1,209 @@
 -- Location: /examples/performance_tuning_showcase.sql
--- Before/after optimization examples with real performance measurements
+-- =============================================================================
+-- Performance tuning showcase - before/after with real plans
+-- =============================================================================
+-- Demos (each section says what it teaches):
+--   1. Seq Scan -> Index Scan      - a missing index on a selective predicate
+--   2. What-if indexing (HypoPG)   - test an index without building it
+--   3. Composite index for "latest per group" - index order = query order
+--   4. Partial index               - index only the rows a hot query touches
+--   5. Query rewriting             - NOT IN vs NOT EXISTS (NULL trap, anti-join)
+--   6. Extended statistics         - fixing a misestimate on correlated columns
+--   7. work_mem                    - sort spilling to disk vs in memory
+--   8. BRIN vs B-tree              - tiny index for naturally ordered time series
+--   9. Index hygiene               - duplicate and unused indexes
+--
+-- Safety: every index / statistics object built here is created inside a
+-- transaction that is ROLLED BACK, so the base tables end exactly as they
+-- started and the script can be re-run any number of times. Recency windows
+-- use meta.as_of() (the dataset "now"), not now().
+-- Run: psql -X -v ON_ERROR_STOP=1 -d <db> -f /examples/performance_tuning_showcase.sql
+-- =============================================================================
+\set ON_ERROR_STOP on
+\pset pager off
+\pset null '-'
 
-SELECT '⚡ Performance Tuning Showcase - Before/After Optimization' as title;
+-- Fresh statistics so the "before" plans are honest.
+ANALYZE civics.citizens, commerce.orders, commerce.payments, commerce.order_items, mobility.sensor_readings;
 
--- Setup: Create test data if tables are small
+\echo ''
+\echo '=== 1. Seq Scan -> Index Scan: looking a citizen up by phone number ==='
+BEGIN;
+\echo '--- BEFORE (no index on phone: every row is read) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT citizen_id, first_name, last_name FROM civics.citizens WHERE phone = '(972) 555-4242';
+
+CREATE INDEX demo_citizens_phone ON civics.citizens (phone);
+\echo '--- AFTER (index scan, a handful of buffers instead of the whole table) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT citizen_id, first_name, last_name FROM civics.citizens WHERE phone = '(972) 555-4242';
+ROLLBACK;
+
+\echo ''
+\echo '=== 2. What-if indexing with HypoPG: would an index on payments(processed_at) be used? ==='
+-- Hypothetical indexes exist only in this session's planner; nothing is built.
 DO $$
-DECLARE
-    citizen_count integer;
-    order_count integer;
 BEGIN
-    SELECT COUNT(*) INTO citizen_count FROM citizens;
-    SELECT COUNT(*) INTO order_count FROM orders;
-
-    RAISE NOTICE 'Current data size: % citizens, % orders', citizen_count, order_count;
-
-    -- Generate additional test data for performance demonstration if needed
-    IF citizen_count < 1000 THEN
-        RAISE NOTICE 'Generating additional test data for performance demo...';
-
-        INSERT INTO citizens (name, email, phone, birth_date, registration_date, city, state)
-        SELECT
-            'Test User ' || i,
-            'testuser' || i || '@example.com',
-            '555-' || LPAD(i::text, 4, '0'),
-            CURRENT_DATE - (RANDOM() * 365 * 30)::integer,
-            CURRENT_DATE - (RANDOM() * 365 * 2)::integer,
-            'Springfield',
-            'IL'
-        FROM generate_series(citizen_count + 1, 1000) i;
-
-        -- Generate orders for performance testing
-        INSERT INTO orders (customer_id, merchant_id, order_date, total_amount, status, payment_method)
-        SELECT
-            (RANDOM() * 1000 + 1)::integer,
-            (RANDOM() * 5 + 1)::integer,
-            CURRENT_DATE - (RANDOM() * 365)::integer,
-            (RANDOM() * 200 + 10)::numeric(10,2),
-            CASE WHEN RANDOM() < 0.9 THEN 'completed' ELSE 'pending' END,
-            (ARRAY['credit_card', 'debit_card', 'cash', 'digital_wallet'])[CEIL(RANDOM() * 4)]
-        FROM generate_series(1, 3000);
-
-        RAISE NOTICE 'Generated test data for performance demonstration';
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hypopg') THEN
+        RAISE NOTICE 'hypopg is not installed in this database - section 2 skipped';
     END IF;
 END $$;
+SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hypopg') AS have_hypopg \gset
+\if :have_hypopg
+SELECT indexname, pg_size_pretty(hypopg_relation_size(indexrelid)) AS estimated_size
+FROM hypopg_create_index('CREATE INDEX ON commerce.payments (processed_at)');
+-- Plain EXPLAIN only (a hypothetical index cannot be executed), and pass the
+-- cut-off as a literal: HypoPG cannot cost a predicate on an expression such as
+-- meta.as_of() - interval, so we materialise it with \gset first.
+SELECT meta.as_of() - interval '1 day' AS since \gset
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(amount) FROM commerce.payments
+WHERE processed_at >= :'since';
+SELECT hypopg_reset();
+\endif
 
--- Demo 1: Sequential Scan vs Index Scan
-SELECT 'Demo 1: Sequential Scan vs Index Scan Comparison' as demo;
+\echo ''
+\echo '=== 3. Composite index for "latest order per customer" ==='
+-- DISTINCT ON (customer) ... ORDER BY customer, order_date DESC can walk an
+-- index on (customer_citizen_id, order_date DESC) instead of sorting 50k rows.
+BEGIN;
+\echo '--- BEFORE ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT DISTINCT ON (customer_citizen_id) customer_citizen_id, order_id, order_date
+FROM commerce.orders
+WHERE customer_citizen_id BETWEEN 1 AND 200
+ORDER BY customer_citizen_id, order_date DESC;
 
--- BEFORE: Query without index (likely sequential scan)
-EXPLAIN (ANALYZE, BUFFERS, TIMING)
-SELECT * FROM citizens
-WHERE email LIKE '%johnson%';
+CREATE INDEX demo_orders_customer_date ON commerce.orders (customer_citizen_id, order_date DESC);
+\echo '--- AFTER (no Sort node: rows arrive in index order) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT DISTINCT ON (customer_citizen_id) customer_citizen_id, order_id, order_date
+FROM commerce.orders
+WHERE customer_citizen_id BETWEEN 1 AND 200
+ORDER BY customer_citizen_id, order_date DESC;
+ROLLBACK;
 
--- Create index for comparison
-CREATE INDEX IF NOT EXISTS idx_citizens_email_demo ON citizens(email);
-
--- AFTER: Same query with index available
-EXPLAIN (ANALYZE, BUFFERS, TIMING)
-SELECT * FROM citizens
-WHERE email = 'alice.johnson@email.com';
-
--- Performance comparison summary
-SELECT 'Index Performance Summary' as analysis;
-WITH scan_comparison AS (
-    SELECT
-        'Sequential Scan' as scan_type,
-        'Pattern matching on unindexed column' as scenario,
-        'Slow for large tables' as performance
-    UNION ALL
-    SELECT
-        'Index Scan',
-        'Exact match on indexed column',
-        'Fast, logarithmic lookup'
-)
-SELECT * FROM scan_comparison;
-
--- Demo 2: Join Performance Optimization
-SELECT 'Demo 2: Join Performance - Hash vs Nested Loop' as demo;
-
--- BEFORE: Potentially inefficient join without proper indexes
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT c.name, COUNT(o.order_id) as order_count, SUM(o.total_amount) as total_spent
-FROM citizens c
-LEFT JOIN orders o ON c.citizen_id = o.customer_id
-WHERE c.city = 'Springfield'
-GROUP BY c.citizen_id, c.name
-HAVING COUNT(o.order_id) > 0
-ORDER BY total_spent DESC;
-
--- Create indexes to optimize joins
-CREATE INDEX IF NOT EXISTS idx_orders_customer_id_demo ON orders(customer_id);
-CREATE INDEX IF NOT EXISTS idx_citizens_city_demo ON citizens(city);
-
--- AFTER: Same query with optimized indexes
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT c.name, COUNT(o.order_id) as order_count, SUM(o.total_amount) as total_spent
-FROM citizens c
-LEFT JOIN orders o ON c.citizen_id = o.customer_id
-WHERE c.city = 'Springfield'
-GROUP BY c.citizen_id, c.name
-HAVING COUNT(o.order_id) > 0
-ORDER BY total_spent DESC;
-
--- Demo 3: Window Function Optimization
-SELECT 'Demo 3: Window Function Performance Tuning' as demo;
-
--- BEFORE: Window function without proper ordering index
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    customer_id,
-    order_date,
-    total_amount,
-    ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) as recent_order_rank,
-    SUM(total_amount) OVER (PARTITION BY customer_id ORDER BY order_date ROWS UNBOUNDED PRECEDING) as running_total
-FROM orders
-WHERE order_date >= CURRENT_DATE - INTERVAL '90 days'
-ORDER BY customer_id, order_date DESC;
-
--- Create composite index for window function optimization
-CREATE INDEX IF NOT EXISTS idx_orders_customer_date_demo ON orders(customer_id, order_date DESC);
-
--- AFTER: Same window function with optimized index
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    customer_id,
-    order_date,
-    total_amount,
-    ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date DESC) as recent_order_rank,
-    SUM(total_amount) OVER (PARTITION BY customer_id ORDER BY order_date ROWS UNBOUNDED PRECEDING) as running_total
-FROM orders
-WHERE order_date >= CURRENT_DATE - INTERVAL '90 days'
-ORDER BY customer_id, order_date DESC;
-
--- Demo 4: Aggregation Performance
-SELECT 'Demo 4: Aggregation Query Optimization' as demo;
-
--- BEFORE: Aggregation that might benefit from partial indexes
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    DATE_TRUNC('day', order_date) as order_day,
-    COUNT(*) as order_count,
-    SUM(total_amount) as daily_revenue,
-    AVG(total_amount) as avg_order_value
-FROM orders
-WHERE status = 'completed'
-    AND order_date >= CURRENT_DATE - INTERVAL '30 days'
-GROUP BY DATE_TRUNC('day', order_date)
-ORDER BY order_day;
-
--- Create partial index for completed orders
-CREATE INDEX IF NOT EXISTS idx_orders_completed_date_demo
-ON orders(order_date)
-WHERE status = 'completed';
-
--- AFTER: Same aggregation with partial index
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    DATE_TRUNC('day', order_date) as order_day,
-    COUNT(*) as order_count,
-    SUM(total_amount) as daily_revenue,
-    AVG(total_amount) as avg_order_value
-FROM orders
-WHERE status = 'completed'
-    AND order_date >= CURRENT_DATE - INTERVAL '30 days'
-GROUP BY DATE_TRUNC('day', order_date)
-ORDER BY order_day;
-
--- Demo 5: Query Rewriting for Performance
-SELECT 'Demo 5: Query Rewriting - EXISTS vs IN vs JOIN' as demo;
-
--- BEFORE: Using IN subquery (potentially slow)
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT c.*
-FROM citizens c
-WHERE c.citizen_id IN (
-    SELECT DISTINCT customer_id
-    FROM orders
-    WHERE total_amount > 100
-    AND status = 'completed'
-);
-
--- AFTER: Using EXISTS (often faster)
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT c.*
-FROM citizens c
-WHERE EXISTS (
-    SELECT 1
-    FROM orders o
-    WHERE o.customer_id = c.citizen_id
-    AND o.total_amount > 100
-    AND o.status = 'completed'
-);
-
--- ALTERNATIVE: Using JOIN with DISTINCT (sometimes fastest)
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT DISTINCT c.*
-FROM citizens c
-INNER JOIN orders o ON c.citizen_id = o.customer_id
-WHERE o.total_amount > 100
-AND o.status = 'completed';
-
--- Demo 6: Statistics and Query Planning
-SELECT 'Demo 6: Statistics Impact on Query Planning' as demo;
-
--- Check current statistics
-SELECT
-    schemaname,
-    tablename,
-    n_distinct,
-    most_common_vals[1:3] as top_3_values,
-    most_common_freqs[1:3] as frequencies,
-    last_analyze
-FROM pg_stats
-WHERE schemaname = 'public'
-AND tablename IN ('citizens', 'orders', 'merchants')
-AND attname IN ('city', 'status', 'category')
-ORDER BY tablename, attname;
-
--- Update statistics
-ANALYZE citizens;
-ANALYZE orders;
-ANALYZE merchants;
-
--- Show how statistics affect query estimates
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
-SELECT COUNT(*)
-FROM orders o
-JOIN merchants m ON o.merchant_id = m.merchant_id
-WHERE m.category = 'Restaurant'
-AND o.status = 'completed';
-
--- Demo 7: Memory and Work_mem Optimization
-SELECT 'Demo 7: Memory Configuration Impact' as demo;
-
--- Show current memory settings
-SELECT
-    name,
-    setting,
-    unit,
-    short_desc
-FROM pg_settings
-WHERE name IN ('work_mem', 'maintenance_work_mem', 'shared_buffers', 'effective_cache_size')
-ORDER BY name;
-
--- Demonstrate sort performance with different work_mem
-SET work_mem = '1MB';
-
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM orders
-ORDER BY total_amount DESC, order_date DESC;
-
--- Increase work_mem and compare
-SET work_mem = '16MB';
-
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM orders
-ORDER BY total_amount DESC, order_date DESC;
-
--- Reset to default
-RESET work_mem;
-
--- Demo 8: Index Usage Analysis
-SELECT 'Demo 8: Index Usage and Maintenance Analysis' as demo;
-
--- Show index usage statistics
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    idx_scan as times_used,
-    idx_tup_read as tuples_read,
-    idx_tup_fetch as tuples_fetched,
-    pg_size_pretty(pg_relation_size(indexrelid)) as index_size
+\echo ''
+\echo '=== 4. Partial index: the failed-payments work queue ==='
+-- ~1.5% of payments failed. Indexing only those rows gives a tiny index that
+-- matches the hot query exactly.
+BEGIN;
+CREATE INDEX demo_payments_failed_full    ON commerce.payments (payment_date);
+CREATE INDEX demo_payments_failed_partial ON commerce.payments (payment_date) WHERE status = 'failed';
+SELECT indexrelname AS index_name, pg_size_pretty(pg_relation_size(indexrelid)) AS size
 FROM pg_stat_user_indexes
-WHERE schemaname = 'public'
-ORDER BY idx_scan DESC;
+WHERE indexrelname IN ('demo_payments_failed_full', 'demo_payments_failed_partial')
+ORDER BY 1;
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT payment_id, order_id, failure_reason
+FROM commerce.payments
+WHERE status = 'failed' AND payment_date >= meta.as_of() - interval '30 days'
+ORDER BY payment_date DESC
+LIMIT 10;
+ROLLBACK;
 
--- Identify unused indexes
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid)) as wasted_size
+\echo ''
+\echo '=== 5. Query rewriting: citizens who never ordered - NOT IN vs NOT EXISTS ==='
+-- orders.customer_citizen_id is nullable. NOT IN (subquery containing NULL)
+-- yields NULL for every row, i.e. silently returns nothing - and it cannot be
+-- turned into an anti-join. NOT EXISTS is both correct and faster.
+-- The base data happens to have no NULL customers, so the third column adds
+-- a single NULL to the list to show the trap.
+SELECT (SELECT count(*) FROM civics.citizens c
+        WHERE c.citizen_id NOT IN (SELECT customer_citizen_id FROM commerce.orders))       AS not_in_rows,
+       (SELECT count(*) FROM civics.citizens c
+        WHERE NOT EXISTS (SELECT 1 FROM commerce.orders o
+                          WHERE o.customer_citizen_id = c.citizen_id))                     AS not_exists_rows,
+       (SELECT count(*) FROM civics.citizens c
+        WHERE c.citizen_id NOT IN (SELECT customer_citizen_id FROM commerce.orders
+                                   UNION ALL SELECT NULL))                                 AS not_in_with_one_null,
+       (SELECT count(*) FROM commerce.orders WHERE customer_citizen_id IS NULL)            AS orders_with_null_customer;
+
+EXPLAIN (ANALYZE, COSTS OFF, SUMMARY ON)
+SELECT count(*) FROM civics.citizens c
+WHERE NOT EXISTS (SELECT 1 FROM commerce.orders o WHERE o.customer_citizen_id = c.citizen_id);
+
+\echo ''
+\echo '=== 6. Extended statistics: sensor_code determines sensor_type ==='
+-- The planner assumes independent columns and multiplies selectivities, so it
+-- underestimates "code = X AND type = Y". A dependencies statistic fixes it.
+BEGIN;
+\echo '--- BEFORE: estimated rows vs actual rows ---'
+EXPLAIN (ANALYZE, COSTS ON, TIMING OFF, SUMMARY OFF)
+SELECT * FROM mobility.sensor_readings WHERE sensor_code = 'AQI-001' AND sensor_type = 'air_quality';
+
+CREATE STATISTICS demo_sensor_code_type (dependencies) ON sensor_code, sensor_type FROM mobility.sensor_readings;
+ANALYZE mobility.sensor_readings;   -- allowed inside a transaction; rolled back with it
+\echo '--- AFTER: the estimate now matches reality ---'
+EXPLAIN (ANALYZE, COSTS ON, TIMING OFF, SUMMARY OFF)
+SELECT * FROM mobility.sensor_readings WHERE sensor_code = 'AQI-001' AND sensor_type = 'air_quality';
+ROLLBACK;
+
+\echo ''
+\echo '=== 7. work_mem: the same sort on disk vs in memory ==='
+BEGIN;
+SET LOCAL work_mem = '64kB';
+\echo '--- work_mem = 64kB: external merge (spills to temp files) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+SELECT item_id, line_total FROM commerce.order_items ORDER BY line_total DESC, item_id OFFSET 100000 LIMIT 5;
+SET LOCAL work_mem = '64MB';
+\echo '--- work_mem = 64MB: quicksort in memory ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF)
+SELECT item_id, line_total FROM commerce.order_items ORDER BY line_total DESC, item_id OFFSET 100000 LIMIT 5;
+ROLLBACK;
+
+\echo ''
+\echo '=== 8. BRIN vs B-tree on an append-ordered time column ==='
+-- reading_time is physically ordered (correlation ~1), so a BRIN index of
+-- block ranges is a tiny fraction of the B-tree and still prunes well.
+-- minmax_multi (PG14+) tolerates a few out-of-order outliers per range.
+BEGIN;
+CREATE INDEX demo_sensors_time_brin ON mobility.sensor_readings
+    USING brin (reading_time timestamptz_minmax_multi_ops) WITH (pages_per_range = 16);
+SELECT (SELECT correlation FROM pg_stats
+        WHERE schemaname = 'mobility' AND tablename = 'sensor_readings' AND attname = 'reading_time') AS correlation,
+       pg_size_pretty(pg_relation_size('mobility.idx_sensors_time_only')) AS btree_size,
+       pg_size_pretty(pg_relation_size('mobility.demo_sensors_time_brin')) AS brin_size;
+SET LOCAL enable_indexscan = off;      -- let the BRIN bitmap path show itself
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*), avg(reading_value) FROM mobility.sensor_readings
+WHERE reading_time >= meta.as_of() - interval '1 day';
+ROLLBACK;
+
+\echo ''
+\echo '=== 9. Index hygiene: duplicate indexes (same table, same definition) ==='
+-- Duplicates cost write amplification and memory for zero read benefit.
+SELECT a.indrelid::regclass AS table_name,
+       a.indexrelid::regclass AS index_a,
+       b.indexrelid::regclass AS index_b,
+       pg_size_pretty(pg_relation_size(b.indexrelid)) AS wasted
+FROM pg_index a
+JOIN pg_index b ON a.indrelid = b.indrelid
+               AND a.indexrelid < b.indexrelid
+               AND a.indkey::text = b.indkey::text
+               AND a.indclass::text = b.indclass::text
+               AND coalesce(pg_get_expr(a.indpred, a.indrelid), '') = coalesce(pg_get_expr(b.indpred, b.indrelid), '')
+               AND coalesce(pg_get_expr(a.indexprs, a.indrelid), '') = coalesce(pg_get_expr(b.indexprs, b.indrelid), '')
+JOIN pg_class c ON c.oid = a.indrelid
+WHERE c.relnamespace::regnamespace::text IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+ORDER BY 1, 2;
+
+\echo ''
+\echo '--- largest never-scanned indexes since the last stats reset ---'
+SELECT schemaname || '.' || relname AS table_name, indexrelname AS index_name, idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
 FROM pg_stat_user_indexes
-WHERE schemaname = 'public'
-AND idx_scan = 0
-AND indexname NOT LIKE '%pkey'; -- Keep primary keys
+WHERE schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents')
+  AND idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 5;
 
--- Demo 9: Query Performance Regression Testing
-SELECT 'Demo 9: Performance Regression Testing Framework' as demo;
-
--- Create performance baseline
-CREATE TEMP TABLE performance_baseline AS
-WITH test_queries AS (
-    -- Query 1: Customer lookup
-    SELECT
-        'customer_lookup' as query_name,
-        extract(milliseconds from clock_timestamp() - start_time) as duration_ms
-    FROM (SELECT clock_timestamp() as start_time) t1,
-         (SELECT * FROM citizens WHERE email = 'alice.johnson@email.com') t2
-
-    UNION ALL
-
-    -- Query 2: Order aggregation
-    SELECT
-        'daily_sales' as query_name,
-        extract(milliseconds from clock_timestamp() - start_time) as duration_ms
-    FROM (SELECT clock_timestamp() as start_time) t1,
-         (SELECT DATE(order_date), COUNT(*), SUM(total_amount)
-          FROM orders WHERE order_date >= CURRENT_DATE - 7
-          GROUP BY DATE(order_date)) t2
-
-    UNION ALL
-
-    -- Query 3: Complex join
-    SELECT
-        'customer_summary' as query_name,
-        extract(milliseconds from clock_timestamp() - start_time) as duration_ms
-    FROM (SELECT clock_timestamp() as start_time) t1,
-         (SELECT c.name, COUNT(o.order_id), SUM(o.total_amount)
-          FROM citizens c LEFT JOIN orders o ON c.citizen_id = o.customer_id
-          GROUP BY c.citizen_id, c.name LIMIT 100) t2
-)
-SELECT * FROM test_queries;
-
--- Show performance baseline
-SELECT
-    query_name,
-    duration_ms,
-    CASE
-        WHEN duration_ms < 1 THEN 'Excellent'
-        WHEN duration_ms < 10 THEN 'Good'
-        WHEN duration_ms < 100 THEN 'Acceptable'
-        ELSE 'Needs Optimization'
-    END as performance_rating
-FROM performance_baseline
-ORDER BY duration_ms DESC;
-
--- Demo 10: Performance Tuning Recommendations
-SELECT 'Performance Tuning Summary and Recommendations' as summary;
-
-DO $$
-DECLARE
-    total_tables integer;
-    total_indexes integer;
-    unused_indexes integer;
-    missing_fk_indexes integer;
-    largest_table text;
-    cache_hit_ratio numeric;
-BEGIN
-    -- Gather performance metrics
-    SELECT COUNT(*) INTO total_tables
-    FROM information_schema.tables
-    WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
-
-    SELECT COUNT(*) INTO total_indexes
-    FROM pg_indexes WHERE schemaname = 'public';
-
-    SELECT COUNT(*) INTO unused_indexes
-    FROM pg_stat_user_indexes
-    WHERE schemaname = 'public' AND idx_scan = 0;
-
-    -- Calculate cache hit ratio
-    SELECT
-        ROUND((sum(heap_blks_hit)::numeric / NULLIF(sum(heap_blks_hit + heap_blks_read), 0) * 100)::numeric, 2)
-    INTO cache_hit_ratio
-    FROM pg_statio_user_tables;
-
-    RAISE NOTICE '===========================================';
-    RAISE NOTICE 'PERFORMANCE TUNING SHOWCASE SUMMARY';
-    RAISE NOTICE '===========================================';
-    RAISE NOTICE 'Database Objects:';
-    RAISE NOTICE '  Tables: %', total_tables;
-    RAISE NOTICE '  Indexes: %', total_indexes;
-    RAISE NOTICE '  Unused Indexes: %', unused_indexes;
-    RAISE NOTICE '';
-    RAISE NOTICE 'Performance Metrics:';
-    RAISE NOTICE '  Buffer Cache Hit Ratio: %%%', COALESCE(cache_hit_ratio, 0);
-    RAISE NOTICE '';
-    RAISE NOTICE 'Optimization Techniques Demonstrated:';
-    RAISE NOTICE '• Index scan vs sequential scan comparison';
-    RAISE NOTICE '• Join algorithm optimization (hash vs nested loop)';
-    RAISE NOTICE '• Window function performance with proper indexing';
-    RAISE NOTICE '• Partial indexes for filtered queries';
-    RAISE NOTICE '• Query rewriting (EXISTS vs IN vs JOIN)';
-    RAISE NOTICE '• Statistics impact on query planning';
-    RAISE NOTICE '• Memory configuration effects (work_mem)';
-    RAISE NOTICE '• Index usage analysis and maintenance';
-    RAISE NOTICE '• Performance regression testing framework';
-    RAISE NOTICE '';
-    RAISE NOTICE 'Key Performance Recommendations:';
-    RAISE NOTICE '• Monitor query execution plans regularly';
-    RAISE NOTICE '• Keep table statistics up to date with ANALYZE';
-    RAISE NOTICE '• Remove unused indexes to reduce maintenance overhead';
-    RAISE NOTICE '• Use partial indexes for frequently filtered queries';
-    RAISE NOTICE '• Optimize work_mem for sort and hash operations';
-    RAISE NOTICE '• Consider query rewriting for better performance';
-    RAISE NOTICE '• Implement performance regression testing';
-    RAISE NOTICE '• Monitor buffer cache hit ratios (target >90%%)';
-    RAISE NOTICE '';
-    RAISE NOTICE 'Tools for Ongoing Performance Management:';
-    RAISE NOTICE '• EXPLAIN ANALYZE for query plan analysis';
-    RAISE NOTICE '• pg_stat_statements for query performance tracking';
-    RAISE NOTICE '• pg_stat_user_indexes for index usage monitoring';
-    RAISE NOTICE '• Auto VACUUM and ANALYZE for maintenance';
-    RAISE NOTICE '===========================================';
-END $$;
+-- Take-aways:
+--   * Read plans with BUFFERS: buffers touched is a hardware-independent cost.
+--   * Index the predicate you actually run (composite order, partial WHERE).
+--   * Try ideas with HypoPG / BEGIN ... ROLLBACK before building for real
+--     (and use CREATE INDEX CONCURRENTLY on a live system).
+--   * Fix estimates (ANALYZE, extended statistics) before reaching for hints.
+--   * Prefer NOT EXISTS over NOT IN for anti-joins.
+--   * Right-size work_mem per query (SET LOCAL), not globally.
+--   * BRIN for huge, naturally ordered tables; drop duplicate/unused indexes.

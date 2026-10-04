@@ -1,328 +1,225 @@
 -- Location: /tests/performance_benchmarks.sql
--- Standard queries with expected plan types and performance targets
-
+-- =============================================================================
+-- PERFORMANCE BENCHMARKS (report, not pass/fail)
+-- =============================================================================
+-- What it teaches:
+--   * how to read EXPLAIN (ANALYZE, BUFFERS) for representative workload shapes
+--     (PK lookup, range scan, join + aggregate, window, time series, full-text,
+--     JSONB containment, KNN, geodesic radius, spatial join, anti-join),
+--   * how to turn EXPLAIN (FORMAT JSON) into a compact, comparable benchmark
+--     table (best-of-N execution time, plan root, buffer hits/reads, target),
+--   * where to look next: pg_stat_statements, index usage, cache hit ratios.
+--
+-- Timings depend on hardware and cache state, so this script never fails on a
+-- slow query: it REPORTS whether each query met its target. Correctness lives
+-- in the pgTAP suites (schema_validation / data_integrity_checks /
+-- regression_tests).
+--
+-- Recency windows are anchored on meta.as_of() (the dataset's "now"), not now():
+-- the generated data ends on 2025-12-31.
+--
+-- Run: psql -X -v ON_ERROR_STOP=1 -d <db> -f /tests/performance_benchmarks.sql
+-- Read-only: creates only a temporary function.
+-- =============================================================================
 \set ON_ERROR_STOP on
-\timing on
+\pset pager off
 
--- Performance test configuration
-SELECT 'Starting performance benchmarks...' as status;
+\echo '=== Performance benchmarks ==='
+SELECT current_database() AS database, version() AS server, meta.as_of() AS dataset_as_of;
 
--- Warm up cache
-SELECT 'Warming up cache...' as status;
-SELECT COUNT(*) FROM citizens;
-SELECT COUNT(*) FROM merchants;
-SELECT COUNT(*) FROM orders;
-SELECT COUNT(*) FROM trips;
+-- Fresh planner statistics make the plans below representative.
+ANALYZE civics.citizens, commerce.orders, commerce.merchants, commerce.order_items,
+        mobility.sensor_readings, mobility.stations, documents.complaint_records,
+        documents.policy_documents, geo.points_of_interest, geo.neighborhood_boundaries;
 
--- Test 1: Simple primary key lookup (Target: <1ms)
-\echo 'Test 1: Primary key lookup performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM citizens WHERE citizen_id = 1;
+-- -----------------------------------------------------------------------------
+-- 1. Full plans for four archetypal queries
+--    BUFFERS: shared hit = page found in shared_buffers, read = fetched from
+--    the OS/disk. SERIALIZE (PG17) also measures the cost of producing the
+--    output rows for the client.
+-- -----------------------------------------------------------------------------
+\echo ''
+\echo '--- 1a. Primary-key lookup (expect Index Scan on citizens_pkey, < 1 ms) ---'
+EXPLAIN (ANALYZE, BUFFERS, SERIALIZE, COSTS OFF)
+SELECT citizen_id, first_name, last_name, email FROM civics.citizens WHERE citizen_id = 4242;
 
--- Test 2: Email lookup (should use index if available)
-\echo 'Test 2: Email lookup performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM citizens WHERE email = 'alice.johnson@email.com';
+\echo ''
+\echo '--- 1b. Last 7 days of orders (expect Index/Bitmap scan on idx_orders_date) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*), sum(total_amount)
+FROM commerce.orders
+WHERE order_date >= meta.as_of() - interval '7 days';
 
--- Test 3: Range query on dates (Target: <10ms)
-\echo 'Test 3: Date range query performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM orders
-WHERE order_date >= '2024-01-01'
-AND order_date < '2024-02-01';
+\echo ''
+\echo '--- 1c. Full-text search (expect Bitmap Index Scan on GIN idx_complaints_search) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT complaint_id, subject
+FROM documents.complaint_records
+WHERE search_vector @@ to_tsquery('english', 'power & outage')
+ORDER BY submitted_at DESC
+LIMIT 10;
 
--- Test 4: Simple join performance (Target: <50ms)
-\echo 'Test 4: Two-table join performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT c.name, o.total_amount, o.order_date
-FROM citizens c
-JOIN orders o ON c.citizen_id = o.customer_id
-WHERE o.order_date >= '2024-01-01'
-LIMIT 100;
+\echo ''
+\echo '--- 1d. KNN: 5 nearest POIs (expect Index Scan using GiST idx_pois_geom with ORDER BY <->) ---'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT poi_id, name,
+       round(ST_Distance(location_geom::geography,
+                         ST_SetSRID(ST_MakePoint(-96.80, 32.98), 4326)::geography)) AS metres
+FROM geo.points_of_interest
+ORDER BY location_geom <-> ST_SetSRID(ST_MakePoint(-96.80, 32.98), 4326)
+LIMIT 5;
 
--- Test 5: Aggregation query (Target: <100ms)
-\echo 'Test 5: Aggregation performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    COUNT(*) as order_count,
-    SUM(total_amount) as total_revenue,
-    AVG(total_amount) as avg_order_value
-FROM orders
-WHERE status = 'completed';
-
--- Test 6: Complex join with grouping (Target: <200ms)
-\echo 'Test 6: Complex aggregation with joins'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    m.category,
-    COUNT(o.order_id) as order_count,
-    SUM(o.total_amount) as revenue,
-    AVG(o.total_amount) as avg_order
-FROM merchants m
-JOIN orders o ON m.merchant_id = o.merchant_id
-WHERE o.status = 'completed'
-GROUP BY m.category
-ORDER BY revenue DESC;
-
--- Test 7: Text search performance (if full-text search available)
-\echo 'Test 7: Text search performance'
-BEGIN;
--- Try different search approaches
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM citizens WHERE name ILIKE '%johnson%';
-
--- If documents table exists with JSONB
-DO $$
-BEGIN
-    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'documents') THEN
-        PERFORM 1 FROM (
-            EXPLAIN (ANALYZE, BUFFERS)
-            SELECT * FROM documents
-            WHERE data->>'type' = 'complaint'
-            LIMIT 10
-        ) as x;
-    END IF;
-END $$;
-ROLLBACK;
-
--- Test 8: Window function performance
-\echo 'Test 8: Window function performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT
-    customer_id,
-    order_date,
-    total_amount,
-    SUM(total_amount) OVER (
-        PARTITION BY customer_id
-        ORDER BY order_date
-        ROWS UNBOUNDED PRECEDING
-    ) as running_total
-FROM orders
-ORDER BY customer_id, order_date;
-
--- Test 9: Subquery performance
-\echo 'Test 9: Subquery vs JOIN performance'
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT c.*
-FROM citizens c
-WHERE EXISTS (
-    SELECT 1 FROM orders o
-    WHERE o.customer_id = c.citizen_id
-    AND o.total_amount > 100
-);
-
--- Alternative with JOIN for comparison
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT DISTINCT c.*
-FROM citizens c
-JOIN orders o ON c.citizen_id = o.customer_id
-WHERE o.total_amount > 100;
-
--- Test 10: Spatial query performance (if PostGIS available)
-DO $$
+-- -----------------------------------------------------------------------------
+-- 2. Benchmark table: every query runs N times; best execution time is kept.
+--    pg_temp.bench() parses EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON).
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION pg_temp.bench(label text, q text, target numeric, runs int DEFAULT 3)
+RETURNS TABLE (benchmark text, plan_root text, rows_out bigint, best_ms numeric,
+               planning_ms numeric, shared_hit bigint, shared_read bigint,
+               target_ms numeric, verdict text)
+LANGUAGE plpgsql AS $$
 DECLARE
-    postgis_available boolean;
+    j json;
+    t numeric;
+    i int;
 BEGIN
-    SELECT EXISTS (SELECT FROM pg_extension WHERE extname = 'postgis') INTO postgis_available;
-
-    IF postgis_available THEN
-        RAISE NOTICE 'Test 10: Spatial query performance';
-
-        -- Check if spatial table exists
-        IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'spatial_features') THEN
-            PERFORM 1 FROM (
-                EXPLAIN (ANALYZE, BUFFERS)
-                SELECT * FROM spatial_features
-                WHERE ST_DWithin(
-                    geometry,
-                    ST_GeomFromText('POINT(-89.65 39.78)', 4326),
-                    0.01
-                )
-            ) as x;
-        ELSE
-            RAISE NOTICE 'No spatial tables found for spatial performance test';
+    benchmark := label;
+    target_ms := target;
+    best_ms := NULL;
+    FOR i IN 1..runs LOOP
+        EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' || q INTO j;
+        t := (j->0->>'Execution Time')::numeric;
+        IF best_ms IS NULL OR t < best_ms THEN
+            best_ms     := round(t, 3);
+            planning_ms := round((j->0->>'Planning Time')::numeric, 3);
+            plan_root   := j->0->'Plan'->>'Node Type';
+            rows_out    := (j->0->'Plan'->>'Actual Rows')::bigint;
+            shared_hit  := (j->0->'Plan'->>'Shared Hit Blocks')::bigint;
+            shared_read := (j->0->'Plan'->>'Shared Read Blocks')::bigint;
         END IF;
-    ELSE
-        RAISE NOTICE 'PostGIS not available - skipping spatial performance test';
-    END IF;
+    END LOOP;
+    verdict := CASE WHEN best_ms <= target THEN 'ok' ELSE 'SLOW' END;
+    RETURN NEXT;
 END $$;
 
--- Performance analysis and recommendations
-\echo 'Performance Analysis Summary'
+\echo ''
+\echo '--- 2. Benchmark summary (best of 3 runs; verdict compares with target) ---'
+SELECT * FROM (
+          SELECT * FROM pg_temp.bench('01 PK lookup (citizens)',
+              $q$SELECT * FROM civics.citizens WHERE citizen_id = 4242$q$, 1)
+UNION ALL SELECT * FROM pg_temp.bench('02 unique email lookup',
+              $q$SELECT citizen_id FROM civics.citizens
+                 WHERE email = (SELECT email FROM civics.citizens WHERE citizen_id = 777)$q$, 1)
+UNION ALL SELECT * FROM pg_temp.bench('03 orders, last 7 days',
+              $q$SELECT count(*), sum(total_amount) FROM commerce.orders
+                 WHERE order_date >= meta.as_of() - interval '7 days'$q$, 10)
+UNION ALL SELECT * FROM pg_temp.bench('04 revenue by business type, 30 d',
+              $q$SELECT m.business_type, count(*), sum(o.total_amount)
+                 FROM commerce.orders o JOIN commerce.merchants m USING (merchant_id)
+                 WHERE o.order_date >= meta.as_of() - interval '30 days'
+                 GROUP BY m.business_type$q$, 50)
+UNION ALL SELECT * FROM pg_temp.bench('05 window: top merchant per type',
+              $q$SELECT * FROM (
+                   SELECT m.business_type, m.merchant_id, sum(o.total_amount) AS revenue,
+                          rank() OVER (PARTITION BY m.business_type ORDER BY sum(o.total_amount) DESC) AS rk
+                   FROM commerce.orders o JOIN commerce.merchants m USING (merchant_id)
+                   GROUP BY m.business_type, m.merchant_id) s WHERE rk = 1$q$, 200)
+UNION ALL SELECT * FROM pg_temp.bench('06 sensor hourly avg, 24 h',
+              $q$SELECT date_trunc('hour', reading_time) AS h, avg(reading_value)
+                 FROM mobility.sensor_readings
+                 WHERE sensor_code = 'AQI-001' AND reading_time >= meta.as_of() - interval '24 hours'
+                 GROUP BY 1 ORDER BY 1$q$, 10)
+UNION ALL SELECT * FROM pg_temp.bench('07 full-text (GIN tsvector)',
+              $q$SELECT complaint_id FROM documents.complaint_records
+                 WHERE search_vector @@ to_tsquery('english', 'power & outage')$q$, 20)
+UNION ALL SELECT * FROM pg_temp.bench('08 JSONB containment (GIN)',
+              $q$SELECT count(*) FROM documents.complaint_records
+                 WHERE metadata @> '{"category": "utilities", "utility_type": "power"}'$q$, 20)
+UNION ALL SELECT * FROM pg_temp.bench('09 KNN 5 nearest POIs (GiST)',
+              $q$SELECT poi_id FROM geo.points_of_interest
+                 ORDER BY location_geom <-> ST_SetSRID(ST_MakePoint(-96.80, 32.98), 4326) LIMIT 5$q$, 5)
+UNION ALL SELECT * FROM pg_temp.bench('10 geodesic radius: POIs in 1 km',
+              $q$SELECT count(*) FROM geo.points_of_interest
+                 WHERE ST_DWithin(location_geom::geography,
+                                  ST_SetSRID(ST_MakePoint(-96.80, 32.98), 4326)::geography, 1000)$q$, 20)
+UNION ALL SELECT * FROM pg_temp.bench('11 spatial join: complaints per hood',
+              $q$SELECT n.neighborhood_name, count(*)
+                 FROM geo.neighborhood_boundaries n
+                 JOIN documents.complaint_records c
+                   ON ST_Covers(n.boundary_geom, ST_SetSRID(ST_MakePoint(c.incident_longitude, c.incident_latitude), 4326))
+                 GROUP BY 1$q$, 300)
+UNION ALL SELECT * FROM pg_temp.bench('12 anti-join: merchants idle 30 d',
+              $q$SELECT m.merchant_id FROM commerce.merchants m
+                 WHERE NOT EXISTS (SELECT 1 FROM commerce.orders o
+                                   WHERE o.merchant_id = m.merchant_id
+                                     AND o.order_date >= meta.as_of() - interval '30 days')$q$, 50)
+) b
+ORDER BY benchmark;
 
--- Show slow queries from pg_stat_statements if available
+-- -----------------------------------------------------------------------------
+-- 3. Where the time goes: workload statistics
+-- -----------------------------------------------------------------------------
+\echo ''
+\echo '--- 3a. Top statements by mean time (pg_stat_statements, if loaded) ---'
 DO $$
+DECLARE rec record;
 BEGIN
-    IF EXISTS (SELECT FROM pg_extension WHERE extname = 'pg_stat_statements') THEN
-        RAISE NOTICE 'Top 5 slowest queries (if statistics available):';
-        FOR rec IN
-            SELECT
-                ROUND(mean_exec_time::numeric, 2) as avg_time_ms,
-                calls,
-                LEFT(query, 60) as query_snippet
-            FROM pg_stat_statements
-            WHERE calls > 1
-            ORDER BY mean_exec_time DESC
-            LIMIT 5
-        LOOP
-            RAISE NOTICE '  %.2f ms (% calls): %...', rec.avg_time_ms, rec.calls, rec.query_snippet;
-        END LOOP;
-    ELSE
-        RAISE NOTICE 'pg_stat_statements extension not available';
+    IF to_regclass('public.pg_stat_statements') IS NULL THEN
+        RAISE NOTICE 'pg_stat_statements is not installed in this database - skipped';
+        RETURN;
     END IF;
+    FOR rec IN EXECUTE $q$
+        SELECT round(mean_exec_time::numeric, 2) AS avg_ms, calls,
+               left(regexp_replace(query, '\s+', ' ', 'g'), 70) AS q
+        FROM pg_stat_statements
+        WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND calls > 1
+        ORDER BY mean_exec_time DESC LIMIT 5 $q$
+    LOOP
+        RAISE NOTICE '  % ms x % : %', rec.avg_ms, rec.calls, rec.q;
+    END LOOP;
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'pg_stat_statements is not in shared_preload_libraries - skipped';
 END $$;
 
--- Index usage analysis
-SELECT
-    'Index Usage Analysis' as analysis_type,
-    schemaname,
-    tablename,
-    indexname,
-    idx_scan as scans,
-    idx_tup_read as tuples_read,
-    idx_tup_fetch as tuples_fetched,
-    CASE
-        WHEN idx_scan = 0 THEN 'UNUSED'
-        WHEN idx_scan < 10 THEN 'LOW_USAGE'
-        ELSE 'ACTIVE'
-    END as usage_status
+\echo ''
+\echo '--- 3b. Index usage on the domain schemas (least used first) ---'
+SELECT schemaname, relname AS table_name, indexrelname AS index_name, idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size,
+       CASE WHEN idx_scan = 0 THEN 'unused' WHEN idx_scan < 10 THEN 'low' ELSE 'active' END AS usage
 FROM pg_stat_user_indexes
-WHERE schemaname = 'public'
-ORDER BY idx_scan DESC;
+WHERE schemaname IN ('civics','commerce','mobility','geo','documents')
+ORDER BY idx_scan, pg_relation_size(indexrelid) DESC
+LIMIT 10;
 
--- Table statistics
-SELECT
-    'Table Statistics' as analysis_type,
-    schemaname,
-    relname as tablename,
-    n_tup_ins as inserts,
-    n_tup_upd as updates,
-    n_tup_del as deletes,
-    n_live_tup as live_tuples,
-    n_dead_tup as dead_tuples,
-    CASE
-        WHEN n_live_tup > 0 THEN ROUND((n_dead_tup::float / n_live_tup * 100)::numeric, 1)
-        ELSE 0
-    END as dead_tuple_pct
-FROM pg_stat_user_tables
-WHERE schemaname = 'public'
-ORDER BY n_live_tup DESC;
+\echo ''
+\echo '--- 3c. Table size, dead tuples and cache hit ratio ---'
+SELECT s.schemaname, s.relname AS table_name, s.n_live_tup, s.n_dead_tup,
+       pg_size_pretty(pg_total_relation_size(s.relid)) AS total_size,
+       round(100.0 * io.heap_blks_hit / nullif(io.heap_blks_hit + io.heap_blks_read, 0), 1) AS cache_hit_pct
+FROM pg_stat_user_tables s
+JOIN pg_statio_user_tables io USING (relid)
+WHERE s.schemaname IN ('civics','commerce','mobility','geo','documents')
+ORDER BY pg_total_relation_size(s.relid) DESC
+LIMIT 10;
 
--- Buffer cache analysis
-SELECT
-    'Buffer Cache Analysis' as analysis_type,
-    schemaname,
-    relname,
-    heap_blks_read,
-    heap_blks_hit,
-    CASE
-        WHEN (heap_blks_hit + heap_blks_read) > 0
-        THEN ROUND((heap_blks_hit::float / (heap_blks_hit + heap_blks_read) * 100)::numeric, 1)
-        ELSE 0
-    END as cache_hit_ratio
-FROM pg_statio_user_tables
-WHERE schemaname = 'public'
-AND (heap_blks_hit + heap_blks_read) > 0
-ORDER BY cache_hit_ratio ASC;
+\echo ''
+\echo '--- 3d. I/O by backend type (pg_stat_io, PG16+) ---'
+SELECT backend_type, object, context, reads, hits, writes
+FROM pg_stat_io
+WHERE coalesce(reads, 0) + coalesce(hits, 0) + coalesce(writes, 0) > 0
+ORDER BY coalesce(hits, 0) + coalesce(reads, 0) DESC
+LIMIT 8;
 
--- Connection and activity summary
-SELECT
-    'Database Activity Summary' as summary_type,
-    COUNT(*) as total_connections,
-    COUNT(CASE WHEN state = 'active' THEN 1 END) as active_queries,
-    COUNT(CASE WHEN state = 'idle' THEN 1 END) as idle_connections,
-    COUNT(CASE WHEN state = 'idle in transaction' THEN 1 END) as idle_in_transaction
-FROM pg_stat_activity;
+\echo ''
+\echo '--- 3e. Configuration that shapes these numbers ---'
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('shared_buffers', 'work_mem', 'effective_cache_size', 'random_page_cost',
+               'effective_io_concurrency', 'max_parallel_workers_per_gather', 'jit')
+ORDER BY name;
 
--- Performance recommendations
-DO $$
-DECLARE
-    unused_indexes integer;
-    tables_needing_vacuum integer;
-    low_cache_hit_tables integer;
-BEGIN
-    -- Count unused indexes
-    SELECT COUNT(*) INTO unused_indexes
-    FROM pg_stat_user_indexes
-    WHERE schemaname = 'public' AND idx_scan = 0;
-
-    -- Count tables with high dead tuple percentage
-    SELECT COUNT(*) INTO tables_needing_vacuum
-    FROM pg_stat_user_tables
-    WHERE schemaname = 'public'
-    AND n_live_tup > 0
-    AND (n_dead_tup::float / n_live_tup) > 0.1;
-
-    -- Count tables with low cache hit ratio
-    SELECT COUNT(*) INTO low_cache_hit_tables
-    FROM pg_statio_user_tables
-    WHERE schemaname = 'public'
-    AND (heap_blks_hit + heap_blks_read) > 100
-    AND (heap_blks_hit::float / (heap_blks_hit + heap_blks_read)) < 0.9;
-
-    RAISE NOTICE '========================================';
-    RAISE NOTICE 'PERFORMANCE RECOMMENDATIONS';
-    RAISE NOTICE '========================================';
-
-    IF unused_indexes > 0 THEN
-        RAISE NOTICE '⚠️  Consider dropping % unused indexes', unused_indexes;
-    ELSE
-        RAISE NOTICE '✓ All indexes are being used';
-    END IF;
-
-    IF tables_needing_vacuum > 0 THEN
-        RAISE NOTICE '⚠️  Consider VACUUM ANALYZE on % tables with high dead tuple ratio', tables_needing_vacuum;
-    ELSE
-        RAISE NOTICE '✓ Tables have acceptable dead tuple ratios';
-    END IF;
-
-    IF low_cache_hit_tables > 0 THEN
-        RAISE NOTICE '⚠️  % tables have low cache hit ratios - consider more memory or better indexes', low_cache_hit_tables;
-    ELSE
-        RAISE NOTICE '✓ Good cache hit ratios across all tables';
-    END IF;
-
-    RAISE NOTICE '========================================';
-    RAISE NOTICE 'General recommendations:';
-    RAISE NOTICE '• Run ANALYZE regularly to update query planner statistics';
-    RAISE NOTICE '• Monitor pg_stat_statements for slow queries';
-    RAISE NOTICE '• Consider partitioning for large time-series tables';
-    RAISE NOTICE '• Add indexes for frequently filtered columns';
-    RAISE NOTICE '• Use EXPLAIN ANALYZE to verify query performance';
-    RAISE NOTICE '========================================';
-END $$;
-
--- Performance target validation
-DO $$
-DECLARE
-    current_db_size text;
-    shared_buffers text;
-    work_mem text;
-    effective_cache_size text;
-BEGIN
-    -- Get current database size
-    SELECT pg_size_pretty(pg_database_size(current_database())) INTO current_db_size;
-
-    -- Get key configuration parameters
-    SELECT setting FROM pg_settings WHERE name = 'shared_buffers' INTO shared_buffers;
-    SELECT setting FROM pg_settings WHERE name = 'work_mem' INTO work_mem;
-    SELECT setting FROM pg_settings WHERE name = 'effective_cache_size' INTO effective_cache_size;
-
-    RAISE NOTICE 'Database Configuration:';
-    RAISE NOTICE '  Database size: %', current_db_size;
-    RAISE NOTICE '  shared_buffers: %', shared_buffers;
-    RAISE NOTICE '  work_mem: %', work_mem;
-    RAISE NOTICE '  effective_cache_size: %', effective_cache_size;
-    RAISE NOTICE '';
-    RAISE NOTICE 'Performance Targets:';
-    RAISE NOTICE '  • Primary key lookups: <1ms';
-    RAISE NOTICE '  • Indexed searches: <10ms';
-    RAISE NOTICE '  • Simple joins: <50ms';
-    RAISE NOTICE '  • Complex aggregations: <200ms';
-    RAISE NOTICE '  • Cache hit ratio: >90%%';
-    RAISE NOTICE '';
-    RAISE NOTICE '✅ Performance benchmark completed!';
-    RAISE NOTICE '📊 Review EXPLAIN ANALYZE output above for detailed timing';
-END $$;
-
-SELECT 'Performance benchmarks completed' as status;
+-- Targets used above (rules of thumb on a laptop, warm cache):
+--   PK / unique lookups < 1 ms, KNN < 5 ms, indexed range / FTS / JSONB < 10-20 ms,
+--   join + aggregate over a month < 50 ms, whole-table window / spatial join < 300 ms.
+\echo ''
+\echo 'Performance benchmarks completed (verdicts are informational; see pgTAP suites for correctness).'

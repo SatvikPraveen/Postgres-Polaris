@@ -1,340 +1,307 @@
 -- Location: /tests/schema_validation.sql
--- Ensure all required tables and indexes exist with proper structure
-
--- Test configuration
+-- =============================================================================
+-- pgTAP suite 1/3: SCHEMA SHAPE
+-- =============================================================================
+-- What it teaches / guards:
+--   * the 18 domain base tables (civics, commerce, mobility, geo, documents)
+--     plus the meta provenance tables exist,
+--   * every table has the expected primary key, every relationship has its
+--     foreign key, and the indexes the curriculum relies on are present with the
+--     right access method (btree / GiST / GIN),
+--   * every enum carries exactly the documented labels, in order,
+--   * geometry columns are typed and SRID-constrained (4326),
+--   * the triggers and helper functions the modules call are installed.
+--
+-- Run:   docker exec polaris-db pg_prove -U polaris -d <db> /tests/schema_validation.sql
+--   or:  psql -X -d <db> -f /tests/schema_validation.sql
+-- Everything runs inside one transaction that is rolled back, so the suite
+-- never changes the database.
+-- =============================================================================
 \set ON_ERROR_STOP on
-\timing on
+\set QUIET 1
+\pset format unaligned
+\pset tuples_only true
+\pset pager off
 
--- Start validation
-SELECT 'Starting schema validation...' as status;
+BEGIN;
+SELECT plan(184);
 
--- Test 1: Check core tables exist
-DO $$
-DECLARE
-    missing_tables text[];
-    expected_tables text[] := ARRAY['citizens', 'merchants', 'orders', 'trips'];
-    table_name text;
-    table_exists boolean;
-BEGIN
-    RAISE NOTICE 'Test 1: Checking core tables exist...';
+-- -----------------------------------------------------------------------------
+-- 1. Extensions and schemas the base build depends on
+-- -----------------------------------------------------------------------------
+SELECT has_extension('postgis',    'PostGIS is installed');
+SELECT has_extension('btree_gist', 'btree_gist is installed (needed by the exclusion constraints)');
+SELECT has_extension('pg_trgm',    'pg_trgm is installed');
+SELECT has_extension('pgtap',      'pgTAP is installed');
 
-    FOREACH table_name IN ARRAY expected_tables LOOP
-        SELECT EXISTS (
-            SELECT FROM information_schema.tables
-            WHERE table_schema = 'public'
-            AND table_name = table_name
-        ) INTO table_exists;
+SELECT has_schema(s, format('schema %s exists', s))
+FROM unnest(ARRAY['civics','commerce','mobility','geo','documents','meta','synth','analytics','audit','auth']) AS s;
 
-        IF NOT table_exists THEN
-            missing_tables := array_append(missing_tables, table_name);
-        END IF;
-    END LOOP;
+-- -----------------------------------------------------------------------------
+-- 2. The 18 base tables (+ 3 provenance tables)
+--    has_table is used instead of tables_are() so the suite still passes after
+--    modules add their own tables (e.g. mobility.sensor_readings_part).
+-- -----------------------------------------------------------------------------
+SELECT has_table(s, t, format('table %s.%s exists', s, t))
+FROM (VALUES
+    ('civics','citizens'), ('civics','permit_applications'), ('civics','tax_payments'), ('civics','voting_records'),
+    ('commerce','merchants'), ('commerce','business_licenses'), ('commerce','orders'), ('commerce','order_items'), ('commerce','payments'),
+    ('mobility','stations'), ('mobility','station_inventory'), ('mobility','trip_segments'), ('mobility','sensor_readings'),
+    ('geo','neighborhood_boundaries'), ('geo','points_of_interest'), ('geo','road_segments'),
+    ('documents','complaint_records'), ('documents','policy_documents'),
+    ('meta','dataset'), ('meta','planted_effects'), ('meta','ground_truth')
+) AS v(s, t);
 
-    IF array_length(missing_tables, 1) > 0 THEN
-        RAISE EXCEPTION 'Missing core tables: %', array_to_string(missing_tables, ', ');
-    ELSE
-        RAISE NOTICE '✓ All core tables exist';
-    END IF;
-END $$;
+-- Exactly 18 ordinary tables live in the five domain schemas of the base.
+-- (Module-owned extras are allowed: we only require that the 18 are there and
+--  that none of them is unlogged/temporary.)
+SELECT is(
+    (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'r' AND c.relpersistence = 'p'
+       AND (n.nspname, c.relname) IN (
+         ('civics','citizens'), ('civics','permit_applications'), ('civics','tax_payments'), ('civics','voting_records'),
+         ('commerce','merchants'), ('commerce','business_licenses'), ('commerce','orders'), ('commerce','order_items'), ('commerce','payments'),
+         ('mobility','stations'), ('mobility','station_inventory'), ('mobility','trip_segments'), ('mobility','sensor_readings'),
+         ('geo','neighborhood_boundaries'), ('geo','points_of_interest'), ('geo','road_segments'),
+         ('documents','complaint_records'), ('documents','policy_documents'))),
+    18, 'all 18 base tables are permanent, ordinary heap tables');
 
--- Test 2: Validate citizens table structure
-DO $$
-DECLARE
-    column_count integer;
-    expected_columns text[] := ARRAY[
-        'citizen_id', 'name', 'email', 'phone', 'birth_date',
-        'registration_date', 'address_line', 'city', 'state', 'zip_code'
-    ];
-BEGIN
-    RAISE NOTICE 'Test 2: Validating citizens table structure...';
+-- -----------------------------------------------------------------------------
+-- 3. Primary keys (single bigint surrogate key per base table)
+-- -----------------------------------------------------------------------------
+SELECT col_is_pk(s, t, c, format('%s.%s primary key is (%s)', s, t, c))
+FROM (VALUES
+    ('civics','citizens','citizen_id'), ('civics','permit_applications','permit_id'),
+    ('civics','tax_payments','tax_id'), ('civics','voting_records','vote_id'),
+    ('commerce','merchants','merchant_id'), ('commerce','business_licenses','license_id'),
+    ('commerce','orders','order_id'), ('commerce','order_items','item_id'), ('commerce','payments','payment_id'),
+    ('mobility','stations','station_id'), ('mobility','station_inventory','inventory_id'),
+    ('mobility','trip_segments','trip_segment_id'), ('mobility','sensor_readings','reading_id'),
+    ('geo','neighborhood_boundaries','neighborhood_id'), ('geo','points_of_interest','poi_id'),
+    ('geo','road_segments','segment_id'),
+    ('documents','complaint_records','complaint_id'), ('documents','policy_documents','policy_id')
+) AS v(s, t, c);
 
-    SELECT COUNT(*) INTO column_count
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-    AND table_name = 'citizens'
-    AND column_name = ANY(expected_columns);
+SELECT col_type_is(s, t, c, 'bigint', format('%s.%s.%s is bigint', s, t, c))
+FROM (VALUES
+    ('civics','citizens','citizen_id'), ('commerce','orders','order_id'),
+    ('commerce','order_items','item_id'), ('mobility','sensor_readings','reading_id')
+) AS v(s, t, c);
 
-    IF column_count < array_length(expected_columns, 1) THEN
-        RAISE EXCEPTION 'Citizens table missing required columns. Found: %, Expected: %',
-            column_count, array_length(expected_columns, 1);
-    ELSE
-        RAISE NOTICE '✓ Citizens table structure valid';
-    END IF;
-END $$;
+-- -----------------------------------------------------------------------------
+-- 4. Foreign keys: every documented relationship is declared
+-- -----------------------------------------------------------------------------
+SELECT fk_ok(fs, ft, fc, ps, pt, pc)
+FROM (VALUES
+    ('civics','permit_applications','citizen_id',      'civics','citizens','citizen_id'),
+    ('civics','permit_applications','processed_by',    'civics','citizens','citizen_id'),
+    ('civics','tax_payments','citizen_id',             'civics','citizens','citizen_id'),
+    ('civics','voting_records','citizen_id',           'civics','citizens','citizen_id'),
+    ('commerce','merchants','owner_citizen_id',        'civics','citizens','citizen_id'),
+    ('commerce','business_licenses','merchant_id',     'commerce','merchants','merchant_id'),
+    ('commerce','orders','merchant_id',                'commerce','merchants','merchant_id'),
+    ('commerce','orders','customer_citizen_id',        'civics','citizens','citizen_id'),
+    ('commerce','order_items','order_id',              'commerce','orders','order_id'),
+    ('commerce','payments','order_id',                 'commerce','orders','order_id'),
+    ('mobility','station_inventory','station_id',      'mobility','stations','station_id'),
+    ('mobility','trip_segments','start_station_id',    'mobility','stations','station_id'),
+    ('mobility','trip_segments','end_station_id',      'mobility','stations','station_id'),
+    ('mobility','trip_segments','user_id',             'civics','citizens','citizen_id'),
+    ('geo','points_of_interest','neighborhood_id',     'geo','neighborhood_boundaries','neighborhood_id'),
+    ('geo','road_segments','neighborhood_id',          'geo','neighborhood_boundaries','neighborhood_id'),
+    ('documents','complaint_records','neighborhood_id','geo','neighborhood_boundaries','neighborhood_id'),
+    ('documents','complaint_records','reporter_citizen_id','civics','citizens','citizen_id'),
+    ('documents','policy_documents','created_by',      'civics','citizens','citizen_id'),
+    ('documents','policy_documents','approved_by',     'civics','citizens','citizen_id'),
+    ('documents','policy_documents','supersedes_policy_id','documents','policy_documents','policy_id')
+) AS v(fs, ft, fc, ps, pt, pc);
 
--- Test 3: Validate merchants table structure
-DO $$
-DECLARE
-    column_count integer;
-    expected_columns text[] := ARRAY[
-        'merchant_id', 'business_name', 'owner_name', 'category',
-        'address', 'phone', 'registration_date', 'tax_id', 'status'
-    ];
-BEGIN
-    RAISE NOTICE 'Test 3: Validating merchants table structure...';
+-- order_items are owned by their order: deleting an order cascades.
+SELECT is(
+    (SELECT confdeltype::text FROM pg_constraint WHERE conname = 'order_items_order_id_fkey'
+       AND conrelid = 'commerce.order_items'::regclass),
+    'c', 'order_items.order_id is ON DELETE CASCADE');
 
-    SELECT COUNT(*) INTO column_count
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-    AND table_name = 'merchants'
-    AND column_name = ANY(expected_columns);
+-- -----------------------------------------------------------------------------
+-- 5. Unique business keys
+-- -----------------------------------------------------------------------------
+SELECT col_is_unique(s, t, c, format('%s.%s.%s is unique', s, t, c))
+FROM (VALUES
+    ('civics','citizens','email'), ('civics','permit_applications','permit_number'),
+    ('commerce','merchants','tax_id'), ('commerce','orders','order_number'),
+    ('commerce','business_licenses','license_number'), ('mobility','stations','station_code'),
+    ('geo','neighborhood_boundaries','neighborhood_name'), ('documents','complaint_records','complaint_number')
+) AS v(s, t, c);
+SELECT col_is_unique('documents', 'policy_documents', ARRAY['policy_number','version'],
+                     'documents.policy_documents (policy_number, version) is unique');
 
-    IF column_count < array_length(expected_columns, 1) THEN
-        RAISE EXCEPTION 'Merchants table missing required columns. Found: %, Expected: %',
-            column_count, array_length(expected_columns, 1);
-    ELSE
-        RAISE NOTICE '✓ Merchants table structure valid';
-    END IF;
-END $$;
+-- -----------------------------------------------------------------------------
+-- 6. Key indexes and their access methods
+--    GiST for geometry, GIN for tsvector/jsonb/arrays, btree for the rest.
+-- -----------------------------------------------------------------------------
+SELECT has_index(s, t, i, format('index %s on %s.%s exists', i, s, t))
+FROM (VALUES
+    ('civics','citizens','idx_citizens_email'), ('civics','citizens','idx_citizens_name'),
+    ('commerce','orders','idx_orders_merchant'), ('commerce','orders','idx_orders_customer'),
+    ('commerce','orders','idx_orders_date'), ('commerce','order_items','idx_order_items_order'),
+    ('commerce','payments','idx_payments_order'),
+    ('mobility','station_inventory','idx_inventory_station_time'), ('mobility','trip_segments','idx_trips_time'),
+    ('mobility','sensor_readings','idx_sensors_code_time'), ('mobility','sensor_readings','idx_sensors_time_only'),
+    ('geo','neighborhood_boundaries','idx_neighborhoods_geom'), ('geo','points_of_interest','idx_pois_geom'),
+    ('geo','road_segments','idx_roads_geom'),
+    ('documents','complaint_records','idx_complaints_search'), ('documents','complaint_records','idx_complaints_metadata'),
+    ('documents','complaint_records','idx_complaints_location'),
+    ('documents','policy_documents','idx_policies_search'), ('documents','policy_documents','idx_policies_content'),
+    ('documents','policy_documents','idx_policies_tags')
+) AS v(s, t, i);
 
--- Test 4: Check primary keys exist
-DO $$
-DECLARE
-    missing_pks text[];
-    table_name text;
-    pk_exists boolean;
-    expected_tables_pks text[] := ARRAY['citizens', 'merchants', 'orders', 'trips'];
-BEGIN
-    RAISE NOTICE 'Test 4: Checking primary keys...';
+SELECT index_is_type(s, t, i, am, format('%s is a %s index', i, am))
+FROM (VALUES
+    ('geo','neighborhood_boundaries','idx_neighborhoods_geom','gist'),
+    ('geo','points_of_interest','idx_pois_geom','gist'),
+    ('geo','road_segments','idx_roads_geom','gist'),
+    ('documents','complaint_records','idx_complaints_search','gin'),
+    ('documents','complaint_records','idx_complaints_metadata','gin'),
+    ('documents','policy_documents','idx_policies_search','gin'),
+    ('documents','policy_documents','idx_policies_content','gin'),
+    ('documents','policy_documents','idx_policies_tags','gin'),
+    ('commerce','orders','idx_orders_date','btree'),
+    ('mobility','sensor_readings','idx_sensors_code_time','btree')
+) AS v(s, t, i, am);
 
-    FOREACH table_name IN ARRAY expected_tables_pks LOOP
-        SELECT EXISTS (
-            SELECT FROM information_schema.table_constraints tc
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-            AND tc.table_schema = 'public'
-            AND tc.table_name = table_name
-        ) INTO pk_exists;
+SELECT is(
+    (SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'documents.idx_complaints_location'::regclass),
+    '(incident_latitude IS NOT NULL)', 'idx_complaints_location is a partial index on located complaints');
 
-        IF NOT pk_exists THEN
-            missing_pks := array_append(missing_pks, table_name);
-        END IF;
-    END LOOP;
+-- -----------------------------------------------------------------------------
+-- 7. Enum types: exact labels in declared order
+-- -----------------------------------------------------------------------------
+SELECT enum_has_labels(s, e, labels, format('enum %s.%s has the documented labels', s, e))
+FROM (VALUES
+    ('civics','civic_status',      ARRAY['active','inactive','suspended','deceased']),
+    ('civics','payment_status',    ARRAY['pending','paid','overdue','refunded']),
+    ('civics','permit_status',     ARRAY['pending','approved','denied','expired','revoked']),
+    ('civics','permit_type',       ARRAY['building','business','event','parking','street']),
+    ('civics','tax_type',          ARRAY['property','income','business','vehicle','utility']),
+    ('civics','vote_type',         ARRAY['municipal','school_board','referendum','special']),
+    ('commerce','business_type',   ARRAY['restaurant','retail','service','manufacturing','technology','healthcare','other']),
+    ('commerce','license_status',  ARRAY['active','pending','expired','suspended','revoked']),
+    ('commerce','order_status',    ARRAY['pending','confirmed','processing','shipped','delivered','cancelled','refunded']),
+    ('commerce','payment_method',  ARRAY['cash','credit_card','debit_card','bank_transfer','digital_wallet','check']),
+    ('commerce','payment_status',  ARRAY['pending','completed','failed','refunded','disputed']),
+    ('documents','access_level',   ARRAY['public','internal','restricted','confidential']),
+    ('documents','document_status',ARRAY['draft','submitted','under_review','approved','resolved','published','archived','rejected','expired']),
+    ('documents','document_type',  ARRAY['complaint','policy','notice','report','form','meeting_minutes','correspondence','application','permit_docs','other']),
+    ('documents','priority_level', ARRAY['low','normal','high','urgent']),
+    ('geo','poi_category',         ARRAY['government','school','hospital','park','retail','restaurant','bank','gas_station','library','community_center','worship','emergency','transportation','utility','other']),
+    ('geo','road_surface',         ARRAY['asphalt','concrete','gravel','dirt','cobblestone']),
+    ('geo','road_type',            ARRAY['interstate','highway','arterial','collector','local','residential','alley','walkway','bike_lane']),
+    ('mobility','sensor_type',     ARRAY['traffic_counter','air_quality','noise','occupancy','speed','weather']),
+    ('mobility','station_status',  ARRAY['active','maintenance','offline','full','empty']),
+    ('mobility','station_type',    ARRAY['bus','rail','bike_share','scooter','park_ride','ev_charging']),
+    ('mobility','trip_mode',       ARRAY['walking','cycling','bus','rail','car','rideshare','scooter','other'])
+) AS v(s, e, labels);
 
-    IF array_length(missing_pks, 1) > 0 THEN
-        RAISE EXCEPTION 'Tables missing primary keys: %', array_to_string(missing_pks, ', ');
-    ELSE
-        RAISE NOTICE '✓ All primary keys exist';
-    END IF;
-END $$;
+-- Columns really use the enums (not free text).
+SELECT col_type_is(s, t, c, ty, format('%s.%s.%s is %s', s, t, c, ty))
+FROM (VALUES
+    ('civics','citizens','status','civics.civic_status'),
+    ('commerce','orders','status','commerce.order_status'),
+    ('documents','complaint_records','status','documents.document_status'),
+    ('mobility','sensor_readings','sensor_type','mobility.sensor_type')
+) AS v(s, t, c, ty);
 
--- Test 5: Check foreign key relationships
-DO $$
-DECLARE
-    fk_count integer;
-BEGIN
-    RAISE NOTICE 'Test 5: Checking foreign key relationships...';
+-- -----------------------------------------------------------------------------
+-- 8. Spatial columns: typmod-constrained geometry in WGS84
+-- -----------------------------------------------------------------------------
+SELECT col_type_is(s, t, c, ty, format('%s.%s.%s is %s', s, t, c, ty))
+FROM (VALUES
+    ('civics','citizens','home_geom','geometry(Point,4326)'),
+    ('geo','neighborhood_boundaries','boundary_geom','geometry(Polygon,4326)'),
+    ('geo','neighborhood_boundaries','centroid_geom','geometry(Point,4326)'),
+    ('geo','points_of_interest','location_geom','geometry(Point,4326)'),
+    ('geo','road_segments','segment_geom','geometry(LineString,4326)')
+) AS v(s, t, c, ty);
 
-    -- Check orders → citizens relationship
-    SELECT COUNT(*) INTO fk_count
-    FROM information_schema.referential_constraints rc
-    JOIN information_schema.table_constraints tc ON rc.constraint_name = tc.constraint_name
-    WHERE tc.table_name = 'orders'
-    AND tc.constraint_type = 'FOREIGN KEY';
+SELECT col_not_null(s, t, c, format('%s.%s.%s is NOT NULL', s, t, c))
+FROM (VALUES
+    ('geo','neighborhood_boundaries','boundary_geom'),
+    ('geo','points_of_interest','location_geom'),
+    ('geo','road_segments','segment_geom'),
+    ('civics','citizens','email'),
+    ('commerce','orders','merchant_id')
+) AS v(s, t, c);
 
-    IF fk_count = 0 THEN
-        RAISE WARNING 'No foreign keys found on orders table (might be expected in early modules)';
-    ELSE
-        RAISE NOTICE '✓ Foreign key relationships exist (% found)', fk_count;
-    END IF;
-END $$;
+-- Mobility keeps raw lat/long numerics (no geometry column) with fixed precision.
+SELECT col_type_is('mobility', 'sensor_readings', 'latitude',  'numeric(10,8)', 'sensor_readings.latitude is numeric(10,8)');
+SELECT col_type_is('mobility', 'sensor_readings', 'longitude', 'numeric(11,8)', 'sensor_readings.longitude is numeric(11,8)');
+SELECT hasnt_column('civics', 'citizens', 'latitude', 'citizens has no latitude column (use home_geom)');
 
--- Test 6: Check basic indexes exist
-DO $$
-DECLARE
-    index_count integer;
-    important_indexes text[] := ARRAY['email', 'customer_id', 'merchant_id'];
-    idx text;
-    idx_exists boolean;
-BEGIN
-    RAISE NOTICE 'Test 6: Checking important indexes...';
+-- Full-text columns
+SELECT col_type_is('documents', 'complaint_records', 'search_vector', 'tsvector', 'complaint_records.search_vector is tsvector');
+SELECT col_type_is('documents', 'policy_documents',  'search_vector', 'tsvector', 'policy_documents.search_vector is tsvector');
+SELECT col_type_is('documents', 'policy_documents',  'document_content', 'jsonb', 'policy_documents.document_content is jsonb');
 
-    FOREACH idx IN ARRAY important_indexes LOOP
-        SELECT EXISTS (
-            SELECT FROM pg_indexes
-            WHERE schemaname = 'public'
-            AND indexname ILIKE '%' || idx || '%'
-        ) INTO idx_exists;
+-- -----------------------------------------------------------------------------
+-- 9. Check and exclusion constraints are declared (and validated)
+--    (data_integrity_checks.sql proves that each one actually rejects bad rows)
+-- -----------------------------------------------------------------------------
+SELECT is(
+    (SELECT count(*)::int FROM pg_constraint
+     WHERE contype = 'c' AND convalidated
+       AND connamespace::regnamespace::text IN ('civics','commerce','mobility','geo','documents')
+       AND conname LIKE 'chk\_%'),
+    33, '33 validated chk_* CHECK constraints on the base tables');
 
-        IF idx_exists THEN
-            RAISE NOTICE '✓ Index found for: %', idx;
-        ELSE
-            RAISE WARNING 'Index not found for: % (might be created in later modules)', idx;
-        END IF;
-    END LOOP;
-END $$;
+SELECT ok(EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'excl_permit_overlap' AND contype = 'x'
+                  AND conrelid = 'civics.permit_applications'::regclass),
+          'permit_applications has the excl_permit_overlap exclusion constraint');
+SELECT ok(EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'excl_license_overlap' AND contype = 'x'
+                  AND conrelid = 'commerce.business_licenses'::regclass),
+          'business_licenses has the excl_license_overlap exclusion constraint');
 
--- Test 7: Check data types are appropriate
-DO $$
-DECLARE
-    wrong_types integer := 0;
-BEGIN
-    RAISE NOTICE 'Test 7: Validating data types...';
+-- -----------------------------------------------------------------------------
+-- 10. Triggers that maintain derived columns
+-- -----------------------------------------------------------------------------
+SELECT trigger_is(s, t, trg, fs, fn, format('%s.%s trigger %s calls %s.%s()', s, t, trg, fs, fn))
+FROM (VALUES
+    ('commerce','order_items','trg_order_items_totals_ins','commerce','update_order_totals'),
+    ('commerce','order_items','trg_order_items_totals_upd','commerce','update_order_totals'),
+    ('commerce','order_items','trg_order_items_totals_del','commerce','update_order_totals'),
+    ('documents','complaint_records','trg_complaint_search_vector','documents','update_complaint_search_vector'),
+    ('documents','policy_documents','trg_policy_search_vector','documents','update_policy_search_vector'),
+    ('geo','neighborhood_boundaries','trg_neighborhood_metrics','geo','calculate_neighborhood_metrics'),
+    ('geo','road_segments','trg_road_metrics','geo','calculate_road_metrics')
+) AS v(s, t, trg, fs, fn);
 
-    -- Check that ID columns are integer/serial
-    SELECT COUNT(*) INTO wrong_types
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-    AND column_name ILIKE '%_id'
-    AND data_type NOT IN ('integer', 'bigint');
+-- Order totals are maintained by STATEMENT-level triggers (transition tables),
+-- so a multi-row INSERT recomputes each touched order once, not once per row.
+SELECT is(
+    (SELECT string_agg(t.tgname, ',' ORDER BY t.tgname) FROM pg_trigger t
+     WHERE t.tgrelid = 'commerce.order_items'::regclass AND NOT t.tgisinternal
+       AND (t.tgtype & 1) = 0),            -- bit 0 clear => FOR EACH STATEMENT
+    'trg_order_items_totals_del,trg_order_items_totals_ins,trg_order_items_totals_upd',
+    'order_items totals triggers are statement-level (one per INSERT/UPDATE/DELETE)');
+SELECT hasnt_trigger('commerce', 'order_items', 'trg_order_items_totals',
+                     'the old row-level trg_order_items_totals is gone');
 
-    IF wrong_types > 0 THEN
-        RAISE WARNING '% ID columns have non-integer types', wrong_types;
-    ELSE
-        RAISE NOTICE '✓ ID columns have appropriate types';
-    END IF;
+-- -----------------------------------------------------------------------------
+-- 11. Helper functions the modules call
+-- -----------------------------------------------------------------------------
+SELECT has_function('meta', 'as_of', 'function meta.as_of() exists');
+SELECT has_function('meta', 'fingerprint', 'function meta.fingerprint() exists');
+SELECT function_returns('meta', 'as_of', 'timestamp with time zone', 'meta.as_of() returns timestamptz');
+SELECT volatility_is('meta', 'as_of', 'stable', 'meta.as_of() is STABLE (safe in index-able predicates)');
+SELECT has_function('synth', 'u', ARRAY['bigint','integer'], 'function synth.u(bigint, integer) exists');
+SELECT has_function('synth', 'z', ARRAY['bigint','integer'], 'function synth.z(bigint, integer) exists');
+SELECT has_function('geo', 'find_nearby_pois', ARRAY['numeric','numeric','integer','geo.poi_category'],
+                    'function geo.find_nearby_pois(lat, lng, radius_m, category) exists');
+SELECT has_function('geo', 'point_to_neighborhood', ARRAY['numeric','numeric'],
+                    'function geo.point_to_neighborhood(lat, lng) exists');
+SELECT has_function('commerce', 'recompute_order_totals', ARRAY['bigint[]'],
+                    'function commerce.recompute_order_totals(bigint[]) exists');
+SELECT has_function('documents', 'search_complaints', ARRAY['text','integer'],
+                    'function documents.search_complaints(text, integer) exists');
 
-    -- Check that date columns are proper date/timestamp types
-    SELECT COUNT(*) INTO wrong_types
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-    AND column_name ILIKE '%date%'
-    AND data_type NOT IN ('date', 'timestamp without time zone', 'timestamp with time zone');
-
-    IF wrong_types > 0 THEN
-        RAISE WARNING '% date columns have non-date types', wrong_types;
-    ELSE
-        RAISE NOTICE '✓ Date columns have appropriate types';
-    END IF;
-END $$;
-
--- Test 8: Check for PostGIS extension (if spatial module loaded)
-DO $$
-DECLARE
-    postgis_available boolean;
-    spatial_tables integer;
-BEGIN
-    RAISE NOTICE 'Test 8: Checking PostGIS availability...';
-
-    SELECT EXISTS (
-        SELECT FROM pg_extension WHERE extname = 'postgis'
-    ) INTO postgis_available;
-
-    IF postgis_available THEN
-        RAISE NOTICE '✓ PostGIS extension is installed';
-
-        -- Check for spatial tables
-        SELECT COUNT(*) INTO spatial_tables
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        AND table_name IN ('spatial_features', 'neighborhoods', 'routes');
-
-        IF spatial_tables > 0 THEN
-            RAISE NOTICE '✓ Spatial tables found (%)', spatial_tables;
-        ELSE
-            RAISE NOTICE 'No spatial tables found (might not be loaded yet)';
-        END IF;
-    ELSE
-        RAISE NOTICE 'PostGIS extension not installed (might be expected)';
-    END IF;
-END $$;
-
--- Test 9: Check JSONB tables if they exist
-DO $$
-DECLARE
-    jsonb_tables integer;
-    jsonb_indexes integer;
-BEGIN
-    RAISE NOTICE 'Test 9: Checking JSONB functionality...';
-
-    SELECT COUNT(*) INTO jsonb_tables
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-    AND data_type = 'jsonb';
-
-    IF jsonb_tables > 0 THEN
-        RAISE NOTICE '✓ JSONB columns found (%)', jsonb_tables;
-
-        -- Check for GIN indexes on JSONB columns
-        SELECT COUNT(*) INTO jsonb_indexes
-        FROM pg_indexes
-        WHERE schemaname = 'public'
-        AND indexdef ILIKE '%gin%'
-        AND indexdef ILIKE '%jsonb%';
-
-        IF jsonb_indexes > 0 THEN
-            RAISE NOTICE '✓ GIN indexes on JSONB columns found (%)', jsonb_indexes;
-        ELSE
-            RAISE NOTICE 'No GIN indexes on JSONB columns (might not be created yet)';
-        END IF;
-    ELSE
-        RAISE NOTICE 'No JSONB columns found (might not be loaded yet)';
-    END IF;
-END $$;
-
--- Test 10: Check table permissions
-DO $$
-DECLARE
-    permission_issues integer := 0;
-    current_role text;
-BEGIN
-    RAISE NOTICE 'Test 10: Checking table permissions...';
-
-    SELECT current_user INTO current_role;
-
-    -- Check if current user can select from core tables
-    BEGIN
-        PERFORM COUNT(*) FROM citizens LIMIT 1;
-        PERFORM COUNT(*) FROM merchants LIMIT 1;
-        PERFORM COUNT(*) FROM orders LIMIT 1;
-        PERFORM COUNT(*) FROM trips LIMIT 1;
-        RAISE NOTICE '✓ Read permissions verified for user: %', current_role;
-    EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'Permission issues detected for user: %', current_role;
-    END;
-END $$;
-
--- Test 11: Schema consistency check
-SELECT
-    'Test 11: Schema consistency summary' as test,
-    COUNT(DISTINCT table_name) as total_tables,
-    COUNT(CASE WHEN table_type = 'BASE TABLE' THEN 1 END) as base_tables,
-    COUNT(CASE WHEN table_type = 'VIEW' THEN 1 END) as views
-FROM information_schema.tables
-WHERE table_schema = 'public';
-
--- Test 12: Index utilization check (if statistics available)
-SELECT
-    'Test 12: Index overview' as test,
-    schemaname,
-    COUNT(*) as total_indexes,
-    COUNT(CASE WHEN idx_scan > 0 THEN 1 END) as used_indexes,
-    COUNT(CASE WHEN idx_scan = 0 THEN 1 END) as unused_indexes
-FROM pg_stat_user_indexes
-WHERE schemaname = 'public'
-GROUP BY schemaname;
-
--- Final validation summary
-DO $$
-DECLARE
-    table_count integer;
-    index_count integer;
-    constraint_count integer;
-BEGIN
-    SELECT COUNT(*) INTO table_count
-    FROM information_schema.tables
-    WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
-
-    SELECT COUNT(*) INTO index_count
-    FROM pg_indexes
-    WHERE schemaname = 'public';
-
-    SELECT COUNT(*) INTO constraint_count
-    FROM information_schema.table_constraints
-    WHERE table_schema = 'public';
-
-    RAISE NOTICE '========================================';
-    RAISE NOTICE 'SCHEMA VALIDATION SUMMARY';
-    RAISE NOTICE '========================================';
-    RAISE NOTICE 'Tables: %', table_count;
-    RAISE NOTICE 'Indexes: %', index_count;
-    RAISE NOTICE 'Constraints: %', constraint_count;
-    RAISE NOTICE '========================================';
-
-    IF table_count >= 4 THEN
-        RAISE NOTICE '✅ Schema validation PASSED';
-    ELSE
-        RAISE NOTICE '⚠️  Schema validation PARTIAL (% tables found, expected at least 4)', table_count;
-    END IF;
-END $$;
-
-SELECT 'Schema validation completed' as status;
+SELECT * FROM finish();
+ROLLBACK;

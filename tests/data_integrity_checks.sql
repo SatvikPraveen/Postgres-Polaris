@@ -1,415 +1,433 @@
 -- Location: /tests/data_integrity_checks.sql
--- FK consistency, constraint validation, and data quality checks
-
+-- =============================================================================
+-- pgTAP suite 2/3: CONSTRAINTS, DATA INVARIANTS AND REPRODUCIBILITY
+-- =============================================================================
+-- What it teaches / guards:
+--   A. Every CHECK, EXCLUDE, FOREIGN KEY, UNIQUE and NOT NULL constraint on the
+--      base tables really rejects bad data, with the right SQLSTATE and the
+--      right constraint name (23514 check, 23P01 exclusion, 23503 FK,
+--      23505 unique, 23502 not-null). A constraint that is dropped, renamed or
+--      made NOT VALID-and-forgotten turns a test red.
+--   B. Invariants of the generated dataset that no single constraint enforces:
+--      no orphans, money adds up, nothing happens after meta.as_of(), every
+--      complaint lies inside its neighbourhood, neighbourhoods tile the city
+--      without overlap, population_estimate equals the citizens living there.
+--   C. Reproducibility: scale 1 / seed 42 yields the documented row counts.
+--
+-- Technique: each "bad write" runs inside throws_ok(), which wraps it in a
+-- subtransaction (savepoint) so the failure is caught and nothing persists.
+-- The whole file runs in one transaction that is ROLLED BACK.
+--
+-- Run:   docker exec polaris-db pg_prove -U polaris -d <db> /tests/data_integrity_checks.sql
+-- =============================================================================
 \set ON_ERROR_STOP on
-\timing on
+\set QUIET 1
+\pset format unaligned
+\pset tuples_only true
+\pset pager off
 
--- Start data integrity testing
-SELECT 'Starting data integrity checks...' as status;
+BEGIN;
+SELECT plan(113);
 
--- Test 1: Check for NULL values in critical columns
-DO $$
-DECLARE
-    null_citizens integer;
-    null_merchants integer;
-    null_orders integer;
+-- Helpers live in pg_temp, so they disappear with the session (and the ROLLBACK).
+CREATE FUNCTION pg_temp.rejects_check(tbl text, con text, stmt text)
+RETURNS text LANGUAGE sql AS $$
+    SELECT throws_ok(stmt, '23514',
+        format('new row for relation "%s" violates check constraint "%s"', tbl, con),
+        format('CHECK %s rejects bad data', con));
+$$;
+
+CREATE FUNCTION pg_temp.rejects_fk(tbl text, con text, stmt text)
+RETURNS text LANGUAGE sql AS $$
+    SELECT throws_ok(stmt, '23503',
+        format('insert or update on table "%s" violates foreign key constraint "%s"', tbl, con),
+        format('FOREIGN KEY %s rejects a dangling reference', con));
+$$;
+
+-- Number of rows whose event timestamp lies after the dataset's "now".
+CREATE FUNCTION pg_temp.after_as_of(tbl regclass, col text)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE n bigint;
 BEGIN
-    RAISE NOTICE 'Test 1: Checking for NULL values in critical columns...';
+    EXECUTE format('SELECT count(*) FROM %s WHERE %I > meta.as_of()', tbl, col) INTO n;
+    RETURN n;
+END $$;
 
-    -- Check citizens table
-    SELECT COUNT(*) INTO null_citizens
-    FROM citizens
-    WHERE citizen_id IS NULL OR name IS NULL OR email IS NULL;
+-- =============================================================================
+-- A1. CHECK constraints (SQLSTATE 23514)
+--     Each statement breaks exactly one rule on one existing row.
+-- =============================================================================
+-- civics.citizens  (note: chk_citizens_age uses CURRENT_DATE, so it is only
+-- evaluated when a row is written, never re-checked as time passes)
+SELECT pg_temp.rejects_check('citizens', 'chk_citizens_age',
+    $$UPDATE civics.citizens SET date_of_birth = '1850-01-01' WHERE citizen_id = 1$$);
+SELECT pg_temp.rejects_check('citizens', 'chk_citizens_email',
+    $$UPDATE civics.citizens SET email = 'not-an-email' WHERE citizen_id = 1$$);
+SELECT pg_temp.rejects_check('citizens', 'chk_citizens_zip',
+    $$UPDATE civics.citizens SET zip_code = 'ABCDE' WHERE citizen_id = 1$$);
 
-    IF null_citizens > 0 THEN
-        RAISE WARNING 'Citizens table has % records with NULL critical values', null_citizens;
-    ELSE
-        RAISE NOTICE '✓ Citizens table: no NULL values in critical columns';
-    END IF;
+-- civics.permit_applications
+SELECT pg_temp.rejects_check('permit_applications', 'chk_permit_dates',
+    $$UPDATE civics.permit_applications SET approval_date = application_date - interval '1 day'
+      WHERE permit_id = (SELECT min(permit_id) FROM civics.permit_applications)$$);
+SELECT pg_temp.rejects_check('permit_applications', 'chk_permit_expiration',
+    $$UPDATE civics.permit_applications SET expiration_date = COALESCE(approval_date, application_date)
+      WHERE permit_id = (SELECT min(permit_id) FROM civics.permit_applications)$$);
+SELECT pg_temp.rejects_check('permit_applications', 'chk_permit_fees',
+    $$UPDATE civics.permit_applications SET fee_paid = fee_amount + 1
+      WHERE permit_id = (SELECT min(permit_id) FROM civics.permit_applications)$$);
 
-    -- Check merchants table
-    SELECT COUNT(*) INTO null_merchants
-    FROM merchants
-    WHERE merchant_id IS NULL OR business_name IS NULL OR status IS NULL;
+-- civics.tax_payments
+SELECT pg_temp.rejects_check('tax_payments', 'chk_mill_rate',
+    $$UPDATE civics.tax_payments SET mill_rate = 0 WHERE tax_id = (SELECT min(tax_id) FROM civics.tax_payments)$$);
+SELECT pg_temp.rejects_check('tax_payments', 'chk_tax_amounts',
+    $$UPDATE civics.tax_payments SET assessment_amount = -1 WHERE tax_id = (SELECT min(tax_id) FROM civics.tax_payments)$$);
+SELECT pg_temp.rejects_check('tax_payments', 'chk_tax_payment_logic',
+    $$UPDATE civics.tax_payments SET amount_paid = amount_due + 1 WHERE tax_id = (SELECT min(tax_id) FROM civics.tax_payments)$$);
+SELECT pg_temp.rejects_check('tax_payments', 'chk_tax_year',
+    $$UPDATE civics.tax_payments SET tax_year = 1900 WHERE tax_id = (SELECT min(tax_id) FROM civics.tax_payments)$$);
 
-    IF null_merchants > 0 THEN
-        RAISE WARNING 'Merchants table has % records with NULL critical values', null_merchants;
-    ELSE
-        RAISE NOTICE '✓ Merchants table: no NULL values in critical columns';
-    END IF;
+-- commerce.merchants
+SELECT pg_temp.rejects_check('merchants', 'chk_merchants_employees',
+    $$UPDATE commerce.merchants SET employee_count = -1 WHERE merchant_id = 1$$);
+SELECT pg_temp.rejects_check('merchants', 'chk_merchants_revenue',
+    $$UPDATE commerce.merchants SET annual_revenue = -1 WHERE merchant_id = 1$$);
+SELECT pg_temp.rejects_check('merchants', 'chk_merchants_tax_id',
+    $$UPDATE commerce.merchants SET tax_id = '123' WHERE merchant_id = 1$$);
 
-    -- Check orders table
-    SELECT COUNT(*) INTO null_orders
-    FROM orders
-    WHERE order_id IS NULL OR customer_id IS NULL OR merchant_id IS NULL OR total_amount IS NULL;
+-- commerce.orders
+SELECT pg_temp.rejects_check('orders', 'chk_delivery_dates',
+    $$UPDATE commerce.orders SET actual_delivery = order_date - interval '1 day' WHERE order_id = 1$$);
+SELECT pg_temp.rejects_check('orders', 'chk_order_amounts',   -- total still adds up; only the tip is negative
+    $$UPDATE commerce.orders SET tip_amount = -1, total_amount = subtotal + tax_amount - 1
+      WHERE order_id = (SELECT min(order_id) FROM commerce.orders WHERE subtotal > 10)$$);
+SELECT pg_temp.rejects_check('orders', 'chk_order_total',
+    $$UPDATE commerce.orders SET total_amount = total_amount + 100 WHERE order_id = 1$$);
 
-    IF null_orders > 0 THEN
-        RAISE WARNING 'Orders table has % records with NULL critical values', null_orders;
-    ELSE
-        RAISE NOTICE '✓ Orders table: no NULL values in critical columns';
-    END IF;
-END $;
+-- commerce.order_items
+SELECT pg_temp.rejects_check('order_items', 'chk_item_line_total',
+    $$UPDATE commerce.order_items SET line_total = line_total + 1 WHERE item_id = 1$$);
+SELECT pg_temp.rejects_check('order_items', 'chk_item_pricing',
+    $$UPDATE commerce.order_items SET quantity = 0, line_total = 0 WHERE item_id = 1$$);
 
--- Test 2: Foreign key consistency checks
-DO $
-DECLARE
-    orphan_orders integer;
-    orphan_customer_orders integer;
-    orphan_merchant_orders integer;
-BEGIN
-    RAISE NOTICE 'Test 2: Checking foreign key consistency...';
+-- commerce.payments
+SELECT pg_temp.rejects_check('payments', 'chk_payment_amount',
+    $$UPDATE commerce.payments SET amount = 0 WHERE payment_id = 1$$);
+SELECT pg_temp.rejects_check('payments', 'chk_payment_processing',
+    $$UPDATE commerce.payments SET status = 'completed', processed_at = NULL WHERE payment_id = 1$$);
 
-    -- Check for orders with invalid customer_id
-    SELECT COUNT(*) INTO orphan_customer_orders
-    FROM orders o
-    LEFT JOIN citizens c ON o.customer_id = c.citizen_id
-    WHERE c.citizen_id IS NULL;
+-- mobility
+SELECT pg_temp.rejects_check('stations', 'chk_station_capacity',
+    $$UPDATE mobility.stations SET total_capacity = -1 WHERE station_id = 1$$);
+SELECT pg_temp.rejects_check('stations', 'chk_station_coordinates',
+    $$UPDATE mobility.stations SET latitude = 91 WHERE station_id = 1$$);
+SELECT pg_temp.rejects_check('station_inventory', 'chk_inventory_counts',
+    $$UPDATE mobility.station_inventory SET available_count = -1 WHERE inventory_id = 1$$);
+SELECT pg_temp.rejects_check('trip_segments', 'chk_trip_coordinates',
+    $$UPDATE mobility.trip_segments SET start_latitude = 91 WHERE trip_segment_id = 1$$);
+SELECT pg_temp.rejects_check('trip_segments', 'chk_trip_metrics',
+    $$UPDATE mobility.trip_segments SET comfort_rating = 6 WHERE trip_segment_id = 1$$);
+SELECT pg_temp.rejects_check('trip_segments', 'chk_trip_times',
+    $$UPDATE mobility.trip_segments SET end_time = start_time - interval '1 hour' WHERE trip_segment_id = 1$$);
+SELECT pg_temp.rejects_check('sensor_readings', 'chk_sensor_coordinates',
+    $$UPDATE mobility.sensor_readings SET longitude = 181 WHERE reading_id = 1$$);
+SELECT pg_temp.rejects_check('sensor_readings', 'chk_sensor_quality',
+    $$UPDATE mobility.sensor_readings SET data_quality_score = 1.5 WHERE reading_id = 1$$);
 
-    IF orphan_customer_orders > 0 THEN
-        RAISE WARNING 'Found % orders with invalid customer_id references', orphan_customer_orders;
-    ELSE
-        RAISE NOTICE '✓ All orders have valid customer references';
-    END IF;
+-- geo
+SELECT pg_temp.rejects_check('road_segments', 'chk_road_attributes',
+    $$UPDATE geo.road_segments SET speed_limit = 0 WHERE segment_id = 1$$);
+SELECT pg_temp.rejects_check('points_of_interest', 'chk_poi_rating',
+    $$UPDATE geo.points_of_interest SET average_rating = 5.5 WHERE poi_id = 1$$);
+SELECT pg_temp.rejects_check('points_of_interest', 'chk_poi_reviews',
+    $$UPDATE geo.points_of_interest SET review_count = -1 WHERE poi_id = 1$$);
 
-    -- Check for orders with invalid merchant_id
-    SELECT COUNT(*) INTO orphan_merchant_orders
-    FROM orders o
-    LEFT JOIN merchants m ON o.merchant_id = m.merchant_id
-    WHERE m.merchant_id IS NULL;
+-- documents
+SELECT pg_temp.rejects_check('complaint_records', 'chk_complaint_coordinates',
+    $$UPDATE documents.complaint_records SET incident_latitude = 91 WHERE complaint_id = 1$$);
+SELECT pg_temp.rejects_check('complaint_records', 'chk_complaint_dates',
+    $$UPDATE documents.complaint_records SET acknowledged_at = submitted_at - interval '1 day' WHERE complaint_id = 1$$);
 
-    IF orphan_merchant_orders > 0 THEN
-        RAISE WARNING 'Found % orders with invalid merchant_id references', orphan_merchant_orders;
-    ELSE
-        RAISE NOTICE '✓ All orders have valid merchant references';
-    END IF;
-END $;
+-- =============================================================================
+-- A2. EXCLUSION constraints (SQLSTATE 23P01)
+--     A copy of an existing approved permit / active licence overlaps itself in
+--     time on the same parcel / merchant. Explicit negative ids avoid touching
+--     the sequences.
+-- =============================================================================
+SELECT throws_ok(
+    $$INSERT INTO civics.permit_applications
+        (permit_id, citizen_id, permit_type, permit_number, description, parcel_id, status,
+         application_date, approval_date, expiration_date, fee_amount, fee_paid)
+      SELECT -1, citizen_id, permit_type, 'TEST-OVERLAP-1', description, parcel_id, status,
+             application_date, approval_date, expiration_date, fee_amount, fee_paid
+      FROM civics.permit_applications
+      WHERE permit_id = (SELECT min(permit_id) FROM civics.permit_applications
+                         WHERE status = 'approved' AND parcel_id IS NOT NULL)$$,
+    '23P01', 'conflicting key value violates exclusion constraint "excl_permit_overlap"',
+    'EXCLUDE excl_permit_overlap rejects an overlapping approved permit on the same parcel');
 
--- Test 3: Data format validation
-DO $
-DECLARE
-    invalid_emails integer;
-    invalid_amounts integer;
-    invalid_dates integer;
-BEGIN
-    RAISE NOTICE 'Test 3: Validating data formats...';
+-- The constraint is partial (WHERE status IN (approved, pending)): a denied copy is fine.
+SELECT lives_ok(
+    $$INSERT INTO civics.permit_applications
+        (permit_id, citizen_id, permit_type, permit_number, description, parcel_id, status,
+         application_date, approval_date, expiration_date, fee_amount, fee_paid)
+      SELECT -2, citizen_id, permit_type, 'TEST-OVERLAP-2', description, parcel_id, 'denied',
+             application_date, approval_date, expiration_date, fee_amount, fee_paid
+      FROM civics.permit_applications
+      WHERE permit_id = (SELECT min(permit_id) FROM civics.permit_applications
+                         WHERE status = 'approved' AND parcel_id IS NOT NULL)$$,
+    'excl_permit_overlap ignores denied permits (partial exclusion constraint)');
+DELETE FROM civics.permit_applications WHERE permit_id = -2;   -- keep the row counts below exact
 
-    -- Check email format
-    SELECT COUNT(*) INTO invalid_emails
-    FROM citizens
-    WHERE email IS NOT NULL
-    AND email !~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}
-    ;
+SELECT throws_ok(
+    $$INSERT INTO commerce.business_licenses
+        (license_id, merchant_id, license_type, license_number, status, application_date,
+         issue_date, expiration_date, license_fee, fee_paid)
+      SELECT -1, merchant_id, license_type, 'TEST-LIC-1', status, application_date,
+             issue_date, expiration_date, license_fee, fee_paid
+      FROM commerce.business_licenses
+      WHERE license_id = (SELECT min(license_id) FROM commerce.business_licenses WHERE status = 'active')$$,
+    '23P01', 'conflicting key value violates exclusion constraint "excl_license_overlap"',
+    'EXCLUDE excl_license_overlap rejects two overlapping active licences of one type');
 
-    IF invalid_emails > 0 THEN
-        RAISE WARNING 'Found % citizens with invalid email formats', invalid_emails;
-    ELSE
-        RAISE NOTICE '✓ All citizen emails have valid formats';
-    END IF;
+-- =============================================================================
+-- A3. FOREIGN KEYS (SQLSTATE 23503)
+-- =============================================================================
+SELECT pg_temp.rejects_fk('orders', 'orders_merchant_id_fkey',
+    $$UPDATE commerce.orders SET merchant_id = -1 WHERE order_id = 1$$);
+SELECT pg_temp.rejects_fk('orders', 'orders_customer_citizen_id_fkey',
+    $$UPDATE commerce.orders SET customer_citizen_id = -1 WHERE order_id = 1$$);
+SELECT pg_temp.rejects_fk('order_items', 'order_items_order_id_fkey',
+    $$UPDATE commerce.order_items SET order_id = -1 WHERE item_id = 1$$);
+SELECT pg_temp.rejects_fk('payments', 'payments_order_id_fkey',
+    $$UPDATE commerce.payments SET order_id = -1 WHERE payment_id = 1$$);
+SELECT pg_temp.rejects_fk('permit_applications', 'permit_applications_citizen_id_fkey',
+    $$UPDATE civics.permit_applications SET citizen_id = -1
+      WHERE permit_id = (SELECT min(permit_id) FROM civics.permit_applications)$$);
+SELECT pg_temp.rejects_fk('station_inventory', 'station_inventory_station_id_fkey',
+    $$UPDATE mobility.station_inventory SET station_id = -1 WHERE inventory_id = 1$$);
+SELECT pg_temp.rejects_fk('trip_segments', 'trip_segments_start_station_id_fkey',
+    $$UPDATE mobility.trip_segments SET start_station_id = -1 WHERE trip_segment_id = 1$$);
+SELECT pg_temp.rejects_fk('complaint_records', 'complaint_records_neighborhood_id_fkey',
+    $$UPDATE documents.complaint_records SET neighborhood_id = -1 WHERE complaint_id = 1$$);
+SELECT pg_temp.rejects_fk('points_of_interest', 'points_of_interest_neighborhood_id_fkey',
+    $$UPDATE geo.points_of_interest SET neighborhood_id = -1 WHERE poi_id = 1$$);
+-- ...and from the parent side: a referenced row cannot be deleted (NO ACTION).
+SELECT throws_ok(
+    $$DELETE FROM commerce.orders WHERE order_id = (SELECT min(order_id) FROM commerce.payments)$$,
+    '23503', NULL, 'an order that has payments cannot be deleted');
+SELECT throws_ok(
+    $$DELETE FROM geo.neighborhood_boundaries WHERE neighborhood_id = 1$$,
+    '23503', NULL, 'a neighbourhood referenced by complaints/POIs/roads cannot be deleted');
 
-    -- Check for negative order amounts
-    SELECT COUNT(*) INTO invalid_amounts
-    FROM orders
-    WHERE total_amount <= 0;
+-- =============================================================================
+-- A4. UNIQUE (23505) and NOT NULL (23502)
+-- =============================================================================
+SELECT throws_ok(
+    $$UPDATE civics.citizens SET email = (SELECT email FROM civics.citizens WHERE citizen_id = 2) WHERE citizen_id = 1$$,
+    '23505', 'duplicate key value violates unique constraint "citizens_email_key"',
+    'citizens.email is unique');
+SELECT throws_ok(
+    $$INSERT INTO documents.policy_documents (policy_id, policy_number, title, version, document_content, department)
+      SELECT -1, policy_number, 'dup', version, '{}'::jsonb, department FROM documents.policy_documents
+      WHERE policy_id = (SELECT min(policy_id) FROM documents.policy_documents)$$,
+    '23505', 'duplicate key value violates unique constraint "uq_policy_number_version"',
+    'policy (policy_number, version) is unique');
+SELECT throws_ok(
+    $$UPDATE civics.citizens SET email = NULL WHERE citizen_id = 1$$,
+    '23502', 'null value in column "email" of relation "citizens" violates not-null constraint',
+    'citizens.email is NOT NULL');
+SELECT throws_ok(
+    $$UPDATE geo.points_of_interest SET location_geom = NULL WHERE poi_id = 1$$,
+    '23502', 'null value in column "location_geom" of relation "points_of_interest" violates not-null constraint',
+    'points_of_interest.location_geom is NOT NULL');
+-- The typmod on geometry columns is a constraint too: wrong SRID / wrong shape is rejected.
+SELECT throws_like(
+    $$UPDATE geo.points_of_interest SET location_geom = ST_SetSRID(ST_MakePoint(500000, 4000000), 3857) WHERE poi_id = 1$$,
+    '%SRID%', 'geometry(Point,4326) rejects a 3857 point');
+SELECT throws_like(
+    $$UPDATE geo.points_of_interest SET location_geom = ST_GeomFromText('LINESTRING(0 0, 1 1)', 4326) WHERE poi_id = 1$$,
+    '%LineString%', 'geometry(Point,4326) rejects a LineString');
 
-    IF invalid_amounts > 0 THEN
-        RAISE WARNING 'Found % orders with invalid amounts (<=0)', invalid_amounts;
-    ELSE
-        RAISE NOTICE '✓ All order amounts are positive';
-    END IF;
+-- =============================================================================
+-- B1. Referential invariants: no orphans (a backstop if an FK is ever dropped)
+-- =============================================================================
+SELECT is((SELECT count(*) FROM commerce.orders o
+           WHERE NOT EXISTS (SELECT 1 FROM commerce.merchants m WHERE m.merchant_id = o.merchant_id)),
+          0::bigint, 'no order without a merchant');
+SELECT is((SELECT count(*) FROM commerce.orders o
+           WHERE o.customer_citizen_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM civics.citizens c WHERE c.citizen_id = o.customer_citizen_id)),
+          0::bigint, 'no order with an unknown customer');
+SELECT is((SELECT count(*) FROM commerce.order_items i
+           WHERE NOT EXISTS (SELECT 1 FROM commerce.orders o WHERE o.order_id = i.order_id)),
+          0::bigint, 'no order item without an order');
+SELECT is((SELECT count(*) FROM commerce.orders o
+           WHERE NOT EXISTS (SELECT 1 FROM commerce.order_items i WHERE i.order_id = o.order_id)),
+          0::bigint, 'every order has at least one item');
+SELECT is((SELECT count(*) FROM commerce.payments p
+           WHERE NOT EXISTS (SELECT 1 FROM commerce.orders o WHERE o.order_id = p.order_id)),
+          0::bigint, 'no payment without an order');
+SELECT is((SELECT count(*) FROM commerce.business_licenses l
+           WHERE NOT EXISTS (SELECT 1 FROM commerce.merchants m WHERE m.merchant_id = l.merchant_id)),
+          0::bigint, 'no licence without a merchant');
+SELECT is((SELECT count(*) FROM (
+              SELECT citizen_id FROM civics.permit_applications
+              UNION ALL SELECT citizen_id FROM civics.tax_payments
+              UNION ALL SELECT citizen_id FROM civics.voting_records) x
+           WHERE NOT EXISTS (SELECT 1 FROM civics.citizens c WHERE c.citizen_id = x.citizen_id)),
+          0::bigint, 'no permit / tax payment / vote without a citizen');
+SELECT is((SELECT count(*) FROM mobility.station_inventory si
+           WHERE NOT EXISTS (SELECT 1 FROM mobility.stations s WHERE s.station_id = si.station_id)),
+          0::bigint, 'no inventory snapshot without a station');
+SELECT is((SELECT count(*) FROM mobility.trip_segments t
+           WHERE (t.start_station_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM mobility.stations s WHERE s.station_id = t.start_station_id))
+              OR (t.end_station_id   IS NOT NULL AND NOT EXISTS (SELECT 1 FROM mobility.stations s WHERE s.station_id = t.end_station_id))
+              OR (t.user_id          IS NOT NULL AND NOT EXISTS (SELECT 1 FROM civics.citizens c WHERE c.citizen_id = t.user_id))),
+          0::bigint, 'no trip segment with an unknown station or user');
+SELECT is((SELECT count(*) FROM (
+              SELECT neighborhood_id FROM documents.complaint_records
+              UNION ALL SELECT neighborhood_id FROM geo.points_of_interest
+              UNION ALL SELECT neighborhood_id FROM geo.road_segments) x
+           WHERE x.neighborhood_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM geo.neighborhood_boundaries n WHERE n.neighborhood_id = x.neighborhood_id)),
+          0::bigint, 'no complaint / POI / road in an unknown neighbourhood');
+SELECT is((SELECT count(*) FROM meta.ground_truth g
+           WHERE (g.entity = 'mobility.sensor_readings'
+                  AND NOT EXISTS (SELECT 1 FROM mobility.sensor_readings r WHERE r.reading_id = g.entity_id))
+              OR (g.entity = 'commerce.orders'
+                  AND NOT EXISTS (SELECT 1 FROM commerce.orders o WHERE o.order_id = g.entity_id))),
+          0::bigint, 'every meta.ground_truth label points at an existing row');
 
-    -- Check for future registration dates
-    SELECT COUNT(*) INTO invalid_dates
-    FROM citizens
-    WHERE registration_date > CURRENT_DATE;
+-- =============================================================================
+-- B2. Money adds up
+-- =============================================================================
+SELECT is((SELECT count(*) FROM commerce.order_items WHERE line_total <> unit_price * quantity),
+          0::bigint, 'order_items: line_total = unit_price * quantity (exactly)');
+SELECT is((SELECT count(*) FROM commerce.orders WHERE total_amount <> subtotal + tax_amount + tip_amount),
+          0::bigint, 'orders: total_amount = subtotal + tax_amount + tip_amount (exactly)');
+SELECT is((SELECT count(*) FROM commerce.orders o
+           JOIN (SELECT order_id, sum(line_total) AS s FROM commerce.order_items GROUP BY order_id) i USING (order_id)
+           WHERE o.subtotal <> i.s),
+          0::bigint, 'orders: subtotal = sum(order_items.line_total)');
+SELECT is((SELECT count(*) FROM commerce.payments p JOIN commerce.orders o USING (order_id)
+           WHERE p.status = 'completed' AND p.amount <> o.total_amount),
+          0::bigint, 'completed payments charge exactly the order total');
+SELECT is((SELECT count(*) FROM civics.tax_payments WHERE amount_paid > amount_due),
+          0::bigint, 'no tax overpayment');
 
-    IF invalid_dates > 0 THEN
-        RAISE WARNING 'Found % citizens with future registration dates', invalid_dates;
-    ELSE
-        RAISE NOTICE '✓ All registration dates are valid';
-    END IF;
-END $;
+-- =============================================================================
+-- B3. Time: nothing that has *happened* lies after meta.as_of()
+--     (Future-dated-by-design columns such as expiration/due/review dates are
+--      deliberately excluded.)
+-- =============================================================================
+SELECT is(pg_temp.after_as_of(t::regclass, c), 0::bigint, format('%s.%s <= meta.as_of()', t, c))
+FROM (VALUES
+    ('civics.citizens', 'registered_date'),
+    ('civics.citizens', 'date_of_birth'),
+    ('civics.permit_applications', 'application_date'),
+    ('civics.voting_records', 'voted_at'),
+    ('commerce.merchants', 'registration_date'),
+    ('commerce.business_licenses', 'issue_date'),
+    ('commerce.orders', 'order_date'),
+    ('commerce.payments', 'payment_date'),
+    ('commerce.payments', 'processed_at'),
+    ('mobility.trip_segments', 'start_time'),
+    ('mobility.sensor_readings', 'reading_time'),
+    ('mobility.station_inventory', 'recorded_at'),
+    ('documents.complaint_records', 'submitted_at'),
+    ('documents.complaint_records', 'incident_date'),
+    ('documents.complaint_records', 'resolved_at'),
+    ('documents.policy_documents', 'effective_date')
+) AS v(t, c);
 
--- Test 4: Business logic validation
-DO $
-DECLARE
-    underage_citizens integer;
-    inactive_merchant_orders integer;
-    same_day_issues integer;
-BEGIN
-    RAISE NOTICE 'Test 4: Checking business logic constraints...';
+-- =============================================================================
+-- B4. Geography: points sit inside their polygons; polygons tile the city
+-- =============================================================================
+SELECT is((SELECT count(*) FROM documents.complaint_records
+           WHERE incident_latitude IS NULL OR incident_longitude IS NULL OR neighborhood_id IS NULL),
+          0::bigint, 'every complaint is geolocated and assigned to a neighbourhood');
+SELECT is((SELECT count(*) FROM documents.complaint_records c
+           JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+           WHERE NOT ST_Covers(n.boundary_geom,
+                               ST_SetSRID(ST_MakePoint(c.incident_longitude, c.incident_latitude), 4326))),
+          0::bigint, 'every complaint point lies inside its neighbourhood polygon');
+SELECT is((SELECT count(*) FROM geo.points_of_interest p
+           JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+           WHERE NOT ST_Covers(n.boundary_geom, p.location_geom)),
+          0::bigint, 'every POI lies inside its neighbourhood polygon');
+SELECT is((SELECT count(*) FROM civics.citizens c
+           JOIN geo.neighborhood_boundaries n ON n.neighborhood_id = substr(c.zip_code, 4, 2)::int
+           WHERE c.home_geom IS NULL OR NOT ST_Covers(n.boundary_geom, c.home_geom)),
+          0::bigint, 'every citizen home lies in the neighbourhood its zip code (751NN) encodes');
+SELECT is((SELECT count(*) FROM geo.neighborhood_boundaries WHERE NOT ST_IsValid(boundary_geom)),
+          0::bigint, 'all neighbourhood polygons are valid');
+SELECT is((SELECT count(*) FROM geo.neighborhood_boundaries a
+           JOIN geo.neighborhood_boundaries b
+             ON a.neighborhood_id < b.neighborhood_id AND a.boundary_geom && b.boundary_geom
+           WHERE ST_Area(ST_Intersection(a.boundary_geom, b.boundary_geom)) > 0),
+          0::bigint, 'no two neighbourhood polygons overlap (shared edges only)');
+SELECT is((SELECT ST_GeometryType(u) || '/' || ST_NumInteriorRings(u)
+           FROM (SELECT ST_Union(boundary_geom) AS u FROM geo.neighborhood_boundaries) s),
+          'ST_Polygon/0', 'the neighbourhoods union to one polygon without holes (they tile the city)');
+SELECT ok((SELECT abs(ST_Area(ST_Union(boundary_geom)) - sum(ST_Area(boundary_geom))) < 1e-9
+           FROM geo.neighborhood_boundaries),
+          'area of the union equals the sum of the parts (no gaps double-counted, no overlap)');
+SELECT is((SELECT count(*) FROM geo.neighborhood_boundaries n
+           WHERE n.population_estimate IS DISTINCT FROM
+                 (SELECT count(*) FROM civics.citizens c WHERE ST_Covers(n.boundary_geom, c.home_geom))),
+          0::bigint, 'population_estimate equals the number of citizens living inside each polygon');
+SELECT is((SELECT sum(population_estimate)::bigint FROM geo.neighborhood_boundaries),
+          (SELECT count(*) FROM civics.citizens), 'neighbourhood populations sum to the citizen count');
+-- Derived columns maintained by trigger are consistent with the geometry (geodesic units).
+SELECT is((SELECT count(*) FROM geo.neighborhood_boundaries
+           WHERE abs(area_sq_km - ST_Area(boundary_geom::geography) / 1e6) > 0.001
+              OR NOT ST_Equals(centroid_geom, ST_Centroid(boundary_geom))),
+          0::bigint, 'area_sq_km / centroid_geom match the boundary (geography area)');
+SELECT is((SELECT count(*) FROM geo.road_segments
+           WHERE abs(length_km - ST_Length(segment_geom::geography) / 1000) > 0.001),
+          0::bigint, 'road length_km matches the geodesic length of segment_geom');
 
-    -- Check for underage citizens (assuming 18+ requirement)
-    SELECT COUNT(*) INTO underage_citizens
-    FROM citizens
-    WHERE birth_date IS NOT NULL
-    AND birth_date > CURRENT_DATE - INTERVAL '18 years';
+-- =============================================================================
+-- C. Reproducibility: scale 1, seed 42 => documented row counts
+-- =============================================================================
+SELECT is((SELECT count(*) FROM meta.dataset), 1::bigint, 'meta.dataset has exactly one row');
+SELECT is((SELECT scale FROM meta.dataset), 1::numeric, 'dataset was generated at scale 1');
+SELECT is((SELECT seed FROM meta.dataset), 42::bigint, 'dataset was generated with seed 42');
+SELECT is(meta.as_of(), '2025-12-31 23:59:59+00'::timestamptz, 'meta.as_of() is 2025-12-31 23:59:59 UTC');
+SELECT is((SELECT count(*) FROM meta.planted_effects), 10::bigint, '10 planted effects are documented');
 
-    IF underage_citizens > 0 THEN
-        RAISE WARNING 'Found % citizens under 18 years old', underage_citizens;
-    ELSE
-        RAISE NOTICE '✓ All citizens meet age requirements';
-    END IF;
+CREATE TEMP TABLE fp ON COMMIT DROP AS SELECT * FROM meta.fingerprint();
 
-    -- Check for orders from inactive merchants
-    SELECT COUNT(*) INTO inactive_merchant_orders
-    FROM orders o
-    JOIN merchants m ON o.merchant_id = m.merchant_id
-    WHERE m.status != 'active';
+SELECT is((SELECT row_count FROM fp WHERE table_name = t), n, format('%s has %s rows', t, n))
+FROM (VALUES
+    ('civics.citizens',             10000::bigint),
+    ('commerce.merchants',            500::bigint),
+    ('commerce.orders',             50000::bigint),
+    ('documents.complaint_records',  5000::bigint),
+    ('civics.permit_applications',   3000::bigint),
+    ('geo.points_of_interest',        600::bigint),
+    ('geo.road_segments',            1067::bigint),
+    ('mobility.stations',             150::bigint),
+    ('geo.neighborhood_boundaries',    24::bigint)
+) AS v(t, n);
 
-    IF inactive_merchant_orders > 0 THEN
-        RAISE WARNING 'Found % orders from inactive merchants', inactive_merchant_orders;
-    ELSE
-        RAISE NOTICE '✓ All orders are from active merchants';
-    END IF;
+-- The counts recorded at generation time still match what is in the tables.
+SELECT is((SELECT count(*) FROM fp
+           JOIN jsonb_each_text((SELECT row_counts FROM meta.dataset)) rc ON rc.key = fp.table_name
+           WHERE rc.value::bigint <> fp.row_count),
+          0::bigint, 'meta.dataset.row_counts agrees with meta.fingerprint()');
 
-    -- Check registration date vs birth date logic
-    SELECT COUNT(*) INTO same_day_issues
-    FROM citizens
-    WHERE birth_date IS NOT NULL
-    AND registration_date IS NOT NULL
-    AND registration_date < birth_date;
+-- =============================================================================
+-- A5. ON DELETE CASCADE (runs last because it removes rows inside this
+--     rolled-back transaction)
+-- =============================================================================
+DELETE FROM commerce.orders
+WHERE order_id = (SELECT min(order_id) FROM commerce.orders o
+                  WHERE NOT EXISTS (SELECT 1 FROM commerce.payments p WHERE p.order_id = o.order_id));
+SELECT is((SELECT count(*) FROM commerce.order_items i
+           WHERE NOT EXISTS (SELECT 1 FROM commerce.orders o WHERE o.order_id = i.order_id)),
+          0::bigint, 'deleting an order cascades to its order_items');
 
-    IF same_day_issues > 0 THEN
-        RAISE WARNING 'Found % citizens with registration before birth date', same_day_issues;
-    ELSE
-        RAISE NOTICE '✓ All registration dates are after birth dates';
-    END IF;
-END $;
-
--- Test 5: Duplicate detection
-DO $
-DECLARE
-    duplicate_emails integer;
-    duplicate_merchants integer;
-    duplicate_orders integer;
-BEGIN
-    RAISE NOTICE 'Test 5: Checking for duplicates...';
-
-    -- Check for duplicate emails
-    SELECT COUNT(*) INTO duplicate_emails
-    FROM (
-        SELECT email, COUNT(*)
-        FROM citizens
-        WHERE email IS NOT NULL
-        GROUP BY email
-        HAVING COUNT(*) > 1
-    ) dupe_emails;
-
-    IF duplicate_emails > 0 THEN
-        RAISE WARNING 'Found % duplicate email addresses', duplicate_emails;
-    ELSE
-        RAISE NOTICE '✓ No duplicate email addresses found';
-    END IF;
-
-    -- Check for duplicate business names at same address
-    SELECT COUNT(*) INTO duplicate_merchants
-    FROM (
-        SELECT business_name, address, COUNT(*)
-        FROM merchants
-        GROUP BY business_name, address
-        HAVING COUNT(*) > 1
-    ) dupe_merchants;
-
-    IF duplicate_merchants > 0 THEN
-        RAISE WARNING 'Found % duplicate merchant names at same address', duplicate_merchants;
-    ELSE
-        RAISE NOTICE '✓ No duplicate merchants at same address';
-    END IF;
-END $;
-
--- Test 6: Data completeness check
-DO $
-DECLARE
-    citizens_with_orders integer;
-    merchants_with_orders integer;
-    total_citizens integer;
-    total_merchants integer;
-BEGIN
-    RAISE NOTICE 'Test 6: Checking data completeness...';
-
-    SELECT COUNT(*) INTO total_citizens FROM citizens;
-    SELECT COUNT(*) INTO total_merchants FROM merchants;
-
-    -- Check how many citizens have orders
-    SELECT COUNT(DISTINCT customer_id) INTO citizens_with_orders FROM orders;
-
-    -- Check how many merchants have orders
-    SELECT COUNT(DISTINCT merchant_id) INTO merchants_with_orders FROM orders;
-
-    RAISE NOTICE 'Data completeness stats:';
-    RAISE NOTICE '  Citizens: % total, % with orders (%.1f%%)',
-        total_citizens,
-        citizens_with_orders,
-        CASE WHEN total_citizens > 0 THEN (citizens_with_orders::float / total_citizens * 100) ELSE 0 END;
-
-    RAISE NOTICE '  Merchants: % total, % with orders (%.1f%%)',
-        total_merchants,
-        merchants_with_orders,
-        CASE WHEN total_merchants > 0 THEN (merchants_with_orders::float / total_merchants * 100) ELSE 0 END;
-END $;
-
--- Test 7: Statistical outlier detection
-DO $
-DECLARE
-    high_value_orders integer;
-    high_trip_counts integer;
-    avg_order_amount numeric;
-    max_order_amount numeric;
-BEGIN
-    RAISE NOTICE 'Test 7: Checking for statistical outliers...';
-
-    -- Check for unusually high order amounts
-    SELECT AVG(total_amount), MAX(total_amount)
-    INTO avg_order_amount, max_order_amount
-    FROM orders;
-
-    SELECT COUNT(*) INTO high_value_orders
-    FROM orders
-    WHERE total_amount > avg_order_amount * 5; -- 5x average as outlier threshold
-
-    IF high_value_orders > 0 THEN
-        RAISE NOTICE 'Found % high-value orders (>5x average of $%.2f)', high_value_orders, avg_order_amount;
-    ELSE
-        RAISE NOTICE '✓ No extreme outliers in order amounts';
-    END IF;
-
-    RAISE NOTICE 'Order amount stats: avg=$%.2f, max=$%.2f', avg_order_amount, max_order_amount;
-END $;
-
--- Test 8: Time series data validation (if exists)
-DO $
-DECLARE
-    sensor_table_exists boolean;
-    future_readings integer;
-    old_readings integer;
-    battery_issues integer;
-BEGIN
-    RAISE NOTICE 'Test 8: Checking time series data quality...';
-
-    SELECT EXISTS (
-        SELECT FROM information_schema.tables
-        WHERE table_schema = 'public'
-        AND table_name = 'sensor_readings'
-    ) INTO sensor_table_exists;
-
-    IF sensor_table_exists THEN
-        -- Check for future timestamps
-        SELECT COUNT(*) INTO future_readings
-        FROM sensor_readings
-        WHERE timestamp > CURRENT_TIMESTAMP;
-
-        -- Check for very old readings (>1 year)
-        SELECT COUNT(*) INTO old_readings
-        FROM sensor_readings
-        WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 year';
-
-        -- Check for low battery sensors
-        SELECT COUNT(*) INTO battery_issues
-        FROM sensor_readings
-        WHERE battery_level < 20;
-
-        RAISE NOTICE 'Sensor data quality:';
-        RAISE NOTICE '  Future timestamps: %', future_readings;
-        RAISE NOTICE '  Old readings (>1yr): %', old_readings;
-        RAISE NOTICE '  Low battery readings: %', battery_issues;
-
-        IF future_readings > 0 THEN
-            RAISE WARNING 'Found sensor readings with future timestamps';
-        END IF;
-    ELSE
-        RAISE NOTICE 'No sensor_readings table found (expected for early modules)';
-    END IF;
-END $;
-
--- Test 9: JSONB data validation (if exists)
-DO $
-DECLARE
-    documents_table_exists boolean;
-    malformed_json integer;
-    missing_required_fields integer;
-BEGIN
-    RAISE NOTICE 'Test 9: Validating JSONB data quality...';
-
-    SELECT EXISTS (
-        SELECT FROM information_schema.tables
-        WHERE table_schema = 'public'
-        AND table_name = 'documents'
-    ) INTO documents_table_exists;
-
-    IF documents_table_exists THEN
-        -- Check for documents missing required fields
-        SELECT COUNT(*) INTO missing_required_fields
-        FROM documents
-        WHERE NOT (data ? 'type') OR NOT (data ? 'id');
-
-        IF missing_required_fields > 0 THEN
-            RAISE WARNING 'Found % documents missing required fields (type, id)', missing_required_fields;
-        ELSE
-            RAISE NOTICE '✓ All documents have required fields';
-        END IF;
-
-        -- Show document type distribution
-        RAISE NOTICE 'Document types:';
-        FOR rec IN
-            SELECT data->>'type' as doc_type, COUNT(*) as count
-            FROM documents
-            WHERE data ? 'type'
-            GROUP BY data->>'type'
-            ORDER BY COUNT(*) DESC
-        LOOP
-            RAISE NOTICE '  %: %', rec.doc_type, rec.count;
-        END LOOP;
-    ELSE
-        RAISE NOTICE 'No documents table found (expected for early modules)';
-    END IF;
-END $;
-
--- Test 10: Constraint validation summary
-SELECT
-    'Test 10: Constraint validation summary' as test,
-    tc.table_name,
-    tc.constraint_type,
-    COUNT(*) as constraint_count
-FROM information_schema.table_constraints tc
-WHERE tc.table_schema = 'public'
-AND tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE', 'CHECK')
-GROUP BY tc.table_name, tc.constraint_type
-ORDER BY tc.table_name, tc.constraint_type;
-
--- Final integrity summary
-DO $
-DECLARE
-    total_records integer := 0;
-    citizens_count integer := 0;
-    merchants_count integer := 0;
-    orders_count integer := 0;
-    trips_count integer := 0;
-BEGIN
-    -- Get record counts
-    SELECT COUNT(*) INTO citizens_count FROM citizens;
-    SELECT COUNT(*) INTO merchants_count FROM merchants;
-    SELECT COUNT(*) INTO orders_count FROM orders;
-    SELECT COUNT(*) INTO trips_count FROM trips;
-
-    total_records := citizens_count + merchants_count + orders_count + trips_count;
-
-    RAISE NOTICE '========================================';
-    RAISE NOTICE 'DATA INTEGRITY CHECK SUMMARY';
-    RAISE NOTICE '========================================';
-    RAISE NOTICE 'Record counts:';
-    RAISE NOTICE '  Citizens: %', citizens_count;
-    RAISE NOTICE '  Merchants: %', merchants_count;
-    RAISE NOTICE '  Orders: %', orders_count;
-    RAISE NOTICE '  Trips: %', trips_count;
-    RAISE NOTICE '  Total: %', total_records;
-    RAISE NOTICE '========================================';
-
-    IF total_records > 0 THEN
-        RAISE NOTICE '✅ Data integrity checks COMPLETED';
-        RAISE NOTICE 'Review any warnings above for data quality issues';
-    ELSE
-        RAISE NOTICE '⚠️  No data found - consider running: make load-data';
-    END IF;
-END $;
-
-SELECT 'Data integrity checks completed' as status;
+SELECT * FROM finish();
+ROLLBACK;
