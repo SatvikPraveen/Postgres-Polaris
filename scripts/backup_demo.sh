@@ -18,7 +18,7 @@ dump="$outdir/${src}_${stamp}.dump"
 
 log "dumping '$src'"
 docker exec "$POLARIS_CONTAINER" pg_dump -U "$POLARIS_USER" -d "$src" -Fc -Z zstd:3 \
-    --exclude-schema=cron -f "/tmp/backup.dump"
+    --exclude-extension=pg_cron -f "/tmp/backup.dump"   # pg_cron may only exist in its home database
 docker cp "$POLARIS_CONTAINER:/tmp/backup.dump" "$dump" >/dev/null
 entries="$(docker exec "$POLARIS_CONTAINER" sh -c 'pg_restore -l /tmp/backup.dump | grep -c "TABLE DATA"')"
 log "archive contains $entries table-data entries ($(du -h "$dump" | cut -f1))"
