@@ -215,9 +215,17 @@ CREATE INDEX IF NOT EXISTS idx_pois_category_rating_geo ON geo.points_of_interes
 -- 6. UNIQUE PARTIAL INDEXES (conditional uniqueness)
 -- =============================================================================
 
--- Only one approved permit per parcel per type
+-- Only one approved permit per parcel per type -- a partial UNIQUE index.
+-- Compare it with excl_permit_overlap (constraints.sql): the unique index
+-- forbids a second approved permit forever, while the exclusion constraint
+-- forbids only *overlapping* validity periods, so a renewal starting the day
+-- the old permit expires is allowed. The exclusion constraint encodes the real
+-- rule; the partial index is shown for its EXPLAIN/size characteristics and
+-- then dropped so it does not change the base data model for later modules.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_permits_active_property_type ON civics.permit_applications(parcel_id, permit_type)
     WHERE status = 'approved' AND parcel_id IS NOT NULL;
+SELECT pg_size_pretty(pg_relation_size('civics.idx_permits_active_property_type')) AS partial_unique_index_size;
+DROP INDEX IF EXISTS civics.idx_permits_active_property_type;
 
 -- Only one active general business license per merchant (license_type values
 -- in the data are snake_case: general_business, food_service, health_facility)

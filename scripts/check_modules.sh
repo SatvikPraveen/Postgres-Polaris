@@ -47,7 +47,7 @@ for f in "${files[@]}"; do
     secs=$(( $(date +%s) - t0 ))
     drop_db "$db"
     if [[ $status == PASS ]]; then pass=$((pass + 1)); ok "$f (${secs}s)"
-    else fail=$((fail + 1)); warn "$f $status -> $(grep -m1 ERROR "$logdir/$name".run*.log | cut -c1-160)"; fi
+    else fail=$((fail + 1)); warn "$f $status -> $(grep -h -m1 ERROR "$logdir/$name".run*.log | cut -c1-160)"; fi
     results+=("$(printf '%-62s %-12s %4ss' "$f" "$status" "$secs")")
 done
 

@@ -249,7 +249,12 @@ SELECT col_type_is('documents', 'policy_documents',  'document_content', 'jsonb'
 SELECT is(
     (SELECT count(*)::int FROM pg_constraint
      WHERE contype = 'c' AND convalidated
-       AND connamespace::regnamespace::text IN ('civics','commerce','mobility','geo','documents')
+       AND conrelid IN (SELECT format('%I.%I', s, t)::regclass FROM (VALUES
+             ('civics','citizens'), ('civics','permit_applications'), ('civics','tax_payments'), ('civics','voting_records'),
+             ('commerce','merchants'), ('commerce','business_licenses'), ('commerce','orders'), ('commerce','order_items'),
+             ('commerce','payments'), ('mobility','stations'), ('mobility','station_inventory'), ('mobility','trip_segments'),
+             ('mobility','sensor_readings'), ('geo','neighborhood_boundaries'), ('geo','points_of_interest'),
+             ('geo','road_segments'), ('documents','complaint_records'), ('documents','policy_documents')) b(s, t))
        AND conname LIKE 'chk\_%'),
     33, '33 validated chk_* CHECK constraints on the base tables');
 

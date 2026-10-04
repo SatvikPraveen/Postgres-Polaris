@@ -320,6 +320,7 @@ JOIN pg_class c ON c.oid = i.indexrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 CROSS JOIN LATERAL pgstatindex(i.indexrelid) s
 WHERE n.nspname IN ('commerce', 'mobility')
+  AND c.relkind = 'i'  -- skip partitioned parents ('I'): they have no storage
   AND c.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
 ORDER BY pg_relation_size(i.indexrelid) DESC, index_name
 LIMIT 5;

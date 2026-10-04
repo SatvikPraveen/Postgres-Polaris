@@ -29,18 +29,23 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     shm_size: 512mb
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Mount the parent dir: PG <= 17 keeps PGDATA in ./data, the PG 18 image
+      # in ./18/docker. One mount point works for both.
+      - pgdata:/var/lib/postgresql
       - ../sql:/sql:ro
       - ../data:/data:ro
       - ../tests:/tests:ro
       - ../examples:/examples:ro
       - ../benchmarks:/benchmarks:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1' >/dev/null"]
+      # Probe over TCP: during first-boot initialisation the entrypoint runs a
+      # temporary server on the Unix socket only, so a socket probe would report
+      # healthy before the dataset build has finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} -tAc 'SELECT 1' >/dev/null"]
       interval: 5s
       timeout: 5s
-      retries: 30
-      start_period: 20s
+      retries: 60
+      start_period: 30s
 
   adminer:
     image: adminer:4.8.1

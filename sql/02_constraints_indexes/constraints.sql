@@ -197,6 +197,10 @@ ALTER TABLE mobility.trip_segments
 -- =============================================================================
 
 -- Create domains for commonly used patterns
+-- Rebuilds drop the domain schemas, but domains live in public, so recreate
+-- them explicitly to keep the file rerunnable.
+DROP DOMAIN IF EXISTS email_address, us_phone, us_zip_code, positive_money, rating_1_to_5, percentage;
+
 CREATE DOMAIN email_address AS VARCHAR(255)
     CHECK (VALUE ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$');
 

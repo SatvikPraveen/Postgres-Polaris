@@ -44,7 +44,8 @@ BEGIN
     plan := plan -> 0 -> 'Plan';
     top_node       := plan ->> 'Node Type';
     estimated_rows := (plan ->> 'Plan Rows')::bigint;
-    actual_rows    := (plan ->> 'Actual Rows')::bigint * (plan ->> 'Actual Loops')::bigint;
+    -- PG 18 reports Actual Rows as a per-loop average with decimals; go via numeric.
+    actual_rows    := round((plan ->> 'Actual Rows')::numeric * (plan ->> 'Actual Loops')::numeric)::bigint;
     -- symmetric "how many times off" (1.0 = perfect), as used in plan-quality research
     misestimate_factor := round(greatest(greatest(estimated_rows, 1)::numeric / greatest(actual_rows, 1),
                                          greatest(actual_rows, 1)::numeric / greatest(estimated_rows, 1)), 1);

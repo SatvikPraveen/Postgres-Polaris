@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh docker/initdb/*.sh benchmarks/*.sh
+      - name: Python syntax
+        run: python3 -m py_compile benchmarks/analyze.py
+      - name: Compose file
+        run: |
+          cp docker/.env.example docker/.env
+          docker compose -f docker/docker-compose.yml config --quiet
+
+  verify:
+    name: Verify (PostgreSQL ${{ matrix.pg }})
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["17", "18"]
+    env:
+      PG_MAJOR: ${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cp docker/.env.example docker/.env
+          cp .env.example .env
+          sed -i "s/^PG_MAJOR=.*/PG_MAJOR=${PG_MAJOR}/" docker/.env
+
+      - name: Build image
+        run: docker compose -f docker/docker-compose.yml build db
+
+      - name: Start database (first boot builds the dataset)
+        run: make up
+
+      - name: Dataset provenance
+        run: |
+          docker exec polaris-db psql -U polaris -d polaris -c \
+            "SELECT generator_version, scale, seed, as_of, generation_ms, server_version FROM meta.dataset"
+
+      - name: pgTAP suite
+        run: make test
+
+      - name: Every module is standalone and idempotent
+        run: make test-modules
+
+      - name: Examples and benchmark queries run
+        run: |
+          for f in examples/*.sql tests/performance_benchmarks.sql; do
+            scripts/run_sql.sh "$f" > /dev/null
+          done
+
+      - name: Reproducibility (identical fingerprints across planner settings)
+        run: make reproduce
+
+      - name: Verified backup and restore
+        run: make backup
+
+      - name: Benchmark harness smoke test
+        run: CLIENTS="1 2" DURATION=3 WARMUP=1 REPS=2 make bench
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-pg${{ matrix.pg }}
+          path: |
+            .check_logs/
+            benchmarks/results/
+          if-no-files-found: ignore
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs polaris-db 2>&1 | tail -200

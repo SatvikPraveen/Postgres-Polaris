@@ -159,7 +159,9 @@ LIMIT 5;
 -- Teaches: pg_stat_io splits I/O by backend_type x object x context. High
 -- 'evictions' for client backends in the 'normal' context means shared_buffers
 -- pressure; 'bulkread'/'vacuum' contexts use small ring buffers on purpose.
--- Multiply counts by op_bytes (8 kB) for volume.
+-- Volume: PG 16-17 expose op_bytes (8 kB per operation); PG 18 replaced it
+-- with read_bytes/write_bytes. Reading through to_jsonb(row) keeps one view
+-- definition valid on both.
 \echo '== 4. pg_stat_io (PG16+)'
 DO $$
 BEGIN
@@ -172,9 +174,11 @@ BEGIN
                coalesce(extends, 0)   AS extends,
                coalesce(hits, 0)      AS hits,
                coalesce(evictions, 0) AS evictions,
-               pg_size_pretty((coalesce(reads, 0) + coalesce(writes, 0)) * op_bytes) AS read_write_volume,
+               pg_size_pretty(coalesce(
+                   coalesce((to_jsonb(s) ->> 'read_bytes')::numeric, 0) + coalesce((to_jsonb(s) ->> 'write_bytes')::numeric, 0),
+                   (coalesce(reads, 0) + coalesce(writes, 0)) * (to_jsonb(s) ->> 'op_bytes')::numeric)) AS read_write_volume,
                round(100.0 * hits / nullif(hits + reads, 0), 2)                      AS hit_pct
-        FROM pg_stat_io
+        FROM pg_stat_io s
         WHERE coalesce(reads, 0) + coalesce(writes, 0) + coalesce(hits, 0) + coalesce(extends, 0) > 0
         $v$;
     ELSE
@@ -322,8 +326,12 @@ SELECT (SELECT count(*) FROM monitoring.replication_slots)                     A
 -- EXECUTE. Staleness is measured against meta.as_of(), the dataset's clock.
 -- In production you would compare against now().
 \echo '== 8. Data freshness'
-CREATE TABLE IF NOT EXISTS monitoring.freshness_sla (
-    table_name      regclass PRIMARY KEY,
+-- table_name is text, not regclass: a regclass column stores the OID, which
+-- goes stale (prints as a bare number) when the table is dropped and rebuilt.
+-- Resolve the name at query time instead.
+DROP TABLE IF EXISTS monitoring.freshness_sla CASCADE;
+CREATE TABLE monitoring.freshness_sla (
+    table_name      text PRIMARY KEY,
     ts_column       name     NOT NULL,
     expected_every  interval NOT NULL,
     note            text
@@ -349,14 +357,14 @@ AS $$
 DECLARE
     r record;
 BEGIN
-    FOR r IN SELECT f.table_name, f.ts_column, f.expected_every FROM monitoring.freshness_sla f ORDER BY f.table_name::text
+    FOR r IN SELECT f.table_name, f.ts_column, f.expected_every FROM monitoring.freshness_sla f ORDER BY f.table_name
     LOOP
         table_name := r.table_name::text;
         ts_column  := r.ts_column;
         expected_every := r.expected_every;
         -- reltuples is a free estimate; count(*) on big tables is not free.
-        SELECT greatest(c.reltuples, 0)::bigint INTO row_count FROM pg_class c WHERE c.oid = r.table_name;
-        EXECUTE format('SELECT max(%I) FROM %s WHERE %I <= $1', r.ts_column, r.table_name, r.ts_column)
+        SELECT greatest(c.reltuples, 0)::bigint INTO row_count FROM pg_class c WHERE c.oid = to_regclass(r.table_name);
+        EXECUTE format('SELECT max(%I) FROM %s WHERE %I <= $1', r.ts_column, to_regclass(r.table_name), r.ts_column)
             INTO latest USING ref;
         staleness := ref - latest;
         status := CASE WHEN latest IS NULL                         THEN 'EMPTY'

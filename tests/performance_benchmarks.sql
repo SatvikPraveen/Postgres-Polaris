@@ -93,7 +93,7 @@ BEGIN
             best_ms     := round(t, 3);
             planning_ms := round((j->0->>'Planning Time')::numeric, 3);
             plan_root   := j->0->'Plan'->>'Node Type';
-            rows_out    := (j->0->'Plan'->>'Actual Rows')::bigint;
+            rows_out    := round((j->0->'Plan'->>'Actual Rows')::numeric)::bigint;  -- PG 18 emits decimals
             shared_hit  := (j->0->'Plan'->>'Shared Hit Blocks')::bigint;
             shared_read := (j->0->'Plan'->>'Shared Read Blocks')::bigint;
         END IF;

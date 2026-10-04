@@ -7,7 +7,8 @@
 #
 #   docker build --build-arg PG_MAJOR=17 -t polaris-db .
 #
-# Supported PG_MAJOR values: 16, 17, 18 (CI tests all three).
+# Supported PG_MAJOR values: 17, 18 (CI tests both). Modules use PG 17
+# features (JSON_TABLE, MERGE ... RETURNING, COPY ON_ERROR, EXPLAIN SERIALIZE).
 
 ARG PG_MAJOR=17
 FROM postgres:${PG_MAJOR}-bookworm
