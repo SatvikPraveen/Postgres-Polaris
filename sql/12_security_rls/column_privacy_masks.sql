@@ -290,6 +290,28 @@ SELECT privacy.mask_ssn('123-45-6789', 'citizen')          AS ssn_citizen,
 -- The view owner (polaris) reads the base table; callers only need SELECT on the view.
 -- security_barrier = true forces the view's own WHERE clause to run BEFORE any
 -- user-supplied predicate, so a leaky function cannot observe hidden rows.
+-- Decryption for the view. The key stays out of the database (see section 2):
+-- an authorised caller supplies it per session in app.encryption_key. Without
+-- this wrapper, pgp_sym_decrypt(ct, NULL) quietly returns NULL, which looks
+-- exactly like "no SSN on file". The wrapper makes both failure modes
+-- explicit: a missing key and a wrong key each return a clear marker. It runs
+-- as the caller (not SECURITY DEFINER), so it can only use the caller's key.
+CREATE OR REPLACE FUNCTION privacy.reveal(ciphertext BYTEA)
+RETURNS TEXT LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    k TEXT := nullif(current_setting('app.encryption_key', true), '');
+BEGIN
+    IF ciphertext IS NULL THEN
+        RETURN NULL;                                   -- genuinely nothing on file
+    ELSIF k IS NULL THEN
+        RETURN '[ENCRYPTED: set app.encryption_key]';
+    END IF;
+    RETURN pgp_sym_decrypt(ciphertext, k);
+EXCEPTION
+    WHEN external_routine_invocation_exception THEN    -- "Wrong key or corrupt data"
+        RETURN '[DECRYPTION FAILED: wrong key]';
+END $$;
+
 CREATE OR REPLACE VIEW privacy.v_citizens_masked
 WITH (security_barrier = true) AS
 SELECT
@@ -303,7 +325,7 @@ SELECT
     zip_code,
     CASE WHEN privacy.can_see_pii() THEN date_of_birth
          ELSE make_date(extract(year FROM date_of_birth)::INT, 1, 1) END AS birth_date,  -- year only
-    CASE WHEN privacy.can_see_pii() THEN pgp_sym_decrypt(ssn_encrypted, current_setting('app.encryption_key', true))
+    CASE WHEN privacy.can_see_pii() THEN privacy.reveal(ssn_encrypted)
          ELSE '***-**-' || ssn_last4 END AS ssn,
     status
 FROM privacy.citizen_profiles
@@ -313,7 +335,7 @@ COMMENT ON VIEW privacy.v_citizens_masked IS
     'Masked citizen view: raw PII only for members of privacy_supervisor; security_barrier prevents leaks of hidden rows';
 
 GRANT SELECT ON privacy.v_citizens_masked TO privacy_clerk, privacy_supervisor;
-GRANT EXECUTE ON FUNCTION privacy.can_see_pii() TO privacy_clerk, privacy_supervisor;
+GRANT EXECUTE ON FUNCTION privacy.can_see_pii(), privacy.reveal(BYTEA) TO privacy_clerk, privacy_supervisor;
 GRANT privacy_clerk TO privacy_supervisor;
 
 \echo '-- same view, different viewers'
@@ -323,8 +345,17 @@ FROM privacy.v_citizens_masked ORDER BY citizen_id LIMIT 2;
 RESET ROLE;
 
 SET ROLE privacy_supervisor;
-SELECT 'supervisor' AS viewer, citizen_id, email, phone, street_address, birth_date, ssn
+SELECT 'supervisor + key' AS viewer, citizen_id, email, phone, street_address, birth_date, ssn
 FROM privacy.v_citizens_masked ORDER BY citizen_id LIMIT 2;
+
+\echo '-- supervisor without the key, then with a wrong key: explicit markers, never a silent NULL'
+SELECT set_config('app.encryption_key', '', false) AS key_cleared \gset
+SELECT 'supervisor, no key' AS viewer, citizen_id, ssn
+FROM privacy.v_citizens_masked ORDER BY citizen_id LIMIT 1;
+SELECT set_config('app.encryption_key', 'not-the-key', false) AS key_wrong \gset
+SELECT 'supervisor, wrong key' AS viewer, citizen_id, ssn
+FROM privacy.v_citizens_masked ORDER BY citizen_id LIMIT 1;
+SELECT set_config('app.encryption_key', 'demo-only-key-rotate-me', false) AS key_restored \gset
 RESET ROLE;
 
 -- ----------------------------------------------------------------------------
