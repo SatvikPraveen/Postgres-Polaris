@@ -1,473 +1,401 @@
 -- File: sql/13_backup_replication/backup_restore_playbook.sql
--- Purpose: pg_dump/pg_restore/psql flows with executable examples
+-- Purpose: logical backups with pg_dump / pg_restore / psql, plus SQL-side bookkeeping
+--
+-- What this module teaches
+--   1. Logical (pg_dump) vs physical (pg_basebackup) backups and when to use which
+--   2. pg_dump formats (plain / custom / directory / tar), selective dumps, parallel dumps,
+--      PG16+ compression (lz4, zstd), PG17 --filter files
+--   3. What pg_dump does NOT include: roles and tablespaces (use pg_dumpall --globals-only)
+--   4. Restores: pg_restore --list / --use-list, --clean --if-exists, --jobs, --single-transaction
+--   5. A small backup catalogue in SQL: job logging, size estimates, retention, reporting
+--
+-- Shell commands are kept in comments because they run outside the database.  They are
+-- written for this repo's Docker setup (container polaris-db, superuser polaris).
+
+\echo '== 13 / backup & restore playbook =='
 
 -- =============================================================================
--- BACKUP STRATEGY OVERVIEW
+-- 1. BACKUP CATALOGUE (module-owned schema)
 -- =============================================================================
-
--- Create backup management schema
 CREATE SCHEMA IF NOT EXISTS backup_mgmt;
 
--- Backup metadata table
-CREATE TABLE backup_mgmt.backup_jobs (
-    job_id BIGSERIAL PRIMARY KEY,
-    job_name TEXT NOT NULL,
-    backup_type TEXT CHECK (backup_type IN ('full', 'schema_only', 'data_only', 'custom', 'incremental')),
-    database_name TEXT NOT NULL,
-    file_path TEXT,
-    file_size_bytes BIGINT,
-    start_time TIMESTAMPTZ,
-    end_time TIMESTAMPTZ,
-    duration_seconds INTEGER GENERATED ALWAYS AS (EXTRACT(epoch FROM (end_time - start_time))) STORED,
-    status TEXT CHECK (status IN ('running', 'completed', 'failed', 'cancelled')) DEFAULT 'running',
-    pg_dump_version TEXT,
-    compression_used BOOLEAN DEFAULT FALSE,
-    error_message TEXT,
-    created_by TEXT DEFAULT current_user
+CREATE TABLE IF NOT EXISTS backup_mgmt.backup_jobs (
+    job_id           BIGSERIAL PRIMARY KEY,
+    job_name         TEXT NOT NULL,
+    backup_type      TEXT CHECK (backup_type IN ('full', 'schema_only', 'data_only', 'custom', 'globals', 'physical', 'incremental')),
+    database_name    TEXT NOT NULL,
+    file_path        TEXT,
+    file_size_bytes  BIGINT,
+    start_time       TIMESTAMPTZ,
+    end_time         TIMESTAMPTZ,
+    -- timestamptz - timestamptz is immutable, so a stored generated column is allowed
+    duration_seconds NUMERIC GENERATED ALWAYS AS (EXTRACT(epoch FROM (end_time - start_time))) STORED,
+    status           TEXT CHECK (status IN ('running', 'completed', 'failed', 'cancelled', 'expired')) DEFAULT 'running',
+    server_version   TEXT,
+    compression      TEXT,              -- e.g. 'gzip:9', 'zstd:3', 'lz4', 'none'
+    error_message    TEXT,
+    created_by       TEXT DEFAULT current_user
 );
 
--- Backup schedule table
-CREATE TABLE backup_mgmt.backup_schedule (
-    schedule_id BIGSERIAL PRIMARY KEY,
-    schedule_name TEXT NOT NULL,
-    backup_type TEXT NOT NULL,
-    cron_schedule TEXT NOT NULL, -- '0 2 * * *' for daily 2 AM
+CREATE TABLE IF NOT EXISTS backup_mgmt.backup_schedule (
+    schedule_id    BIGSERIAL PRIMARY KEY,
+    schedule_name  TEXT NOT NULL UNIQUE,
+    backup_type    TEXT NOT NULL,
+    cron_schedule  TEXT NOT NULL,       -- '0 2 * * *' = daily at 02:00
     retention_days INTEGER DEFAULT 30,
-    compression BOOLEAN DEFAULT TRUE,
-    is_active BOOLEAN DEFAULT TRUE,
-    last_run TIMESTAMPTZ,
-    next_run TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    compression    TEXT DEFAULT 'zstd:3',
+    is_active      BOOLEAN DEFAULT TRUE,
+    last_run       TIMESTAMPTZ,
+    next_run       TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ DEFAULT now()
 );
 
--- =============================================================================
--- BACKUP COMMAND TEMPLATES (Shell Commands)
--- =============================================================================
+INSERT INTO backup_mgmt.backup_schedule (schedule_name, backup_type, cron_schedule, retention_days, compression)
+VALUES ('nightly_full',      'custom',      '0 2 * * *', 30,  'zstd:3'),
+       ('weekly_globals',    'globals',     '0 3 * * 0', 90,  'none'),
+       ('hourly_schema_ddl', 'schema_only', '0 * * * *', 7,   'none')
+ON CONFLICT (schedule_name) DO NOTHING;
 
+-- =============================================================================
+-- 2. BACKUP COMMAND TEMPLATES (shell, run from the host)
+-- =============================================================================
+-- Logical backups (pg_dump) are consistent snapshots of ONE database taken from a single
+-- REPEATABLE READ transaction; they do not block writers.  They are portable across major
+-- versions and architectures but restore by replaying SQL (slow for big DBs, indexes rebuilt).
 /*
--- Full database backup (binary format, compressed)
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --format=custom --compress=9 --verbose \
-  --file=/backups/smart_city_full_$(date +%Y%m%d_%H%M%S).backup
+# Full database, custom format (compressed, selective restore possible, needed for pg_restore)
+docker exec polaris-db pg_dump -U polaris -d polaris \
+  --format=custom --compress=zstd:3 --verbose \
+  --file=/tmp/polaris_full_$(date +%Y%m%d_%H%M%S).dump
+# (--compress=zstd / lz4 need PG16+ pg_dump; older versions only support gzip levels 0-9)
 
--- Schema-only backup
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --schema-only --format=plain \
-  --file=/backups/smart_city_schema_$(date +%Y%m%d_%H%M%S).sql
+# Copy it out of the container
+docker cp polaris-db:/tmp/polaris_full_20251231_020000.dump ./backups/
 
--- Data-only backup
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --data-only --format=custom --compress=9 \
-  --file=/backups/smart_city_data_$(date +%Y%m%d_%H%M%S).backup
+# Or stream straight to the host (no file inside the container)
+docker exec polaris-db pg_dump -U polaris -d polaris -Fc > ./backups/polaris_full.dump
 
--- Specific schema backup
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --schema=civics --format=custom --compress=9 \
-  --file=/backups/civics_schema_$(date +%Y%m%d_%H%M%S).backup
+# Schema only (DDL), plain SQL - good for code review / diffing
+docker exec polaris-db pg_dump -U polaris -d polaris --schema-only --format=plain > ./backups/polaris_schema.sql
 
--- Specific tables backup
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --table=civics.citizens --table=civics.neighborhoods \
-  --format=custom --compress=9 \
-  --file=/backups/core_tables_$(date +%Y%m%d_%H%M%S).backup
+# Data only
+docker exec polaris-db pg_dump -U polaris -d polaris --data-only -Fc > ./backups/polaris_data.dump
 
--- Large database backup with parallel jobs
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --format=directory --jobs=4 --compress=9 \
-  --file=/backups/smart_city_parallel_$(date +%Y%m%d_%H%M%S)
+# One schema / specific tables (patterns are schema-qualified)
+docker exec polaris-db pg_dump -U polaris -d polaris -Fc --schema=civics > ./backups/civics.dump
+docker exec polaris-db pg_dump -U polaris -d polaris -Fc \
+  --table=civics.citizens --table=geo.neighborhood_boundaries > ./backups/core_tables.dump
 
--- Backup with custom options
-pg_dump -h localhost -p 5432 -U postgres -d smart_city \
-  --format=custom --compress=9 --verbose \
-  --exclude-table=temp_* --exclude-table=*_log \
-  --exclude-schema=staging \
-  --file=/backups/smart_city_production_$(date +%Y%m%d_%H%M%S).backup
+# Large database: directory format + parallel workers (-j only works with -Fd)
+docker exec polaris-db pg_dump -U polaris -d polaris \
+  --format=directory --jobs=4 --compress=zstd:3 --file=/tmp/polaris_dir
+
+# Exclusions (quote patterns so the shell does not expand them)
+docker exec polaris-db pg_dump -U polaris -d polaris -Fc \
+  --exclude-table='*_log' --exclude-table='*.temp_*' --exclude-schema=synth \
+  --exclude-table-data='audit.*' > ./backups/polaris_lean.dump
+
+# PG17: put include/exclude rules in a file
+#   filter.txt:   include table civics.*
+#                 exclude table_data audit.*
+docker exec -i polaris-db pg_dump -U polaris -d polaris -Fc --filter=- < filter.txt > ./backups/filtered.dump
+
+# ROLES ARE NOT IN pg_dump!  Users, groups, passwords and memberships are cluster-global.
+docker exec polaris-db pg_dumpall -U polaris --globals-only > ./backups/globals.sql
 */
 
 -- =============================================================================
--- RESTORE COMMAND TEMPLATES (Shell Commands)
+-- 3. RESTORE COMMAND TEMPLATES (shell)
 -- =============================================================================
-
 /*
--- Full database restore (creates new database)
-createdb -h localhost -p 5432 -U postgres smart_city_restored
-pg_restore -h localhost -p 5432 -U postgres -d smart_city_restored \
-  --verbose --clean --if-exists \
-  /backups/smart_city_full_20241128_020000.backup
+# Restore into a NEW database (restore globals first so owners/grants resolve)
+docker exec -i polaris-db psql -U polaris -d postgres < ./backups/globals.sql
+docker exec polaris-db createdb -U polaris polaris_restored
+docker exec -i polaris-db pg_restore -U polaris -d polaris_restored --verbose --jobs=4 < ./backups/polaris_full.dump
+#   note: --jobs needs a seekable file, so for parallel restore docker cp the dump in first
+#   and pass the path instead of stdin.
 
--- Restore into existing database (careful!)
-pg_restore -h localhost -p 5432 -U postgres -d smart_city \
-  --verbose --clean --if-exists --single-transaction \
-  /backups/smart_city_full_20241128_020000.backup
+# Restore over an existing database (drops objects first; all-or-nothing)
+pg_restore -U polaris -d polaris --clean --if-exists --single-transaction /tmp/polaris_full.dump
 
--- Schema-only restore
-psql -h localhost -p 5432 -U postgres -d smart_city_new \
-  -f /backups/smart_city_schema_20241128_020000.sql
+# Inspect / edit the table of contents, then restore only what you kept
+pg_restore --list /tmp/polaris_full.dump > toc.list
+#   ... comment out lines with ';' ...
+pg_restore -U polaris -d polaris_restored --use-list=toc.list /tmp/polaris_full.dump
 
--- Data-only restore
-pg_restore -h localhost -p 5432 -U postgres -d smart_city \
-  --verbose --data-only --disable-triggers \
-  /backups/smart_city_data_20241128_020000.backup
+# One table back from a full dump (-n schema AND -t table name)
+pg_restore -U polaris -d polaris_restored -n civics -t citizens /tmp/polaris_full.dump
 
--- Selective table restore
-pg_restore -h localhost -p 5432 -U postgres -d smart_city \
-  --verbose --table=citizens --table=neighborhoods \
-  /backups/smart_city_full_20241128_020000.backup
+# Data-only restore into existing tables; --disable-triggers needs superuser and also
+# skips FK checks, so validate afterwards
+pg_restore -U polaris -d polaris_restored --data-only --disable-triggers /tmp/polaris_data.dump
 
--- Parallel restore (faster for large databases)
-pg_restore -h localhost -p 5432 -U postgres -d smart_city_restored \
-  --verbose --jobs=4 --clean --if-exists \
-  /backups/smart_city_parallel_20241128_020000
+# Plain-format dumps are restored with psql, stopping at the first error
+psql -U polaris -d polaris_restored -v ON_ERROR_STOP=1 --single-transaction -f polaris_schema.sql
 
--- Point-in-time restore (requires WAL archives)
-pg_basebackup -h localhost -p 5432 -U postgres \
-  --pgdata=/restore/base_backup --format=tar --gzip \
-  --checkpoint=fast --label="restore_point_$(date +%Y%m%d_%H%M%S)"
+# After any restore: refresh planner statistics (pg_dump does not carry them)
+vacuumdb -U polaris -d polaris_restored --analyze-in-stages
 */
+-- Physical backups (pg_basebackup) copy the whole cluster and enable point-in-time
+-- recovery; see point_in_time_recovery.sql.
 
 -- =============================================================================
--- BACKUP VALIDATION FUNCTIONS
+-- 4. SIZE ESTIMATION BEFORE A BACKUP
 -- =============================================================================
-
--- Function to validate backup file integrity
-CREATE OR REPLACE FUNCTION backup_mgmt.validate_backup(
-    backup_file_path TEXT,
-    backup_type TEXT DEFAULT 'custom'
+-- On-disk size includes indexes and dead tuples; a dump contains only live rows and
+-- index DEFINITIONS, so it is usually much smaller.  The 0.3 factor is a rough guess for
+-- compressed custom-format output.
+CREATE OR REPLACE FUNCTION backup_mgmt.estimate_backup_size(
+    p_schemas TEXT[] DEFAULT ARRAY['civics', 'commerce', 'documents', 'mobility', 'geo', 'analytics']
 )
-RETURNS TABLE(
-    validation_step TEXT,
-    status TEXT,
-    details TEXT
-) AS $$
-DECLARE
-    cmd_output TEXT;
-BEGIN
-    -- Note: These would need to be implemented via external scripts
-    -- or stored procedures with appropriate permissions
-
-    -- Step 1: File existence check
-    RETURN QUERY SELECT
-        'File Existence'::TEXT as validation_step,
-        'INFO'::TEXT as status,
-        'Backup file path: ' || backup_file_path as details;
-
-    -- Step 2: File size check
-    RETURN QUERY SELECT
-        'File Size Check'::TEXT as validation_step,
-        'INFO'::TEXT as status,
-        'Use: du -h ' || backup_file_path as details;
-
-    -- Step 3: pg_restore list test (for custom format)
-    IF backup_type = 'custom' THEN
-        RETURN QUERY SELECT
-            'Backup Contents List'::TEXT as validation_step,
-            'INFO'::TEXT as status,
-            'Use: pg_restore --list ' || backup_file_path as details;
-    END IF;
-
-    -- Step 4: Test restore to temp database
-    RETURN QUERY SELECT
-        'Test Restore'::TEXT as validation_step,
-        'RECOMMENDED'::TEXT as status,
-        'Create test database and restore to validate' as details;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- BACKUP SIZE ESTIMATION
--- =============================================================================
-
--- Estimate backup size before running
-CREATE OR REPLACE FUNCTION backup_mgmt.estimate_backup_size()
 RETURNS TABLE(
     schema_name NAME,
     table_name NAME,
-    row_count BIGINT,
+    est_rows BIGINT,
     table_size TEXT,
     indexes_size TEXT,
     total_size TEXT,
-    estimated_compressed_size TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        schemaname::NAME,
-        tablename::NAME,
-        COALESCE(n_tup_ins - n_tup_del, 0) as row_count,
-        pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) as table_size,
-        pg_size_pretty(pg_indexes_size(schemaname||'.'||tablename)) as indexes_size,
-        pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
-        pg_size_pretty((pg_total_relation_size(schemaname||'.'||tablename) * 0.3)::BIGINT) as estimated_compressed_size
-    FROM pg_tables t
-    LEFT JOIN pg_stat_user_tables s ON t.schemaname = s.schemaname AND t.tablename = s.relname
-    WHERE t.schemaname IN ('civics', 'commerce', 'documents', 'analytics')
-    ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
-END;
-$$ LANGUAGE plpgsql;
+    estimated_dump_size TEXT
+) LANGUAGE sql STABLE AS $$
+    SELECT n.nspname,
+           c.relname,
+           GREATEST(c.reltuples, 0)::BIGINT,                         -- planner estimate, no scan
+           pg_size_pretty(pg_table_size(c.oid)),
+           pg_size_pretty(pg_indexes_size(c.oid)),
+           pg_size_pretty(pg_total_relation_size(c.oid)),
+           pg_size_pretty((pg_table_size(c.oid) * 0.3)::BIGINT)
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'm')
+      AND n.nspname = ANY (p_schemas)
+    ORDER BY pg_total_relation_size(c.oid) DESC, n.nspname, c.relname
+$$;
+
+\echo '-- largest relations (top 8)'
+SELECT * FROM backup_mgmt.estimate_backup_size() LIMIT 8;
+
+SELECT pg_size_pretty(pg_database_size(current_database())) AS database_size_on_disk;
 
 -- =============================================================================
--- BACKUP MONITORING AND LOGGING
+-- 5. JOB LOGGING
 -- =============================================================================
-
--- Function to log backup start
 CREATE OR REPLACE FUNCTION backup_mgmt.log_backup_start(
-    job_name TEXT,
-    backup_type TEXT,
-    database_name TEXT,
-    file_path TEXT DEFAULT NULL
+    job_name      TEXT,
+    backup_type   TEXT,
+    database_name TEXT DEFAULT current_database(),
+    file_path     TEXT DEFAULT NULL,
+    compression   TEXT DEFAULT NULL
 )
-RETURNS BIGINT AS $$
+RETURNS BIGINT LANGUAGE plpgsql AS $$
 DECLARE
-    job_id BIGINT;
+    v_job_id BIGINT;
 BEGIN
-    INSERT INTO backup_mgmt.backup_jobs (
-        job_name,
-        backup_type,
-        database_name,
-        file_path,
-        start_time,
-        pg_dump_version
-    ) VALUES (
-        job_name,
-        backup_type,
-        database_name,
-        file_path,
-        NOW(),
-        (SELECT setting FROM pg_settings WHERE name = 'server_version')
-    ) RETURNING backup_jobs.job_id INTO job_id;
+    INSERT INTO backup_mgmt.backup_jobs
+        (job_name, backup_type, database_name, file_path, start_time, server_version, compression)
+    VALUES
+        (job_name, backup_type, database_name, file_path, clock_timestamp(),
+         current_setting('server_version'), compression)
+    RETURNING backup_jobs.job_id INTO v_job_id;
+    RETURN v_job_id;
+END $$;
 
-    RETURN job_id;
-END;
-$$ LANGUAGE plpgsql;
-
--- Function to log backup completion
 CREATE OR REPLACE FUNCTION backup_mgmt.log_backup_complete(
-    job_id BIGINT,
+    job_id          BIGINT,
     file_size_bytes BIGINT DEFAULT NULL,
-    status TEXT DEFAULT 'completed',
-    error_message TEXT DEFAULT NULL
+    status          TEXT DEFAULT 'completed',
+    error_message   TEXT DEFAULT NULL
 )
-RETURNS VOID AS $$
+RETURNS VOID LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE backup_mgmt.backup_jobs
-    SET
-        end_time = NOW(),
+    UPDATE backup_mgmt.backup_jobs b
+    SET end_time        = clock_timestamp(),
         file_size_bytes = log_backup_complete.file_size_bytes,
-        status = log_backup_complete.status,
-        error_message = log_backup_complete.error_message
-    WHERE backup_jobs.job_id = log_backup_complete.job_id;
-END;
-$$ LANGUAGE plpgsql;
+        status          = log_backup_complete.status,
+        error_message   = log_backup_complete.error_message
+    WHERE b.job_id = log_backup_complete.job_id;
+END $$;
 
 -- =============================================================================
--- BACKUP RETENTION MANAGEMENT
+-- 6. RETENTION
 -- =============================================================================
-
--- Function to clean old backups based on retention policy
-CREATE OR REPLACE FUNCTION backup_mgmt.cleanup_old_backups(
-    retention_days INTEGER DEFAULT 30
-)
-RETURNS TABLE(
-    cleanup_action TEXT,
-    job_count BIGINT,
-    total_size_freed TEXT
-) AS $$
+-- SQL can only mark catalogue rows; deleting files is the job of the backup script.
+CREATE OR REPLACE FUNCTION backup_mgmt.cleanup_old_backups(retention_days INTEGER DEFAULT 30)
+RETURNS TABLE(cleanup_action TEXT, job_count BIGINT, total_size_freed TEXT)
+LANGUAGE plpgsql AS $$
 DECLARE
-    total_size BIGINT := 0;
-    job_count BIGINT := 0;
+    v_size  BIGINT;
+    v_count BIGINT;
 BEGIN
-    -- Calculate total size of old backups
-    SELECT
-        COUNT(*),
-        COALESCE(SUM(file_size_bytes), 0)
-    INTO job_count, total_size
-    FROM backup_mgmt.backup_jobs
-    WHERE end_time < (NOW() - (retention_days || ' days')::INTERVAL)
-    AND status = 'completed';
+    WITH expired AS (
+        UPDATE backup_mgmt.backup_jobs
+        SET status = 'expired'
+        WHERE end_time < now() - make_interval(days => retention_days)
+          AND status = 'completed'
+        RETURNING file_size_bytes
+    )
+    SELECT count(*), COALESCE(sum(file_size_bytes), 0) INTO v_count, v_size FROM expired;
 
-    -- Mark old jobs for cleanup (don't actually delete files from SQL)
-    UPDATE backup_mgmt.backup_jobs
-    SET status = 'expired'
-    WHERE end_time < (NOW() - (retention_days || ' days')::INTERVAL)
-    AND status = 'completed';
-
-    RETURN QUERY SELECT
-        'Marked for cleanup'::TEXT as cleanup_action,
-        job_count,
-        pg_size_pretty(total_size) as total_size_freed;
-
-    RETURN QUERY SELECT
-        'Action required'::TEXT as cleanup_action,
-        0::BIGINT as job_count,
-        'Use external script to delete actual files'::TEXT as total_size_freed;
-END;
-$$ LANGUAGE plpgsql;
+    RETURN QUERY SELECT 'Marked expired'::TEXT, v_count, pg_size_pretty(v_size);
+    RETURN QUERY SELECT 'Action required'::TEXT, 0::BIGINT, 'Delete the files with an external script'::TEXT;
+END $$;
 
 -- =============================================================================
--- BACKUP COMPARISON AND VERIFICATION
+-- 7. POST-RESTORE VERIFICATION
 -- =============================================================================
-
--- Compare table row counts between databases
+-- Exact row counts per table (run on source and restored DB, then diff the output).
+-- pg_stat counters are NOT reliable for this: they reset and are not restored.
 CREATE OR REPLACE FUNCTION backup_mgmt.compare_table_counts(
-    source_db TEXT DEFAULT current_database()
+    p_schemas TEXT[] DEFAULT ARRAY['civics', 'commerce', 'documents', 'mobility', 'geo']
 )
-RETURNS TABLE(
-    schema_name NAME,
-    table_name NAME,
-    source_count BIGINT,
-    comparison_notes TEXT
-) AS $$
+RETURNS TABLE(schema_name NAME, table_name NAME, exact_count BIGINT, size_class TEXT)
+LANGUAGE plpgsql AS $$
+DECLARE r RECORD;
 BEGIN
-    RETURN QUERY
-    SELECT
-        schemaname::NAME,
-        tablename::NAME,
-        COALESCE(n_tup_ins - n_tup_del, 0) as source_count,
-        CASE
-            WHEN COALESCE(n_tup_ins - n_tup_del, 0) = 0 THEN 'Empty table'
-            WHEN COALESCE(n_tup_ins - n_tup_del, 0) < 1000 THEN 'Small table'
-            WHEN COALESCE(n_tup_ins - n_tup_del, 0) < 100000 THEN 'Medium table'
-            ELSE 'Large table'
-        END as comparison_notes
-    FROM pg_tables t
-    LEFT JOIN pg_stat_user_tables s ON t.schemaname = s.schemaname AND t.tablename = s.relname
-    WHERE t.schemaname IN ('civics', 'commerce', 'documents', 'analytics')
-    ORDER BY source_count DESC;
-END;
-$$ LANGUAGE plpgsql;
+    FOR r IN
+        SELECT n.nspname, c.relname
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition AND n.nspname = ANY (p_schemas)
+        ORDER BY n.nspname, c.relname
+    LOOP
+        schema_name := r.nspname;
+        table_name  := r.relname;
+        EXECUTE format('SELECT count(*) FROM %I.%I', r.nspname, r.relname) INTO exact_count;
+        size_class := CASE WHEN exact_count = 0 THEN 'empty'
+                           WHEN exact_count < 1000 THEN 'small'
+                           WHEN exact_count < 100000 THEN 'medium'
+                           ELSE 'large' END;
+        RETURN NEXT;
+    END LOOP;
+END $$;
+
+\echo '-- exact row counts (civics + commerce)'
+SELECT * FROM backup_mgmt.compare_table_counts(ARRAY['civics', 'commerce']);
+
+-- A content fingerprint catches changed values that row counts miss.
+SELECT 'civics.citizens' AS table_name,
+       md5(string_agg(md5(c::TEXT), '' ORDER BY citizen_id)) AS content_fingerprint
+FROM civics.citizens c;
 
 -- =============================================================================
--- SAMPLE BACKUP SCRIPTS GENERATOR
+-- 8. SCRIPT GENERATOR
 -- =============================================================================
-
--- Generate backup scripts for different scenarios
-CREATE OR REPLACE FUNCTION backup_mgmt.generate_backup_scripts(
-    backup_scenario TEXT DEFAULT 'production'
-)
-RETURNS TEXT AS $$
+CREATE OR REPLACE FUNCTION backup_mgmt.generate_backup_scripts(backup_scenario TEXT DEFAULT 'production')
+RETURNS TEXT LANGUAGE plpgsql AS $$
 DECLARE
-    script_content TEXT;
-    timestamp_suffix TEXT := '$(date +%Y%m%d_%H%M%S)';
+    s   TEXT;
+    ext TEXT := CASE backup_scenario WHEN 'development' THEN 'sql' ELSE 'dump' END;
 BEGIN
-    script_content := '#!/bin/bash' || E'\n';
-    script_content := script_content || '# Generated backup script for: ' || backup_scenario || E'\n';
-    script_content := script_content || '# Generated at: ' || NOW()::TEXT || E'\n\n';
+    s := '#!/usr/bin/env bash' || E'\n'
+      || '# Generated backup script for: ' || backup_scenario || E'\n'
+      || 'set -euo pipefail' || E'\n\n'
+      || 'DB_HOST=${DB_HOST:-localhost}; DB_PORT=${DB_PORT:-5432}; DB_USER=${DB_USER:-polaris}' || E'\n'
+      || 'DB_NAME=${DB_NAME:-' || current_database() || '}; BACKUP_DIR=${BACKUP_DIR:-/backups}' || E'\n'
+      || 'TIMESTAMP=$(date +%Y%m%d_%H%M%S)' || E'\n'
+      || 'OUT="$BACKUP_DIR/${DB_NAME}_' || backup_scenario || '_$TIMESTAMP.' || ext || '"' || E'\n\n';
 
-    script_content := script_content || 'set -e  # Exit on error' || E'\n';
-    script_content := script_content || 'set -u  # Exit on undefined variable' || E'\n\n';
-
-    script_content := script_content || '# Database connection parameters' || E'\n';
-    script_content := script_content || 'DB_HOST=localhost' || E'\n';
-    script_content := script_content || 'DB_PORT=5432' || E'\n';
-    script_content := script_content || 'DB_USER=postgres' || E'\n';
-    script_content := script_content || 'DB_NAME=smart_city' || E'\n';
-    script_content := script_content || 'BACKUP_DIR=/backups' || E'\n';
-    script_content := script_content || 'TIMESTAMP=' || timestamp_suffix || E'\n\n';
-
-    CASE backup_scenario
+    s := s || CASE backup_scenario
         WHEN 'production' THEN
-            script_content := script_content || '# Production full backup' || E'\n';
-            script_content := script_content || 'pg_dump -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME \' || E'\n';
-            script_content := script_content || '  --format=custom --compress=9 --verbose \' || E'\n';
-            script_content := script_content || '  --exclude-table=*_log --exclude-table=temp_* \' || E'\n';
-            script_content := script_content || '  --file=$BACKUP_DIR/smart_city_prod_$TIMESTAMP.backup' || E'\n';
-
+            'pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \' || E'\n'
+         || '  --format=custom --compress=zstd:3 \' || E'\n'
+         || '  --exclude-table-data=''*_log'' --file="$OUT"' || E'\n'
+         || 'pg_dumpall -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" --globals-only > "${OUT%.dump}_globals.sql"' || E'\n'
         WHEN 'development' THEN
-            script_content := script_content || '# Development backup (schema + sample data)' || E'\n';
-            script_content := script_content || 'pg_dump -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME \' || E'\n';
-            script_content := script_content || '  --format=plain --schema-only \' || E'\n';
-            script_content := script_content || '  --file=$BACKUP_DIR/smart_city_dev_schema_$TIMESTAMP.sql' || E'\n';
-
+            'pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \' || E'\n'
+         || '  --format=plain --schema-only --file="$OUT"' || E'\n'
         WHEN 'migration' THEN
-            script_content := script_content || '# Migration backup (data only, no temp tables)' || E'\n';
-            script_content := script_content || 'pg_dump -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME \' || E'\n';
-            script_content := script_content || '  --format=custom --compress=9 --data-only \' || E'\n';
-            script_content := script_content || '  --exclude-table=*_temp --exclude-table=*_staging \' || E'\n';
-            script_content := script_content || '  --file=$BACKUP_DIR/smart_city_migration_$TIMESTAMP.backup' || E'\n';
-
+            'pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \' || E'\n'
+         || '  --format=custom --data-only \' || E'\n'
+         || '  --exclude-table=''*_temp'' --exclude-table=''*_staging'' --file="$OUT"' || E'\n'
         ELSE
-            script_content := script_content || '# Standard backup' || E'\n';
-            script_content := script_content || 'pg_dump -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME \' || E'\n';
-            script_content := script_content || '  --format=custom --compress=9 --verbose \' || E'\n';
-            script_content := script_content || '  --file=$BACKUP_DIR/smart_city_$TIMESTAMP.backup' || E'\n';
-    END CASE;
+            'pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" --format=custom --file="$OUT"' || E'\n'
+        END;
 
-    script_content := script_content || E'\n' || '# Verify backup was created' || E'\n';
-    script_content := script_content || 'if [ -f "$BACKUP_DIR/smart_city_*_$TIMESTAMP.backup" ]; then' || E'\n';
-    script_content := script_content || '    echo "Backup completed successfully"' || E'\n';
-    script_content := script_content || '    ls -lh $BACKUP_DIR/smart_city_*_$TIMESTAMP.backup' || E'\n';
-    script_content := script_content || 'else' || E'\n';
-    script_content := script_content || '    echo "Backup failed!" >&2' || E'\n';
-    script_content := script_content || '    exit 1' || E'\n';
-    script_content := script_content || 'fi' || E'\n';
+    s := s || E'\n# Verify: the file exists, is non-empty, and (for archives) has a readable TOC\n'
+      || 'test -s "$OUT" || { echo "Backup failed: $OUT missing or empty" >&2; exit 1; }' || E'\n'
+      || CASE WHEN ext = 'dump' THEN 'pg_restore --list "$OUT" > /dev/null' || E'\n' ELSE '' END
+      || 'ls -lh "$OUT"' || E'\n';
+    RETURN s;
+END $$;
 
-    RETURN script_content;
-END;
-$$ LANGUAGE plpgsql;
+\echo '-- generated production script'
+SELECT backup_mgmt.generate_backup_scripts('production') AS script;
+
+-- Validation checklist (the real checks run in the shell; the only proof of a backup is a test restore)
+CREATE OR REPLACE FUNCTION backup_mgmt.validate_backup(backup_file_path TEXT, backup_format TEXT DEFAULT 'custom')
+RETURNS TABLE(step INTEGER, validation_step TEXT, command TEXT)
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT * FROM (VALUES
+        (1, 'File exists and is non-empty', 'test -s ' || backup_file_path),
+        (2, 'Archive TOC readable',
+            CASE WHEN backup_format IN ('custom', 'directory', 'tar')
+                 THEN 'pg_restore --list ' || backup_file_path || ' | head'
+                 ELSE 'head -n 20 ' || backup_file_path END),
+        (3, 'Test restore into a scratch database',
+            'createdb restore_test && pg_restore -d restore_test --exit-on-error ' || backup_file_path),
+        (4, 'Compare row counts / fingerprints',
+            'psql -d restore_test -c "SELECT * FROM backup_mgmt.compare_table_counts()"'),
+        (5, 'Drop the scratch database', 'dropdb restore_test')
+    ) v(step, validation_step, command)
+$$;
+
+SELECT * FROM backup_mgmt.validate_backup('/tmp/polaris_full.dump');
 
 -- =============================================================================
--- BACKUP REPORTING
+-- 9. REPORTING (demo with simulated jobs, rolled back)
 -- =============================================================================
+CREATE OR REPLACE FUNCTION backup_mgmt.backup_status_report(days_back INTEGER DEFAULT 7)
+RETURNS TABLE(report_section TEXT, metric_name TEXT, metric_value TEXT, status_indicator TEXT)
+LANGUAGE sql STABLE AS $$
+    WITH recent AS (
+        SELECT * FROM backup_mgmt.backup_jobs
+        WHERE start_time >= now() - make_interval(days => days_back)
+    )
+    SELECT 'Recent Backups', 'Total backups (last ' || days_back || ' days)',
+           count(*)::TEXT, CASE WHEN count(*) > 0 THEN 'OK' ELSE 'WARNING' END
+    FROM recent
+    UNION ALL
+    SELECT 'Recent Backups', 'Success rate',
+           COALESCE(round(100.0 * count(*) FILTER (WHERE status = 'completed') / NULLIF(count(*), 0), 1)::TEXT || '%', 'n/a'),
+           CASE WHEN count(*) = 0 THEN 'NO DATA'
+                WHEN 100.0 * count(*) FILTER (WHERE status = 'completed') / count(*) >= 95 THEN 'OK'
+                WHEN 100.0 * count(*) FILTER (WHERE status = 'completed') / count(*) >= 80 THEN 'WARNING'
+                ELSE 'CRITICAL' END
+    FROM recent
+    UNION ALL
+    SELECT 'Recent Backups', 'Hours since last successful backup',
+           COALESCE(round(extract(epoch FROM now() - max(end_time)) / 3600, 1)::TEXT, 'never'),
+           CASE WHEN max(end_time) > now() - interval '26 hours' THEN 'OK' ELSE 'CRITICAL' END
+    FROM recent WHERE status = 'completed'
+    UNION ALL
+    SELECT 'Storage', 'Average backup size',
+           COALESCE(pg_size_pretty(avg(file_size_bytes)::BIGINT), 'n/a'), 'INFO'
+    FROM recent WHERE status = 'completed' AND file_size_bytes IS NOT NULL
+    UNION ALL
+    SELECT 'Storage', 'Total retained',
+           COALESCE(pg_size_pretty(sum(file_size_bytes)), '0 bytes'), 'INFO'
+    FROM backup_mgmt.backup_jobs WHERE status = 'completed'
+$$;
 
--- Generate backup status report
-CREATE OR REPLACE FUNCTION backup_mgmt.backup_status_report(
-    days_back INTEGER DEFAULT 7
-)
-RETURNS TABLE(
-    report_section TEXT,
-    metric_name TEXT,
-    metric_value TEXT,
-    status_indicator TEXT
-) AS $$
+\echo '-- simulated backup runs and report (rolled back)'
+BEGIN;
+DO $$
+DECLARE j BIGINT;
 BEGIN
-    -- Recent backup summary
-    RETURN QUERY
-    SELECT
-        'Recent Backups'::TEXT as report_section,
-        'Total Backups (Last ' || days_back || ' days)'::TEXT as metric_name,
-        COUNT(*)::TEXT as metric_value,
-        CASE WHEN COUNT(*) > 0 THEN 'OK' ELSE 'WARNING' END as status_indicator
-    FROM backup_mgmt.backup_jobs
-    WHERE start_time >= (NOW() - (days_back || ' days')::INTERVAL);
+    j := backup_mgmt.log_backup_start('nightly_full', 'custom', current_database(), '/backups/n1.dump', 'zstd:3');
+    PERFORM backup_mgmt.log_backup_complete(j, 52428800);
+    j := backup_mgmt.log_backup_start('nightly_full', 'custom', current_database(), '/backups/n2.dump', 'zstd:3');
+    PERFORM backup_mgmt.log_backup_complete(j, NULL, 'failed', 'pg_dump: error: connection to server lost');
+    j := backup_mgmt.log_backup_start('weekly_globals', 'globals', current_database(), '/backups/g1.sql', 'none');
+    PERFORM backup_mgmt.log_backup_complete(j, 4096);
+    -- an old completed backup that retention should expire
+    INSERT INTO backup_mgmt.backup_jobs (job_name, backup_type, database_name, start_time, end_time, status, file_size_bytes)
+    VALUES ('nightly_full', 'custom', current_database(), now() - interval '40 days',
+            now() - interval '40 days' + interval '3 minutes', 'completed', 50000000);
+END $$;
+SELECT job_name, backup_type, status, file_size_bytes, duration_seconds IS NOT NULL AS has_duration
+FROM backup_mgmt.backup_jobs ORDER BY job_id;
+SELECT * FROM backup_mgmt.backup_status_report(7);
+SELECT * FROM backup_mgmt.cleanup_old_backups(30);
+ROLLBACK;
 
-    -- Success rate
-    RETURN QUERY
-    SELECT
-        'Recent Backups'::TEXT,
-        'Success Rate'::TEXT,
-        ROUND(
-            (COUNT(*) FILTER (WHERE status = 'completed') * 100.0) /
-            NULLIF(COUNT(*), 0), 1
-        )::TEXT || '%' as metric_value,
-        CASE
-            WHEN COUNT(*) = 0 THEN 'NO DATA'
-            WHEN (COUNT(*) FILTER (WHERE status = 'completed') * 100.0) / COUNT(*) >= 95 THEN 'OK'
-            WHEN (COUNT(*) FILTER (WHERE status = 'completed') * 100.0) / COUNT(*) >= 80 THEN 'WARNING'
-            ELSE 'CRITICAL'
-        END as status_indicator
-    FROM backup_mgmt.backup_jobs
-    WHERE start_time >= (NOW() - (days_back || ' days')::INTERVAL);
-
-    -- Average backup size
-    RETURN QUERY
-    SELECT
-        'Storage Metrics'::TEXT,
-        'Average Backup Size'::TEXT,
-        pg_size_pretty(AVG(file_size_bytes)::BIGINT) as metric_value,
-        'INFO'::TEXT as status_indicator
-    FROM backup_mgmt.backup_jobs
-    WHERE status = 'completed'
-    AND file_size_bytes IS NOT NULL
-    AND start_time >= (NOW() - (days_back || ' days')::INTERVAL);
-
-    -- Total storage used
-    RETURN QUERY
-    SELECT
-        'Storage Metrics'::TEXT,
-        'Total Storage Used'::TEXT,
-        pg_size_pretty(SUM(file_size_bytes)) as metric_value,
-        'INFO'::TEXT as status_indicator
-    FROM backup_mgmt.backup_jobs
-    WHERE status = 'completed' AND file_size_bytes IS NOT NULL;
-END;
-$$ LANGUAGE plpgsql;
+\echo '== backup playbook complete =='
