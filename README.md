@@ -1,475 +1,159 @@
+<div align="center">
+
 # PostgreSQL Polaris
 
-A comprehensive PostgreSQL learning environment featuring real-world urban data scenarios, advanced patterns, and hands-on exercises designed to take you from beginner to expert.
-
-## Quick Start
-
-```bash
-# Clone and setup
-git clone https://github.com/SatvikPraveen/postgres-polaris.git
-cd postgres-polaris
-make bootstrap
-
-# Start the environment
-make up
-
-# Access database
-make psql
-# OR visit http://localhost:8080 (Adminer web interface)
-```
-
-## Learning Levels
-
-### Beginner (4-6 hours)
-
-Perfect for SQL newcomers and those refreshing fundamentals.
-
-1. **[Schema Design](sql/01_schema_design/)** - Urban data modeling and relationships
-2. **[Constraints & Indexes](sql/02_constraints_indexes/)** - Data integrity and performance fundamentals
-3. **[DML Queries](sql/03_dml_queries/)** - SELECT, GROUP BY, JOINs, and advanced querying
-4. **[Views & Materialized Views](sql/04_views_matviews/)** - Data abstraction and simplification
-
-### Intermediate (8-12 hours)
-
-For developers building database-backed applications.
-
-1. Complete Beginner Path
-2. **[Functions & Triggers](sql/05_functions_triggers/)** - Business logic automation with PL/pgSQL
-3. **[JSONB & Full-Text](sql/06_jsonb_fulltext/)** - Modern data patterns and search
-4. **[Geospatial](sql/07_geospatial/)** - PostGIS and location analytics
-5. **[Partitioning & Timeseries](sql/08_partitioning_timeseries/)** - Scaling strategies
-6. **[Data Movement](sql/09_data_movement/)** - COPY operations and foreign data wrappers
-
-### Advanced (15+ hours)
-
-For database administrators and system architects.
-
-1. Complete Intermediate Path
-2. **[Transactions & MVCC](sql/10_tx_mvcc_locks/)** - Concurrency control and isolation
-3. **[Performance Tuning](sql/11_perf_tuning/)** - Query optimization and statistics
-4. **[Security & RLS](sql/12_security_rls/)** - Multi-tenant security patterns
-5. **[Backup & Replication](sql/13_backup_replication/)** - High availability and disaster recovery
-6. **[Async Patterns](sql/14_async_patterns/)** - LISTEN/NOTIFY, advisory locks, and scheduling
-7. **[Testing & Quality](sql/15_testing_quality/)** - Data validation and regression testing
-8. **[Capstone Projects](sql/16_capstones/)** - Real-world analytical scenarios
-
-## Project Architecture
-
-```
-postgres-polaris/
-├── docker/                    # Complete containerized environment
-│   ├── docker-compose.yml     # Multi-service orchestration
-│   ├── Dockerfile             # Custom PostgreSQL with extensions
-│   ├── initdb/               # Database initialization scripts
-│   └── pgadmin_servers.json  # Pre-configured admin interface
-├── sql/                      # Progressive learning modules (16 total)
-│   ├── 00_init/             # Database initialization and setup
-│   ├── 01_schema_design/    # Urban data modeling foundations
-│   ├── 02_constraints_indexes/ # Data integrity and performance
-│   ├── 03_dml_queries/      # Advanced querying techniques
-│   ├── 04_views_matviews/   # Data abstraction layers
-│   ├── 05_functions_triggers/ # Business logic automation
-│   ├── 06_jsonb_fulltext/   # Document storage and search
-│   ├── 07_geospatial/       # PostGIS spatial analysis
-│   ├── 08_partitioning_timeseries/ # Scaling and time-based data
-│   ├── 09_data_movement/    # ETL and data integration
-│   ├── 10_tx_mvcc_locks/    # Concurrency and isolation
-│   ├── 11_perf_tuning/      # Query optimization mastery
-│   ├── 12_security_rls/     # Multi-tenant security
-│   ├── 13_backup_replication/ # High availability patterns
-│   ├── 14_async_patterns/   # Event-driven architectures
-│   ├── 15_testing_quality/  # Data validation and testing
-│   └── 16_capstones/        # Applied analytical projects
-├── data/                    # Urban simulation datasets
-│   ├── boundaries.geojson   # Geographic boundary data
-│   ├── documents.jsonb      # Sample document collections
-│   ├── seeds.csv           # Demographic and commercial data
-│   └── timeseries.csv      # Mobility and sensor data
-├── docs/                   # Comprehensive documentation
-│   ├── HOWTO_SETUP.md      # Detailed installation guide
-│   ├── LEARNING_PATHS.md   # Role-based learning recommendations
-│   ├── MODULE_MAP_EXERCISES.md # Exercise solutions and explanations
-│   ├── EXPLAIN_PLAN_LIBRARY.md # Query optimization reference
-│   └── TROUBLESHOOTING.md  # Common issues and solutions
-├── examples/               # Ready-to-run demonstrations
-│   ├── quick_demo.sql      # 10-minute introduction
-│   ├── analytics_showcase.sql # Business intelligence patterns
-│   ├── geospatial_showcase.sql # Location analysis examples
-│   ├── performance_tuning_showcase.sql # Optimization techniques
-│   └── security_showcase.sql # Multi-tenant security demos
-├── scripts/                # Automation and utilities
-│   ├── load_sample_data.sh # Data loading automation
-│   ├── backup_demo.sh      # Backup and restore examples
-│   ├── reset_db.sh         # Environment reset utility
-│   └── run_sql.sh          # Batch SQL execution
-└── tests/                  # Validation and benchmarks
-    ├── schema_validation.sql # Structure integrity tests
-    ├── data_integrity_checks.sql # Data quality validation
-    ├── performance_benchmarks.sql # Performance regression tests
-    └── regression_tests.sql # Functional regression suite
-```
-
-## Core Features
-
-**Realistic Urban Simulation**
-
-- Complete city ecosystem with interconnected data domains
-- 10,000+ citizens with demographic diversity and lifecycle events
-- Commerce network including merchants, orders, and supply chains
-- Transit system with real-time operations and capacity management
-- Geographic data with neighborhood boundaries and spatial relationships
-
-**Progressive Learning Architecture**
-
-- 16 comprehensive modules building from basics to expert-level patterns
-- Each module includes theory, practical exercises, and real-world applications
-- Detailed solutions with performance analysis and optimization techniques
-- Capstone projects integrating multiple advanced concepts
-
-**Production-Ready Patterns**
-
-- Enterprise security models including row-level security and audit trails
-- High-availability configurations with replication and backup strategies
-- Performance optimization techniques used in large-scale deployments
-- Data quality frameworks with automated monitoring and validation
-
-**Modern PostgreSQL Stack**
-
-- Latest PostgreSQL features including advanced indexing and parallel processing
-- PostGIS for comprehensive geospatial analysis and routing
-- Full-text search with custom configurations and ranking
-- JSONB document storage with validation and advanced querying
-
-## Urban Dataset Details
-
-**Civics Schema (Government Operations)**
-
-- **Citizens**: 10,000+ individuals with demographics, addresses, and registration history
-- **Permit Applications**: Construction, business, and event permits with approval workflows
-- **Tax Records**: Property assessments, payment history, and compliance tracking
-- **Voting Records**: Election participation and ballot preferences (anonymized)
-- **Property Ownership**: Real estate transactions and zoning classifications
-
-**Commerce Schema (Economic Activity)**
-
-- **Merchants**: Business directories with licenses, categories, and operational status
-- **Orders**: Transaction processing with payment methods and fulfillment tracking
-- **Inventory**: Product catalogs with pricing, availability, and supplier relationships
-- **Customer Analytics**: Purchase patterns, loyalty metrics, and segmentation data
-- **Supply Chain**: Vendor relationships and logistics tracking
-
-**Mobility Schema (Transportation Network)**
-
-- **Transit Routes**: Bus and rail lines with schedules and capacity specifications
-- **Trip Records**: Real-time operational data with delays and passenger counts
-- **Station Management**: Facility maintenance, accessibility, and usage statistics
-- **Sensor Data**: Traffic monitoring, environmental conditions, and infrastructure health
-- **Routing Analysis**: Optimal path calculation and network optimization
-
-**Geographic Schema (Spatial Infrastructure)**
-
-- **Neighborhood Boundaries**: Political districts and community areas with PostGIS polygons
-- **Road Networks**: Street layouts with intersection data and traffic classifications
-- **Points of Interest**: Schools, hospitals, parks, and commercial centers
-- **Zoning Data**: Land use classifications and development restrictions
-- **Environmental Layers**: Flood zones, green spaces, and conservation areas
-
-**Document Schema (Information Management)**
-
-- **Citizen Complaints**: Service requests with categorization and resolution tracking
-- **Policy Documents**: Regulations and procedures with full-text search capabilities
-- **Meeting Minutes**: Government proceedings with agenda tracking and decision logs
-- **Audit Trails**: System changes and user activities with temporal tracking
-- **Metadata Systems**: Document classification and relationship management
-
-## Available Commands
-
-```bash
-# Environment Management
-make bootstrap     # Complete initial setup with dependency checks
-make up           # Start all Docker services (PostgreSQL, Adminer, monitoring)
-make down         # Graceful shutdown of all containers
-make restart      # Full restart cycle for configuration changes
-make status       # Display service health and connection information
-
-# Database Operations
-make psql         # Interactive PostgreSQL client connection
-make reset        # Reset database to clean initial state with sample data
-make backup       # Create timestamped database backup
-make restore      # Restore from most recent backup file
-
-# Development Workflow
-make test         # Run comprehensive validation suite (schema, data, performance)
-make bench        # Execute performance benchmarks with timing analysis
-make lint         # Validate SQL code style and best practices
-make docs         # Generate documentation from code comments
-
-# Data Management
-make sample-data  # Regenerate realistic sample dataset
-make load-data    # Load additional datasets from data/ directory
-make export-data  # Export current data for external analysis
-make import-csv   # Bulk import CSV files with automatic schema detection
-
-# Monitoring and Analysis
-make logs         # Display aggregated service logs
-make stats        # Database statistics and performance metrics
-make explain      # Run EXPLAIN ANALYZE on sample queries
-make monitor      # Start real-time performance monitoring dashboard
-```
-
-## Quick Start Examples
-
-**Urban Analytics Query**
-
-```sql
--- Neighborhood economic analysis with spatial joins
-WITH neighborhood_commerce AS (
-    SELECT
-        n.name as neighborhood,
-        COUNT(DISTINCT m.merchant_id) as total_merchants,
-        COUNT(DISTINCT o.order_id) as total_orders,
-        SUM(o.total_amount) as total_revenue,
-        AVG(o.total_amount) as avg_order_value,
-        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.total_amount) as median_order_value
-    FROM geography.neighborhoods n
-    LEFT JOIN commerce.merchants m ON ST_Contains(n.boundary, m.location)
-    LEFT JOIN commerce.orders o ON m.merchant_id = o.merchant_id
-    WHERE o.order_date >= CURRENT_DATE - INTERVAL '1 year'
-    GROUP BY n.neighborhood_id, n.name
-),
-demographic_context AS (
-    SELECT
-        n.name as neighborhood,
-        COUNT(c.citizen_id) as population,
-        AVG(EXTRACT(YEAR FROM age(c.date_of_birth))) as avg_age,
-        AVG(c.annual_income) as avg_income,
-        COUNT(*) FILTER (WHERE c.employment_status = 'employed') * 100.0 / COUNT(*) as employment_rate
-    FROM geography.neighborhoods n
-    LEFT JOIN civics.citizens c ON ST_Contains(n.boundary, ST_Point(c.longitude, c.latitude))
-    GROUP BY n.neighborhood_id, n.name
-)
-SELECT
-    nc.neighborhood,
-    nc.total_merchants,
-    nc.total_orders,
-    ROUND(nc.total_revenue::NUMERIC, 2) as total_revenue,
-    ROUND(nc.avg_order_value::NUMERIC, 2) as avg_order_value,
-    dc.population,
-    ROUND(dc.avg_income::NUMERIC, 2) as avg_income,
-    ROUND(dc.employment_rate::NUMERIC, 1) as employment_rate_pct,
-    ROUND((nc.total_revenue / NULLIF(dc.population, 0))::NUMERIC, 2) as revenue_per_capita
-FROM neighborhood_commerce nc
-JOIN demographic_context dc ON nc.neighborhood = dc.neighborhood
-WHERE nc.total_orders > 0
-ORDER BY revenue_per_capita DESC;
-```
-
-**Real-Time Transit Performance Monitoring**
-
-```sql
--- Advanced transit delay analysis with predictive indicators
-WITH route_performance AS (
-    SELECT
-        t.route_id,
-        t.trip_date::DATE as service_date,
-        COUNT(*) as total_trips,
-        AVG(t.delay_minutes) as avg_delay,
-        STDDEV(t.delay_minutes) as delay_variance,
-        COUNT(*) FILTER (WHERE t.delay_minutes > 5) as delayed_trips,
-        COUNT(*) FILTER (WHERE t.delay_minutes > 15) as severely_delayed_trips,
-        MAX(t.delay_minutes) as max_delay
-    FROM mobility.trips t
-    WHERE t.trip_date >= CURRENT_DATE - INTERVAL '30 days'
-    GROUP BY t.route_id, t.trip_date::DATE
-),
-service_reliability AS (
-    SELECT
-        route_id,
-        AVG(avg_delay) as monthly_avg_delay,
-        AVG(delayed_trips::NUMERIC / total_trips) * 100 as on_time_performance,
-        CORR(extract(dow from service_date), avg_delay) as weekday_delay_correlation,
-        COUNT(*) FILTER (WHERE avg_delay > 10) as problem_days
-    FROM route_performance
-    GROUP BY route_id
-),
-current_status AS (
-    SELECT
-        t.route_id,
-        COUNT(*) as current_active_trips,
-        AVG(t.delay_minutes) as current_avg_delay,
-        COUNT(*) FILTER (WHERE t.delay_minutes > 10) as current_delayed_trips
-    FROM mobility.trips t
-    WHERE t.scheduled_arrival >= NOW() - INTERVAL '2 hours'
-    AND t.scheduled_arrival <= NOW() + INTERVAL '2 hours'
-    GROUP BY t.route_id
-)
-SELECT
-    sr.route_id,
-    ROUND(sr.monthly_avg_delay::NUMERIC, 2) as monthly_avg_delay_min,
-    ROUND(sr.on_time_performance::NUMERIC, 1) as on_time_performance_pct,
-    sr.problem_days as poor_performance_days,
-    cs.current_active_trips,
-    ROUND(cs.current_avg_delay::NUMERIC, 2) as current_avg_delay_min,
-    cs.current_delayed_trips,
-    CASE
-        WHEN sr.on_time_performance < 70 THEN 'CRITICAL'
-        WHEN sr.on_time_performance < 85 THEN 'NEEDS_ATTENTION'
-        WHEN sr.on_time_performance < 95 THEN 'GOOD'
-        ELSE 'EXCELLENT'
-    END as service_grade,
-    CASE
-        WHEN cs.current_avg_delay > sr.monthly_avg_delay * 1.5 THEN 'DEGRADED'
-        WHEN cs.current_avg_delay > sr.monthly_avg_delay * 1.2 THEN 'WATCH'
-        ELSE 'NORMAL'
-    END as current_status
-FROM service_reliability sr
-LEFT JOIN current_status cs ON sr.route_id = cs.route_id
-ORDER BY sr.on_time_performance ASC, sr.monthly_avg_delay DESC;
-```
-
-## Comprehensive Learning Objectives
-
-**Database Architecture Mastery**
-
-- Relational schema design with proper normalization and denormalization strategies
-- Constraint implementation for data integrity and business rule enforcement
-- Index design for optimal query performance across diverse workloads
-- Partitioning strategies for horizontal scaling and maintenance efficiency
-
-**Advanced SQL Proficiency**
-
-- Complex analytical queries using window functions and common table expressions
-- Recursive queries for hierarchical data and graph traversal problems
-- Advanced aggregation techniques including ROLLUP, CUBE, and custom aggregates
-- Query optimization techniques with EXPLAIN plan analysis and statistics management
-
-**Modern PostgreSQL Features**
-
-- JSONB document modeling with validation schemas and advanced indexing
-- Full-text search implementation with custom configurations and ranking algorithms
-- Array and range data types with specialized operators and indexing strategies
-- Advanced data types including network addresses, geometric shapes, and custom types
-
-**Geospatial Analysis Expertise**
-
-- PostGIS installation, configuration, and spatial data type management
-- Spatial indexing strategies (GiST, SP-GiST) for optimal geographic query performance
-- Complex spatial analysis including buffer operations, intersection analysis, and routing
-- Integration of geographic data with business intelligence and analytical workflows
-
-**Enterprise Performance Optimization**
-
-- Query performance analysis using EXPLAIN, EXPLAIN ANALYZE, and pg_stat_statements
-- Index optimization including partial indexes, expression indexes, and covering indexes
-- Database statistics management and automatic vacuum configuration
-- Connection pooling and resource management for high-concurrency applications
-
-**Production Security Implementation**
-
-- Row-level security policies for multi-tenant applications and data isolation
-- Authentication and authorization patterns including role-based access control
-- Data encryption at rest and in transit with proper key management
-- Audit logging and compliance frameworks for regulatory requirements
-
-**High Availability and Disaster Recovery**
-
-- Streaming replication configuration for read replicas and failover scenarios
-- Point-in-time recovery implementation with WAL archiving and restoration
-- Logical replication for selective data synchronization and migration strategies
-- Backup strategies including pg_dump, pg_basebackup, and continuous archiving
-
-**Operational Excellence**
-
-- Database monitoring with built-in statistics views and external tools integration
-- Automated maintenance tasks using pg_cron and custom scheduling frameworks
-- Performance regression testing and benchmark development
-- Capacity planning and resource allocation for growth scenarios
-
-## System Requirements and Setup
-
-**Minimum System Requirements**
-
-- **Operating System**: Docker-compatible platform (Linux, macOS, Windows with WSL2)
-- **Docker**: Version 20.10.0 or higher with Docker Compose 2.0+
-- **Memory**: 4GB RAM available for container allocation
-- **Storage**: 10GB free disk space for data, logs, and temporary files
-- **Network**: Internet connectivity for initial setup and extension downloads
-
-**Recommended Development Environment**
-
-- **Memory**: 8GB+ RAM for optimal performance during complex analytical queries
-- **Storage**: SSD storage for improved I/O performance during data loading operations
-- **CPU**: Multi-core processor for parallel query execution and concurrent user scenarios
-- **Network**: Stable broadband connection for documentation and community resource access
-
-**Production Deployment Considerations**
-
-- **Scaling**: Container orchestration support (Kubernetes, Docker Swarm) for production deployment
-- **Monitoring**: Integration points for Prometheus, Grafana, and other monitoring solutions
-- **Security**: Network isolation and firewall configuration for production security
-- **Backup**: External storage integration for automated backup and archival processes
-
-## Contributing and Community
-
-**Contribution Workflow**
-We welcome contributions that enhance the learning experience and expand the curriculum:
-
-1. **Fork and Branch**: Create your own fork and feature branch for development
-2. **Quality Standards**: Ensure all new content includes comprehensive documentation and testing
-3. **Code Review**: Submit detailed pull requests with clear descriptions of changes and improvements
-4. **Testing**: Add validation tests for new exercises and verify existing functionality remains intact
-
-**Content Guidelines**
-
-- **Exercise Design**: All new exercises must include problem statements, solution explanations, and performance analysis
-- **SQL Style**: Follow established coding conventions for readability and maintainability
-- **Documentation**: Update relevant documentation files when adding new modules or changing existing functionality
-- **Performance**: Include EXPLAIN output and optimization discussion for complex queries
-
-**Community Resources and Support**
-
-- **GitHub Issues**: Report bugs, request features, and discuss enhancements with the development community
-- **Documentation**: Comprehensive guides for setup, troubleshooting, and advanced configuration scenarios
-- **Examples Gallery**: Showcase of student projects and real-world implementations using PostgreSQL Polaris
-- **Discussion Forum**: Community-driven support for learning questions and technical discussions
-
-## License and Acknowledgments
-
-**Open Source License**
-This project is released under the MIT License, allowing for both educational and commercial use with proper attribution. See the [LICENSE](LICENSE) file for complete terms and conditions.
-
-**Community Acknowledgments**
-PostgreSQL Polaris builds upon the outstanding work of the global PostgreSQL community. Special recognition goes to:
-
-- **PostgreSQL Global Development Group** for creating and maintaining the world's most advanced open source database
-- **PostGIS Development Team** for enabling sophisticated geospatial analysis capabilities
-- **PostgreSQL Community** for extensive documentation, tutorials, and best practice sharing
-- **Contributors and Educators** who have shared knowledge and improved database education worldwide
+**A reproducible PostgreSQL laboratory: a 16-module curriculum, a synthetic city with planted ground truth, and the tooling to prove every result.**
+
+[![CI](https://github.com/SatvikPraveen/Postgres-Polaris/actions/workflows/ci.yml/badge.svg)](https://github.com/SatvikPraveen/Postgres-Polaris/actions/workflows/ci.yml)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17%20%7C%2018-336791?logo=postgresql&logoColor=white)
+![PostGIS](https://img.shields.io/badge/PostGIS-3.6-5A9E3C)
+![Tests](https://img.shields.io/badge/pgTAP-361%20tests-success)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+</div>
 
 ---
 
-## Ready to Begin Your PostgreSQL Journey?
+Most database tutorials stop at "the query ran". Polaris asks a stricter question: **did it return the right answer?**
 
-**Quick Setup Commands**
+The database ships with *Polaris City*, a deterministic synthetic city of about 420,000 rows. It covers residents, merchants, orders, transit, sensors, streets and 311 complaints, all generated inside PostgreSQL. Known effects are planted into the data, and anomalies are labelled. So a regression either recovers the true coefficient or it does not, and an anomaly detector gets a precision and recall, not an impression.
 
-```bash
-git clone https://github.com/SatvikPraveen/postgres-polaris.git
-cd postgres-polaris
-make bootstrap && make up
+```sql
+-- Does complaint resolution time depend on neighbourhood income?
+WITH c AS (
+    SELECT ln(extract(epoch FROM resolved_at - submitted_at) / 86400) AS log_days, category,
+           ln(n.median_income / 58000.0) / 0.35                        AS income_z
+    FROM documents.complaint_records JOIN geo.neighborhood_boundaries n USING (neighborhood_id)
+    WHERE resolved_at IS NOT NULL
+), within AS (
+    SELECT log_days - avg(log_days) OVER w AS y, income_z - avg(income_z) OVER w AS x
+    FROM c WINDOW w AS (PARTITION BY category)
+)
+SELECT round(regr_slope(y, x)::numeric, 3) AS estimated,
+       (SELECT true_value FROM meta.planted_effects
+         WHERE effect = 'complaint_resolution_income_gradient')     AS planted
+FROM within;
+```
+```
+ estimated | planted
+-----------+---------
+    -0.258 |   -0.25
 ```
 
-**Access Points**
+## Highlights
 
-- **Database Console**: `make psql` for direct PostgreSQL command line access
-- **Web Interface**: Visit http://localhost:8080 for Adminer database administration
-- **Documentation**: Browse the `docs/` directory for comprehensive learning guides
-- **Quick Demo**: Run `examples/quick_demo.sql` for a 10-minute introduction to key concepts
+- **Ground truth built in.** Ten planted effects in `meta.planted_effects` and 2,755 labelled anomalies in `meta.ground_truth`. The capstones score themselves against both.
+- **Deterministic at any scale.** A counter-based RNG makes the data depend only on `(scale, seed)`, not on plans, memory or parallelism. `make reproduce` proves it, and PostgreSQL 17 and 18 produce identical fingerprints.
+- **Verified, not just written.** 361 pgTAP tests cover schema, every constraint's rejection path, and data invariants. All 39 module files are checked to run standalone and idempotently on a fresh database, in CI, on two major versions.
+- **Modern PostgreSQL.** The curriculum uses PostgreSQL 17 and 18 features: `JSON_TABLE`, `MERGE ... RETURNING`, `COPY ... ON_ERROR`, `EXPLAIN (SERIALIZE, MEMORY)` and `pg_stat_io`. It also uses PostGIS 3.6, pg_partman 5, pg_cron, HypoPG, pgvector and pg_stat_kcache.
+- **Measured performance.** A pgbench harness records its full environment and reports throughput and latency percentiles with 95% confidence intervals.
 
-**Next Steps**
+## Quick start
 
-1. Review the [Setup Guide](docs/HOWTO_SETUP.md) for detailed installation instructions
-2. Choose your [Learning Path](docs/LEARNING_PATHS.md) based on your current experience level
-3. Start with [Module 01: Schema Design](sql/01_schema_design/) to understand the urban data model
-4. Join our community discussions and share your learning progress
+Requires Docker with Compose v2 and about 4 GB of RAM. It runs natively on x86-64 and Apple Silicon.
 
-Transform your PostgreSQL expertise from beginner to advanced practitioner with hands-on experience using realistic, complex datasets that mirror real-world analytical challenges.
+```bash
+git clone https://github.com/SatvikPraveen/Postgres-Polaris.git
+cd Postgres-Polaris
+make bootstrap      # create .env files, build the image
+make up             # start PostgreSQL 17; first boot generates the city (~30 s)
+make psql           # you are in
+```
+
+```sql
+SELECT generator_version, scale, seed, as_of FROM meta.dataset;
+\i /examples/quick_demo.sql          -- a five-minute guided tour
+```
+
+Run `make help` for every target. `make ui` adds Adminer (`:8080`) and pgAdmin (`:8081`).
+
+## Curriculum
+
+Each module is a set of commented, executable SQL files. Run one with `make module F=<path>`, or all of them with `make build-all`.
+
+| # | Module | What you build and measure |
+|---|---|---|
+| 01 | [Schema design](sql/01_schema_design) | Five normalised domains, enums, PostGIS geometry, JSONB documents |
+| 02 | [Constraints and indexes](sql/02_constraints_indexes) | CHECK, exclusion and deferrable constraints. B-tree, hash, GIN, GiST, SP-GiST, BRIN (minmax-multi) and bloom indexes. HypoPG what-if indexes |
+| 03 | [Queries](sql/03_dml_queries) | Joins, grouping sets, window frames (`GROUPS`, `EXCLUDE`), recursive CTEs with `SEARCH`/`CYCLE` |
+| 04 | [Views](sql/04_views_matviews) | Updatable and `security_invoker` views, materialized views with `REFRESH CONCURRENTLY` |
+| 05 | [Functions and triggers](sql/05_functions_triggers) | PL/pgSQL, `BEGIN ATOMIC`, generic audit triggers, transition tables, event triggers |
+| 06 | [JSONB and full-text](sql/06_jsonb_fulltext) | jsonpath, `JSON_TABLE`, GIN operator classes, ranked search, trigram typo tolerance |
+| 07 | [Geospatial](sql/07_geospatial) | Geodesic measurement, KNN, spatial indexes, Dijkstra and A* routing in SQL |
+| 08 | [Partitioning](sql/08_partitioning_timeseries) | Range, list and hash partitioning, pruning, `DETACH CONCURRENTLY`, pg_partman, exact time-bucket rollups |
+| 09 | [Data movement](sql/09_data_movement) | `COPY` with error tolerance, file_fdw, postgres_fdw federation with remote-plan inspection |
+| 10 | [Transactions and MVCC](sql/10_tx_mvcc_locks) | Isolation anomalies and the lock-conflict matrix measured live, page-level MVCC, freezing |
+| 11 | [Performance tuning](sql/11_perf_tuning) | Plan reading, join strategies, spills, extended statistics, an index advisor, autovacuum |
+| 12 | [Security](sql/12_security_rls) | Row-level security as real roles, column privileges, `security_barrier`, pgcrypto |
+| 13 | [Backup and replication](sql/13_backup_replication) | Logical decoding, filtered publications, PITR primitives, PostgreSQL 17 incremental backup |
+| 14 | [Async patterns](sql/14_async_patterns) | LISTEN/NOTIFY, advisory locks, `SKIP LOCKED` queues, pg_cron |
+| 15 | [Testing and quality](sql/15_testing_quality) | Data-quality rule engine, pgTAP, timing and plan-shape regression detection |
+| 16 | [Capstones](sql/16_capstones) | Anomaly detection scored by F1, service-equity estimation, 15-minute-city accessibility, monitoring |
+
+Suggested orders for developers, analysts, DBAs and researchers are in [docs/LEARNING_PATHS.md](docs/LEARNING_PATHS.md).
+
+## The dataset
+
+| Domain | Tables | Rows at scale 1 |
+|---|---|---:|
+| Civics | citizens, permits, tax payments, voting records | 50,083 |
+| Commerce | merchants, licences, orders, order items, payments | 212,371 |
+| Mobility | stations, hourly inventory, trip segments, sensor readings | 198,627 |
+| Geography | 24 neighbourhoods, 1,067 road segments, 600 points of interest | 1,691 |
+| Documents | 311 complaints with free text, versioned JSONB policies | 5,135 |
+
+Change the size with `make build SCALE=5 SEED=7`. The [dataset card](docs/DATASET.md) documents the generative model, every planted effect with its recovered estimate, the ground-truth labels and the known limitations.
+
+## Verification
+
+| Command | What it proves |
+|---|---|
+| `make test` | 361 pgTAP assertions: schema shape, every constraint rejects bad data with the right SQLSTATE, money adds up, no event after `as_of`, polygons tile the city |
+| `make test-modules` | All 39 module files run twice, with `ON_ERROR_STOP`, each on its own fresh database |
+| `make reproduce` | Two builds under different planner settings produce identical content fingerprints for every table |
+| `make backup` | A `pg_dump` restore is fingerprint-identical to its source |
+| `make check` | All of the above, plus linting. This is what CI runs on PostgreSQL 17 and 18 |
+
+## Benchmarks
+
+```bash
+make bench                                   # 5 workloads x 5 client counts x 3 repetitions
+CLIENTS="1 8" DURATION=20 REPS=5 make bench  # custom sweep
+```
+
+The workloads cover an OLTP checkout, point lookups, GiST nearest-neighbour search, ranked full-text search and an analytical rollup. Each run writes its environment, raw per-transaction latency samples and a report. The report gives mean TPS with Student-t confidence intervals and p50, p95 and p99 latency with distribution-free intervals. See [benchmarks/README.md](benchmarks/README.md).
+
+## Repository layout
+
+```
+docker/        image (PostgreSQL 17/18 + extensions), compose stack, server config, first-boot init
+sql/           build.sql entry point and modules 00-16
+tests/         pgTAP suites and benchmark queries
+examples/      runnable showcases (quick tour, analytics, geospatial, tuning, security)
+benchmarks/    pgbench workloads, runner, statistical analysis
+scripts/       build, run, module check, reproduce, verified backup, reset
+data/          small sample files used by the COPY and file_fdw lessons
+docs/          setup, troubleshooting, learning paths, exercises, plan library, dataset card
+```
+
+## Documentation
+
+- [Setup guide](docs/HOWTO_SETUP.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Learning paths](docs/LEARNING_PATHS.md)
+- [Exercises by module](docs/MODULE_MAP_EXERCISES.md)
+- [EXPLAIN plan library](docs/EXPLAIN_PLAN_LIBRARY.md)
+- [Dataset card](docs/DATASET.md)
+- [Reproducibility](docs/REPRODUCIBILITY.md)
+
+## Citing
+
+If you use Polaris in research or teaching, please cite it using [CITATION.cff](CITATION.cff). GitHub's "Cite this repository" button reads it. When reporting results, include `generator_version`, `scale` and `seed` from `meta.dataset`.
+
+## Contributing
+
+Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) lists the rules every module must satisfy; CI enforces them.
+
+## License
+
+[MIT](LICENSE) © Satvik Praveen
