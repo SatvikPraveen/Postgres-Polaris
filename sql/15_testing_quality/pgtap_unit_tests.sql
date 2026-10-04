@@ -1,631 +1,354 @@
 -- File: sql/15_testing_quality/pgtap_unit_tests.sql
--- Purpose: optional pgTAP unit tests for database functions and procedures
+-- Purpose: a real pgTAP unit-test suite for the Polaris schema, its constraints, its
+--          functions and the invariants of the frozen synthetic dataset.
+--
+-- What this module teaches
+--   * The pgTAP pattern:  BEGIN; SELECT plan(n); <tests>; SELECT * FROM finish(); ROLLBACK;
+--     Everything happens inside one transaction that is rolled back, so tests may insert,
+--     update and break things freely and leave the database untouched.
+--   * Four layers of database tests:
+--       1. schema tests      has_table, col_type_is, col_not_null, fk_ok, has_index ...
+--       2. constraint tests  throws_ok(sql, SQLSTATE) proves bad data is REJECTED;
+--                            lives_ok proves good data is accepted
+--       3. function tests    behaviour of geo.find_nearby_pois, meta.as_of() and a trigger
+--       4. data invariants   is / results_eq / set_eq on facts the dataset guarantees
+--   * plan(n) is a contract: if a test is added or silently skipped, finish() prints
+--     "# Looks like you planned n tests but ran m" and pg_prove marks the file as failed.
+--   * finish(true) additionally RAISES if any test failed, so a failing suite also stops
+--     `psql -v ON_ERROR_STOP=1` (a plan mismatch alone does not raise; pg_prove catches it).
+--
+-- How to run
+--   psql:      psql -X -v ON_ERROR_STOP=1 -d <db> -f sql/15_testing_quality/pgtap_unit_tests.sql
+--   pg_prove:  pg_prove -d <db> sql/15_testing_quality/pgtap_unit_tests.sql   (TAP harness, summarises)
+-- Requires the pgtap extension (installed in the Polaris image).
+
+CREATE EXTENSION IF NOT EXISTS pgtap;
+
+-- TAP output is easiest to read without psql's table decoration.
+\pset format unaligned
+\pset tuples_only on
+\pset pager off
+
+BEGIN;
+
+SELECT plan(85);
 
 -- =============================================================================
--- PGTAP EXTENSION SETUP
+-- 1. SCHEMA TESTS: the structure the curriculum relies on
 -- =============================================================================
 
--- Install pgTAP extension (requires superuser privileges)
--- CREATE EXTENSION IF NOT EXISTS pgtap;
+-- 1a. Schemas and core tables exist
+-- schemas_are() would demand an EXACT list and break as soon as a module adds a schema;
+-- has_schema() is the right tool for open-ended checks.
+SELECT has_schema('civics');
+SELECT has_schema('commerce');
+SELECT has_schema('mobility');
+SELECT has_schema('geo');
+SELECT has_schema('documents');
+SELECT has_schema('meta');
 
--- Create schema for test utilities
-CREATE SCHEMA IF NOT EXISTS testing;
+SELECT has_table('civics',   'citizens',                'civics.citizens exists');
+SELECT has_table('civics',   'permit_applications',     'civics.permit_applications exists');
+SELECT has_table('commerce', 'merchants',               'commerce.merchants exists');
+SELECT has_table('commerce', 'orders',                  'commerce.orders exists');
+SELECT has_table('commerce', 'order_items',             'commerce.order_items exists');
+SELECT has_table('commerce', 'payments',                'commerce.payments exists');
+SELECT has_table('mobility', 'sensor_readings',         'mobility.sensor_readings exists');
+SELECT has_table('geo',      'points_of_interest',      'geo.points_of_interest exists');
+SELECT has_table('geo',      'neighborhood_boundaries', 'geo.neighborhood_boundaries exists');
+SELECT has_table('meta',     'ground_truth',            'meta.ground_truth exists');
+SELECT hasnt_table('geo',    'neighborhoods',           'there is no geo.neighborhoods (use neighborhood_boundaries)');
 
--- Test execution log
-CREATE TABLE testing.test_execution_log (
-    execution_id BIGSERIAL PRIMARY KEY,
-    test_suite TEXT NOT NULL,
-    test_name TEXT NOT NULL,
-    test_status TEXT CHECK (test_status IN ('pass', 'fail', 'skip', 'error')) NOT NULL,
-    test_description TEXT,
-    error_message TEXT,
-    execution_time_ms INTEGER,
-    executed_at TIMESTAMPTZ DEFAULT NOW(),
-    executed_by TEXT DEFAULT current_user
-);
+-- 1b. Primary keys and column types (types are compared with format_type(), so
+--     typmods such as numeric(12,2) and geometry(Point,4326) must match exactly)
+SELECT has_pk('civics',   'citizens', 'citizens has a primary key');
+SELECT has_pk('commerce', 'orders',   'orders has a primary key');
+SELECT col_type_is('civics',   'citizens', 'home_geom',      'geometry(Point,4326)',     'citizens.home_geom is a 4326 point');
+SELECT hasnt_column('civics',  'citizens', 'latitude',       'citizens has no latitude column (location lives in home_geom)');
+SELECT col_type_is('commerce', 'orders',   'total_amount',   'numeric(12,2)',            'orders.total_amount is numeric(12,2)');
+SELECT col_type_is('commerce', 'orders',   'order_date',     'timestamp with time zone', 'orders.order_date is timestamptz');
+SELECT col_type_is('geo', 'neighborhood_boundaries', 'boundary_geom', 'geometry(Polygon,4326)', 'boundaries are 4326 polygons');
+SELECT col_not_null('civics',   'citizens', 'email',       'citizens.email is NOT NULL');
+SELECT col_not_null('commerce', 'orders',   'merchant_id', 'orders.merchant_id is NOT NULL');
+SELECT col_is_unique('commerce', 'orders',  'order_number', 'order_number is unique');
+SELECT enum_has_labels('documents', 'document_status',
+    ARRAY['draft', 'submitted', 'under_review', 'approved', 'resolved',
+          'published', 'archived', 'rejected', 'expired'],
+    'documents.document_status has the documented labels in order');
 
--- =============================================================================
--- TEST UTILITY FUNCTIONS
--- =============================================================================
+-- 1c. Foreign keys: fk_ok(fk_schema, fk_table, fk_column, pk_schema, pk_table, pk_column)
+SELECT fk_ok('commerce', 'orders',      'merchant_id',         'commerce', 'merchants', 'merchant_id');
+SELECT fk_ok('commerce', 'orders',      'customer_citizen_id', 'civics',   'citizens',  'citizen_id');
+SELECT fk_ok('commerce', 'order_items', 'order_id',            'commerce', 'orders',    'order_id');
+SELECT fk_ok('commerce', 'payments',    'order_id',            'commerce', 'orders',    'order_id');
+SELECT fk_ok('civics', 'permit_applications', 'citizen_id',    'civics',   'citizens',  'citizen_id');
 
--- Simple test assertion without pgTAP
-CREATE OR REPLACE FUNCTION testing.assert_equals(
-    expected ANYELEMENT,
-    actual ANYELEMENT,
-    test_name TEXT DEFAULT 'equality_test'
-)
-RETURNS BOOLEAN AS $$
-BEGIN
-    IF expected = actual OR (expected IS NULL AND actual IS NULL) THEN
-        INSERT INTO testing.test_execution_log (test_suite, test_name, test_status, test_description)
-        VALUES ('manual_tests', test_name, 'pass', 'Expected: ' || COALESCE(expected::TEXT, 'NULL') || ', Got: ' || COALESCE(actual::TEXT, 'NULL'));
-        RETURN TRUE;
-    ELSE
-        INSERT INTO testing.test_execution_log (test_suite, test_name, test_status, test_description, error_message)
-        VALUES ('manual_tests', test_name, 'fail', 'Assertion failed', 'Expected: ' || COALESCE(expected::TEXT, 'NULL') || ', Got: ' || COALESCE(actual::TEXT, 'NULL'));
-        RETURN FALSE;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
-
--- Test that value is not null
-CREATE OR REPLACE FUNCTION testing.assert_not_null(
-    value ANYELEMENT,
-    test_name TEXT DEFAULT 'not_null_test'
-)
-RETURNS BOOLEAN AS $$
-BEGIN
-    IF value IS NOT NULL THEN
-        INSERT INTO testing.test_execution_log (test_suite, test_name, test_status, test_description)
-        VALUES ('manual_tests', test_name, 'pass', 'Value is not null');
-        RETURN TRUE;
-    ELSE
-        INSERT INTO testing.test_execution_log (test_suite, test_name, test_status, test_description, error_message)
-        VALUES ('manual_tests', test_name, 'fail', 'Expected non-null value', 'Got NULL');
-        RETURN FALSE;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
-
--- Test that condition is true
-CREATE OR REPLACE FUNCTION testing.assert_true(
-    condition BOOLEAN,
-    test_name TEXT DEFAULT 'boolean_test'
-)
-RETURNS BOOLEAN AS $$
-BEGIN
-    IF condition THEN
-        INSERT INTO testing.test_execution_log (test_suite, test_name, test_status, test_description)
-        VALUES ('manual_tests', test_name, 'pass', 'Condition evaluated to true');
-        RETURN TRUE;
-    ELSE
-        INSERT INTO testing.test_execution_log (test_suite, test_name, test_status, test_description, error_message)
-        VALUES ('manual_tests', test_name, 'fail', 'Expected true condition', 'Condition was false or null');
-        RETURN FALSE;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
+-- 1d. Indexes the lessons depend on, including the access method
+SELECT has_index('commerce', 'orders', 'idx_orders_date', ARRAY['order_date'], 'orders has a btree on order_date');
+SELECT has_index('commerce', 'orders', 'idx_orders_merchant', 'orders has an index on merchant_id');
+SELECT has_index('geo', 'points_of_interest', 'idx_pois_geom', 'POIs have a spatial index');
+SELECT index_is_type('geo', 'points_of_interest', 'idx_pois_geom', 'gist', 'the POI spatial index is GiST');
+SELECT has_index('mobility', 'sensor_readings', 'idx_sensors_code_time',
+                 ARRAY['sensor_code', 'reading_time'], 'sensor readings indexed by (sensor_code, reading_time)');
 
 -- =============================================================================
--- CITIZEN MANAGEMENT TESTS
+-- 2. CONSTRAINT TESTS: invalid data must be rejected with the right SQLSTATE
 -- =============================================================================
+-- throws_ok runs the statement in a savepoint, so a failure does not abort the suite.
+-- SQLSTATEs: 23502 not_null, 23503 foreign_key, 23505 unique, 23514 check, 23P01 exclusion.
 
--- Test citizen registration function
-CREATE OR REPLACE FUNCTION testing.test_citizen_registration()
-RETURNS VOID AS $$
-DECLARE
-    test_citizen_id BIGINT;
-    citizen_count_before INTEGER;
-    citizen_count_after INTEGER;
-BEGIN
-    -- Setup
-    SELECT COUNT(*) INTO citizen_count_before FROM civics.citizens;
+-- A known-good fixture, created inside the rolled-back transaction.
+SELECT lives_ok($$
+    INSERT INTO civics.citizens (citizen_id, first_name, last_name, date_of_birth, email, street_address, zip_code)
+    VALUES (-1, 'Tap', 'Tester', '1990-01-01', 'tap.tester@example.org', '1 Test Way', '75101')
+$$, 'a valid citizen can be inserted');
 
-    -- Test citizen insertion
-    INSERT INTO civics.citizens (
-        first_name, last_name, email, phone,
-        street_address, city, state_province, postal_code,
-        date_of_birth, status
-    ) VALUES (
-        'Test', 'Citizen', 'test.citizen@test.com', '555-TEST-001',
-        '123 Test St', 'Test City', 'TS', '12345',
-        '1990-01-01', 'active'
-    ) RETURNING citizen_id INTO test_citizen_id;
+SELECT throws_ok($$
+    INSERT INTO civics.citizens (first_name, last_name, date_of_birth, email, street_address, zip_code)
+    VALUES ('Bad', 'Email', '1990-01-01', 'not-an-email', '1 Test Way', '75101')
+$$, '23514', NULL, 'chk_citizens_email rejects a malformed email');
 
-    -- Verify citizen was created
-    PERFORM testing.assert_not_null(test_citizen_id, 'citizen_registration_returns_id');
+SELECT throws_ok($$
+    INSERT INTO civics.citizens (first_name, last_name, date_of_birth, email, street_address, zip_code)
+    VALUES ('Future', 'Born', (CURRENT_DATE + 1), 'future@example.org', '1 Test Way', '75101')
+$$, '23514', NULL, 'chk_citizens_age rejects a birth date in the future');
 
-    -- Verify count increased
-    SELECT COUNT(*) INTO citizen_count_after FROM civics.citizens;
-    PERFORM testing.assert_equals(citizen_count_before + 1, citizen_count_after, 'citizen_count_increased');
+SELECT throws_ok($$
+    INSERT INTO civics.citizens (first_name, last_name, date_of_birth, email, street_address, zip_code)
+    VALUES ('Dup', 'Email', '1990-01-01', 'tap.tester@example.org', '2 Test Way', '75101')
+$$, '23505', NULL, 'duplicate email violates the unique constraint');
 
-    -- Verify citizen data
-    PERFORM testing.assert_equals('Test', first_name, 'citizen_first_name_correct')
-    FROM civics.citizens WHERE citizen_id = test_citizen_id;
+SELECT throws_ok($$
+    INSERT INTO civics.citizens (first_name, last_name, date_of_birth, street_address, zip_code)
+    VALUES ('No', 'Email', '1990-01-01', '1 Test Way', '75101')
+$$, '23502', NULL, 'email is required');
 
-    PERFORM testing.assert_equals('active', status, 'citizen_default_status')
-    FROM civics.citizens WHERE citizen_id = test_citizen_id;
+SELECT throws_ok($$
+    INSERT INTO commerce.orders (merchant_id, customer_citizen_id, order_number)
+    VALUES (987654321, -1, 'TAP-ORPHAN')
+$$, '23503', NULL, 'an order for an unknown merchant violates the FK');
 
-    -- Cleanup
-    DELETE FROM civics.citizens WHERE citizen_id = test_citizen_id;
-END;
-$$ LANGUAGE plpgsql;
+SELECT throws_ok($$
+    INSERT INTO commerce.orders (merchant_id, order_number, subtotal, tax_amount, tip_amount, total_amount)
+    VALUES (1, 'TAP-BADTOTAL', 10.00, 0.83, 0.00, 99.99)
+$$, '23514', NULL, 'chk_order_total: total must equal subtotal + tax + tip');
 
--- Test citizen status updates
-CREATE OR REPLACE FUNCTION testing.test_citizen_status_updates()
-RETURNS VOID AS $$
-DECLARE
-    test_citizen_id BIGINT;
-    old_status TEXT;
-    new_status TEXT;
-BEGIN
-    -- Create test citizen
-    INSERT INTO civics.citizens (
-        first_name, last_name, email, phone,
-        street_address, city, state_province, postal_code,
-        date_of_birth, status
-    ) VALUES (
-        'Status', 'Test', 'status.test@test.com', '555-TEST-002',
-        '456 Status St', 'Status City', 'ST', '67890',
-        '1985-05-15', 'pending'
-    ) RETURNING citizen_id INTO test_citizen_id;
+SELECT throws_ok($$
+    INSERT INTO commerce.orders (merchant_id, order_number, subtotal, total_amount)
+    VALUES (1, 'TAP-NEG', -5, -5)
+$$, '23514', NULL, 'chk_order_amounts rejects negative amounts');
 
-    -- Test status update
-    UPDATE civics.citizens
-    SET status = 'active'
-    WHERE citizen_id = test_citizen_id;
+SELECT throws_ok(
+    format($$INSERT INTO commerce.orders (merchant_id, order_number) VALUES (1, %L)$$,
+           (SELECT order_number FROM commerce.orders ORDER BY order_id LIMIT 1)),
+    '23505', NULL, 'order_number must be unique');
 
-    -- Verify status changed
-    SELECT status INTO new_status
-    FROM civics.citizens
-    WHERE citizen_id = test_citizen_id;
+SELECT throws_ok($$
+    INSERT INTO commerce.order_items (order_id, item_name, unit_price, quantity, line_total)
+    VALUES (1, 'Zero qty', 5.00, 0, 0.00)
+$$, '23514', NULL, 'chk_item_pricing rejects quantity 0');
 
-    PERFORM testing.assert_equals('active', new_status, 'citizen_status_update_works');
+SELECT throws_ok($$
+    INSERT INTO civics.permit_applications (citizen_id, permit_type, permit_number, description, fee_amount, fee_paid)
+    VALUES (-1, 'building', 'TAP-FEE', 'overpaid', 100, 150)
+$$, '23514', NULL, 'chk_permit_fees: fee_paid cannot exceed fee_amount');
 
-    -- Test invalid status (should fail)
-    BEGIN
-        UPDATE civics.citizens
-        SET status = 'invalid_status'
-        WHERE citizen_id = test_citizen_id;
+-- Exclusion constraint: two approved permits of the same type on the same parcel with
+-- overlapping validity periods are rejected (23P01), adjacent periods are fine.
+SELECT lives_ok($$
+    INSERT INTO civics.permit_applications
+        (citizen_id, permit_type, permit_number, description, parcel_id, status,
+         application_date, approval_date, expiration_date)
+    VALUES (-1, 'event', 'TAP-EX-1', 'first', 'TAP-PARCEL', 'approved',
+            '2025-03-01', '2025-03-02', '2025-06-01')
+$$, 'first approved permit on a parcel is accepted');
 
-        -- If we get here, test should fail
-        PERFORM testing.assert_true(FALSE, 'invalid_status_should_be_rejected');
-    EXCEPTION WHEN check_violation THEN
-        -- This is expected
-        PERFORM testing.assert_true(TRUE, 'invalid_status_properly_rejected');
-    END;
+SELECT throws_ok($$
+    INSERT INTO civics.permit_applications
+        (citizen_id, permit_type, permit_number, description, parcel_id, status,
+         application_date, approval_date, expiration_date)
+    VALUES (-1, 'event', 'TAP-EX-2', 'overlapping', 'TAP-PARCEL', 'approved',
+            '2025-04-01', '2025-04-02', '2025-08-01')
+$$, '23P01', NULL, 'excl_permit_overlap rejects an overlapping approved permit');
 
-    -- Cleanup
-    DELETE FROM civics.citizens WHERE citizen_id = test_citizen_id;
-END;
-$$ LANGUAGE plpgsql;
+SELECT lives_ok($$
+    INSERT INTO civics.permit_applications
+        (citizen_id, permit_type, permit_number, description, parcel_id, status,
+         application_date, approval_date, expiration_date)
+    VALUES (-1, 'event', 'TAP-EX-3', 'adjacent', 'TAP-PARCEL', 'approved',
+            '2025-05-30', '2025-06-01', '2025-09-01')
+$$, 'a permit starting exactly when the previous one expires is accepted ([) ranges)');
 
--- =============================================================================
--- PERMIT APPLICATION TESTS
--- =============================================================================
-
--- Test permit application workflow
-CREATE OR REPLACE FUNCTION testing.test_permit_application_workflow()
-RETURNS VOID AS $$
-DECLARE
-    test_citizen_id BIGINT;
-    test_permit_id BIGINT;
-    permit_status TEXT;
-BEGIN
-    -- Create test citizen
-    INSERT INTO civics.citizens (
-        first_name, last_name, email, phone,
-        street_address, city, state_province, postal_code,
-        date_of_birth, status
-    ) VALUES (
-        'Permit', 'Applicant', 'permit.applicant@test.com', '555-TEST-003',
-        '789 Permit Ave', 'Permit City', 'PC', '11111',
-        '1980-12-25', 'active'
-    ) RETURNING citizen_id INTO test_citizen_id;
-
-    -- Test permit application creation
-    INSERT INTO civics.permit_applications (
-        citizen_id, permit_type, description,
-        estimated_cost, requested_start_date, status
-    ) VALUES (
-        test_citizen_id, 'building', 'Test building permit',
-        5000.00, CURRENT_DATE + INTERVAL '30 days', 'pending'
-    ) RETURNING application_id INTO test_permit_id;
-
-    -- Verify permit was created
-    PERFORM testing.assert_not_null(test_permit_id, 'permit_application_created');
-
-    -- Test permit status progression
-    UPDATE civics.permit_applications
-    SET status = 'under_review'
-    WHERE application_id = test_permit_id;
-
-    SELECT status INTO permit_status
-    FROM civics.permit_applications
-    WHERE application_id = test_permit_id;
-
-    PERFORM testing.assert_equals('under_review', permit_status, 'permit_status_updated_to_under_review');
-
-    -- Test permit approval
-    UPDATE civics.permit_applications
-    SET status = 'approved',
-        approved_date = CURRENT_DATE,
-        final_cost = 4800.00
-    WHERE application_id = test_permit_id;
-
-    -- Verify approval fields
-    SELECT status INTO permit_status
-    FROM civics.permit_applications
-    WHERE application_id = test_permit_id;
-
-    PERFORM testing.assert_equals('approved', permit_status, 'permit_approved');
-
-    PERFORM testing.assert_not_null(approved_date, 'permit_approval_date_set')
-    FROM civics.permit_applications WHERE application_id = test_permit_id;
-
-    -- Cleanup
-    DELETE FROM civics.permit_applications WHERE application_id = test_permit_id;
-    DELETE FROM civics.citizens WHERE citizen_id = test_citizen_id;
-END;
-$$ LANGUAGE plpgsql;
+-- DEFERRABLE foreign key: orders.customer_citizen_id is checked at COMMIT when deferred,
+-- which lets a loader insert children before parents. Here the parent never arrives, so
+-- switching back to IMMEDIATE fires the pending check. Both statements run in one
+-- throws_ok so the deferred event and the error live in the same savepoint.
+SELECT throws_ok($$
+    SET CONSTRAINTS commerce.orders_customer_citizen_id_fkey DEFERRED;
+    INSERT INTO commerce.orders (merchant_id, customer_citizen_id, order_number)
+    VALUES (1, 987654321, 'TAP-DEFERRED');
+    SET CONSTRAINTS commerce.orders_customer_citizen_id_fkey IMMEDIATE;
+$$, '23503', NULL, 'a deferred FK violation surfaces when the constraint becomes IMMEDIATE');
 
 -- =============================================================================
--- COMMERCE SYSTEM TESTS
+-- 3. FUNCTION TESTS
 -- =============================================================================
 
--- Test merchant and order creation
-CREATE OR REPLACE FUNCTION testing.test_commerce_workflow()
-RETURNS VOID AS $$
-DECLARE
-    test_citizen_id BIGINT;
-    test_merchant_id BIGINT;
-    test_order_id BIGINT;
-    order_total DECIMAL(10,2);
-BEGIN
-    -- Create test citizen (merchant owner)
-    INSERT INTO civics.citizens (
-        first_name, last_name, email, phone,
-        street_address, city, state_province, postal_code,
-        date_of_birth, status
-    ) VALUES (
-        'Merchant', 'Owner', 'merchant.owner@test.com', '555-TEST-004',
-        '321 Business St', 'Commerce City', 'CC', '22222',
-        '1975-06-10', 'active'
-    ) RETURNING citizen_id INTO test_citizen_id;
+-- 3a. meta.as_of(): the dataset clock
+SELECT has_function('meta', 'as_of', ARRAY[]::name[], 'meta.as_of() exists');
+SELECT volatility_is('meta', 'as_of', ARRAY[]::name[], 'stable', 'meta.as_of() is STABLE (not IMMUTABLE: it reads a table)');
+SELECT is(meta.as_of(), '2025-12-31 23:59:59+00'::timestamptz, 'meta.as_of() is the end of 2025 UTC');
+SELECT cmp_ok(meta.as_of(), '<', now(), 'the dataset clock is in the past relative to the wall clock');
 
-    -- Create test merchant
-    INSERT INTO commerce.merchants (
-        owner_citizen_id, business_name, business_type,
-        street_address, city, state_province, postal_code,
-        business_phone, business_email, status
-    ) VALUES (
-        test_citizen_id, 'Test Merchant LLC', 'retail',
-        '321 Business St', 'Commerce City', 'CC', '22222',
-        '555-BIZ-TEST', 'business@testmerchant.com', 'active'
-    ) RETURNING merchant_id INTO test_merchant_id;
+-- 3b. geo.find_nearby_pois(lat, lng, radius_m, category)
+SELECT has_function('geo', 'find_nearby_pois',
+                    ARRAY['numeric', 'numeric', 'integer', 'geo.poi_category'],
+                    'geo.find_nearby_pois(numeric, numeric, integer, poi_category) exists');
+SELECT volatility_is('geo', 'find_nearby_pois',
+                     ARRAY['numeric', 'numeric', 'integer', 'geo.poi_category'], 'stable',
+                     'find_nearby_pois is STABLE (inlinable, usable in index conditions)');
 
-    -- Verify merchant creation
-    PERFORM testing.assert_not_null(test_merchant_id, 'merchant_created');
+-- Searching at a POI's own location returns that POI first, at distance 0.
+SELECT results_eq(
+    $$SELECT f.poi_id, f.distance_meters
+      FROM geo.points_of_interest p,
+           geo.find_nearby_pois(ST_Y(p.location_geom)::numeric, ST_X(p.location_geom)::numeric, 50) f
+      WHERE p.poi_id = (SELECT min(poi_id) FROM geo.points_of_interest WHERE is_active)
+      LIMIT 1$$,
+    $$SELECT min(poi_id), 0 FROM geo.points_of_interest WHERE is_active$$,
+    'searching at a POI returns that POI first with distance 0');
 
-    -- Create test order
-    INSERT INTO commerce.orders (
-        merchant_id, customer_citizen_id,
-        total_amount, tax_amount, payment_method,
-        delivery_address, order_status
-    ) VALUES (
-        test_merchant_id, test_citizen_id,
-        99.99, 8.25, '4***-****-****-1234',
-        '321 Business St, Commerce City, CC 22222', 'pending'
-    ) RETURNING order_id INTO test_order_id;
+-- Every result is within the radius, and results are ordered by distance.
+SELECT is_empty($$
+    SELECT 1 FROM geo.find_nearby_pois(32.99, -96.80, 1500) WHERE distance_meters > 1500
+$$, 'no result lies outside the requested radius');
 
-    -- Verify order creation
-    PERFORM testing.assert_not_null(test_order_id, 'order_created');
+-- Ordering: the function sorts by `geography <-> geography`, which uses a SPHERE, while
+-- distance_meters comes from ST_Distance on the SPHEROID. Neighbours a few metres apart
+-- can therefore swap places. The honest test is "ordered within a small tolerance".
+SELECT is_empty($$
+    SELECT 1
+    FROM (SELECT distance_meters AS d,
+                 max(distance_meters) OVER (ORDER BY ord ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS worst_prev
+          FROM geo.find_nearby_pois(32.99, -96.80, 1500)
+               WITH ORDINALITY AS t(poi_id, name, category, distance_meters, street_address, ord)) s
+    WHERE worst_prev - d > 10
+$$, 'results come back nearest first (within 10 m sphere-vs-spheroid tolerance)');
 
-    -- Test order total calculation
-    SELECT total_amount INTO order_total
-    FROM commerce.orders WHERE order_id = test_order_id;
+-- The function agrees with a brute-force geodesic query (same ids, any order).
+SELECT set_eq(
+    $$SELECT poi_id FROM geo.find_nearby_pois(32.99, -96.80, 1500)$$,
+    $$SELECT poi_id FROM geo.points_of_interest
+      WHERE is_active
+        AND ST_Distance(location_geom::geography, ST_SetSRID(ST_MakePoint(-96.80, 32.99), 4326)::geography) <= 1500$$,
+    'find_nearby_pois matches a brute-force ST_Distance scan');
 
-    PERFORM testing.assert_equals(99.99::DECIMAL(10,2), order_total, 'order_total_correct');
+SELECT is_empty($$
+    SELECT 1 FROM geo.find_nearby_pois(32.99, -96.80, 5000, 'park') WHERE category <> 'park'
+$$, 'the category filter returns only that category');
 
-    -- Test order status updates
-    UPDATE commerce.orders
-    SET order_status = 'processing'
-    WHERE order_id = test_order_id;
+SELECT is_empty($$
+    SELECT 1 FROM geo.find_nearby_pois(32.99, -96.80, 5000) f
+    JOIN geo.points_of_interest p USING (poi_id) WHERE NOT p.is_active
+$$, 'inactive POIs are never returned');
 
-    PERFORM testing.assert_equals('processing', order_status, 'order_status_updated')
-    FROM commerce.orders WHERE order_id = test_order_id;
+-- 3c. The order-totals triggers on commerce.order_items. They are STATEMENT-level triggers
+--     with transition tables (REFERENCING NEW/OLD TABLE), so a bulk insert recomputes each
+--     affected order once, and subtotal / tax / total are set in ONE UPDATE so the
+--     chk_order_total CHECK never sees an inconsistent intermediate row.
+SELECT has_trigger('commerce', 'order_items', 'trg_order_items_totals_ins', 'order_items has the insert totals trigger');
+SELECT has_trigger('commerce', 'order_items', 'trg_order_items_totals_del', 'order_items has the delete totals trigger');
+SELECT trigger_is('commerce', 'order_items', 'trg_order_items_totals_ins', 'commerce', 'update_order_totals',
+                  'the insert trigger calls commerce.update_order_totals()');
 
-    -- Cleanup
-    DELETE FROM commerce.orders WHERE order_id = test_order_id;
-    DELETE FROM commerce.merchants WHERE merchant_id = test_merchant_id;
-    DELETE FROM civics.citizens WHERE citizen_id = test_citizen_id;
-END;
-$$ LANGUAGE plpgsql;
+SELECT lives_ok($$
+    INSERT INTO commerce.orders (order_id, merchant_id, customer_citizen_id, order_number)
+    VALUES (-1, 1, -1, 'TAP-TRIGGER')
+$$, 'an empty order (all amounts 0) can be inserted');
 
--- =============================================================================
--- MESSAGING SYSTEM TESTS
--- =============================================================================
+SELECT lives_ok($$
+    INSERT INTO commerce.order_items (order_id, item_name, unit_price, quantity, line_total)
+    VALUES (-1, 'Widget', 10.00, 2, 20.00), (-1, 'Gadget', 5.50, 1, 5.50)
+$$, 'two line items can be added in one statement');
 
--- Test messaging pub/sub functionality
-CREATE OR REPLACE FUNCTION testing.test_messaging_system()
-RETURNS VOID AS $$
-DECLARE
-    subscription_result BOOLEAN;
-    message_id BIGINT;
-    subscriber_count INTEGER;
-BEGIN
-    -- Test subscription
-    subscription_result := messaging.subscribe_to_channel(
-        'test_channel',
-        'test_subscriber',
-        'live'
-    );
+SELECT results_eq(
+    $$SELECT subtotal, tax_amount, total_amount FROM commerce.orders WHERE order_id = -1$$,
+    $$VALUES (25.50::numeric(12,2), 2.10::numeric(12,2), 27.60::numeric(12,2))$$,
+    'after INSERT: subtotal 25.50, tax 2.10 (8.25%, rounded to cents), total 27.60');
 
-    PERFORM testing.assert_true(subscription_result, 'channel_subscription_successful');
+SELECT lives_ok($$DELETE FROM commerce.order_items WHERE order_id = -1 AND item_name = 'Gadget'$$,
+                'a line item can be removed');
 
-    -- Test message sending
-    message_id := messaging.notify_channel(
-        'test_channel',
-        'test_event',
-        json_build_object('test_data', 'test_value'),
-        'test_sender',
-        TRUE  -- persist message
-    );
-
-    PERFORM testing.assert_not_null(message_id, 'message_sent_with_persistence');
-
-    -- Verify message was logged
-    SELECT subscriber_count INTO subscriber_count
-    FROM messaging.notification_log
-    WHERE channel_name = 'test_channel'
-    AND event_type = 'test_event'
-    ORDER BY notification_sent_at DESC
-    LIMIT 1;
-
-    PERFORM testing.assert_equals(1, subscriber_count, 'subscriber_count_logged_correctly');
-
-    -- Test message queue processing
-    PERFORM messaging.process_queue_messages('test_channel', 10);
-
-    -- Verify message was processed
-    PERFORM testing.assert_equals('completed', status, 'queued_message_processed')
-    FROM messaging.message_queue
-    WHERE message_id = message_id;
-
-    -- Cleanup
-    DELETE FROM messaging.message_queue WHERE message_id = message_id;
-    DELETE FROM messaging.channel_subscribers WHERE channel_name = 'test_channel' AND subscriber_id = 'test_subscriber';
-    DELETE FROM messaging.notification_log WHERE channel_name = 'test_channel' AND event_type = 'test_event';
-END;
-$$ LANGUAGE plpgsql;
+SELECT results_eq(
+    $$SELECT subtotal, tax_amount, total_amount FROM commerce.orders WHERE order_id = -1$$,
+    $$VALUES (20.00::numeric(12,2), 1.65::numeric(12,2), 21.65::numeric(12,2))$$,
+    'after DELETE: totals are recomputed to 20.00 / 1.65 / 21.65');
 
 -- =============================================================================
--- COORDINATION SYSTEM TESTS
+-- 4. DATASET INVARIANTS (scale 1, seed 42)
 -- =============================================================================
+-- These pin down facts the lessons assume. If the generator changes, they fail loudly
+-- instead of letting lessons silently return different numbers.
 
--- Test advisory lock coordination
-CREATE OR REPLACE FUNCTION testing.test_coordination_locks()
-RETURNS VOID AS $$
-DECLARE
-    lock_acquired BOOLEAN;
-    lock_released BOOLEAN;
-    lock_id BIGINT;
-BEGIN
-    -- Test lock registration
-    lock_id := coordination.register_lock('test_coordination_lock', 'Test lock for unit testing');
-    PERFORM testing.assert_not_null(lock_id, 'lock_registration_returns_id');
+SELECT is((SELECT count(*) FROM civics.citizens WHERE citizen_id > 0), 10000::bigint, '10,000 citizens');
+SELECT is((SELECT count(*) FROM commerce.merchants), 500::bigint, '500 merchants');
+SELECT is((SELECT count(*) FROM commerce.orders WHERE order_id > 0), 50000::bigint, '50,000 orders');
+SELECT is((SELECT count(*) FROM geo.neighborhood_boundaries), 24::bigint, '24 neighbourhoods');
 
-    -- Test lock acquisition
-    lock_acquired := coordination.try_acquire_lock('test_coordination_lock', 'Unit test operation');
-    PERFORM testing.assert_true(lock_acquired, 'lock_acquisition_successful');
+-- The row counts recorded at generation time still match the tables (no drift).
+-- Tables that THIS transaction wrote fixtures into are excluded.
+SELECT set_eq(
+    $$SELECT table_name, row_count FROM meta.fingerprint()
+      WHERE table_name IN (SELECT jsonb_object_keys(row_counts) FROM meta.dataset WHERE dataset_id = 1)
+        AND table_name <> ALL (ARRAY['civics.citizens', 'commerce.orders', 'commerce.order_items',
+                                     'civics.permit_applications'])$$,
+    $$SELECT key, value::bigint FROM meta.dataset, jsonb_each_text(row_counts)
+      WHERE dataset_id = 1
+        AND key <> ALL (ARRAY['civics.citizens', 'commerce.orders', 'commerce.order_items',
+                              'civics.permit_applications'])$$,
+    'meta.dataset.row_counts agrees with meta.fingerprint() for untouched tables');
 
-    -- Test double acquisition (should fail)
-    lock_acquired := coordination.try_acquire_lock('test_coordination_lock', 'Second acquisition attempt');
-    PERFORM testing.assert_true(NOT lock_acquired, 'double_lock_acquisition_prevented');
+SELECT is((SELECT max(order_date) <= meta.as_of() FROM commerce.orders WHERE order_id > 0), true,
+          'no order is dated after meta.as_of()');
+SELECT is((SELECT max(reading_time) <= meta.as_of() FROM mobility.sensor_readings), true,
+          'no sensor reading is after meta.as_of()');
 
-    -- Test lock release
-    lock_released := coordination.release_lock('test_coordination_lock');
-    PERFORM testing.assert_true(lock_released, 'lock_release_successful');
+SELECT is_empty($$
+    SELECT 1 FROM commerce.orders
+    WHERE abs(total_amount - (subtotal + tax_amount + tip_amount)) >= 0.01
+$$, 'every order total equals subtotal + tax + tip');
 
-    -- Test lock acquisition after release (should work)
-    lock_acquired := coordination.try_acquire_lock('test_coordination_lock', 'Post-release acquisition');
-    PERFORM testing.assert_true(lock_acquired, 'lock_reacquisition_after_release');
+SELECT is_empty($$
+    SELECT 1 FROM civics.citizens c
+    WHERE c.citizen_id > 0
+      AND NOT EXISTS (SELECT 1 FROM geo.neighborhood_boundaries nb
+                      WHERE ST_Covers(nb.boundary_geom, c.home_geom)
+                        AND nb.neighborhood_id = substr(c.zip_code, 4, 2)::int)
+$$, 'every citizen lives inside the neighbourhood encoded by zip 751NN');
 
-    -- Final cleanup
-    PERFORM coordination.release_lock('test_coordination_lock');
-END;
-$$ LANGUAGE plpgsql;
+SELECT results_eq(
+    $$SELECT label, count(*) FROM meta.ground_truth GROUP BY label ORDER BY label$$,
+    $$VALUES ('dropout', 228::bigint), ('level_shift', 2038), ('order_amount_outlier', 103), ('spike', 386)$$,
+    'ground-truth label counts');
 
--- =============================================================================
--- PRIVACY AND SECURITY TESTS
--- =============================================================================
+SELECT is_empty($$
+    SELECT 1 FROM meta.ground_truth g
+    WHERE g.entity = 'commerce.orders'
+      AND NOT EXISTS (SELECT 1 FROM commerce.orders o WHERE o.order_id = g.entity_id)
+$$, 'every labelled order outlier refers to an existing order');
 
--- Test data masking functions
-CREATE OR REPLACE FUNCTION testing.test_privacy_masking()
-RETURNS VOID AS $$
-DECLARE
-    masked_ssn TEXT;
-    masked_email TEXT;
-    masked_phone TEXT;
-BEGIN
-    -- Test SSN masking for regular user
-    masked_ssn := privacy.mask_ssn('123-45-6789', 'citizen');
-    PERFORM testing.assert_equals('***-**-6789', masked_ssn, 'ssn_masking_for_citizen');
+-- The planted outliers are visibly large: their median amount is >10x the overall median.
+SELECT cmp_ok(
+    (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY o.total_amount)
+     FROM commerce.orders o JOIN meta.ground_truth g
+       ON g.entity = 'commerce.orders' AND g.label = 'order_amount_outlier' AND g.entity_id = o.order_id)::numeric,
+    '>',
+    10 * (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY total_amount) FROM commerce.orders)::numeric,
+    'labelled outliers have a median amount more than 10x the overall median');
 
-    -- Test SSN visibility for admin
-    masked_ssn := privacy.mask_ssn('123-45-6789', 'admin');
-    PERFORM testing.assert_equals('123-45-6789', masked_ssn, 'ssn_visible_for_admin');
+SELECT * FROM finish(true);   -- true: raise an exception if any test failed
 
-    -- Test email masking
-    masked_email := privacy.mask_email('john.doe@email.com', 'citizen');
-    PERFORM testing.assert_equals('j***@email.com', masked_email, 'email_masking_works');
+ROLLBACK;
 
-    -- Test phone masking
-    masked_phone := privacy.mask_phone('555-123-4567', 'citizen');
-    PERFORM testing.assert_equals('(***) ***-4567', masked_phone, 'phone_masking_works');
-
-    -- Test admin phone visibility
-    masked_phone := privacy.mask_phone('555-123-4567', 'admin');
-    PERFORM testing.assert_equals('555-123-4567', masked_phone, 'phone_visible_for_admin');
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- ANALYTICS TESTS
--- =============================================================================
-
--- Test analytics functions
-CREATE OR REPLACE FUNCTION testing.test_analytics_functions()
-RETURNS VOID AS $$
-DECLARE
-    stats_result JSONB;
-    citizen_count INTEGER;
-BEGIN
-    -- Test real-time stats function
-    stats_result := messaging.get_realtime_stats();
-    PERFORM testing.assert_not_null(stats_result, 'realtime_stats_returns_data');
-
-    -- Verify stats structure
-    PERFORM testing.assert_true(stats_result ? 'active_citizens', 'stats_contains_active_citizens');
-    PERFORM testing.assert_true(stats_result ? 'last_updated', 'stats_contains_timestamp');
-
-    -- Test citizen demographics (if we have test data)
-    SELECT COUNT(*) INTO citizen_count FROM civics.citizens WHERE status = 'active';
-
-    IF citizen_count > 0 THEN
-        PERFORM testing.assert_true(
-            (stats_result->>'active_citizens')::INTEGER >= 0,
-            'active_citizen_count_non_negative'
-        );
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- TEST SUITE RUNNERS
--- =============================================================================
-
--- Run all citizen-related tests
-CREATE OR REPLACE FUNCTION testing.run_citizen_tests()
-RETURNS TABLE(
-    test_suite TEXT,
-    tests_run INTEGER,
-    tests_passed INTEGER,
-    tests_failed INTEGER,
-    success_rate NUMERIC
-) AS $$
-DECLARE
-    initial_count INTEGER;
-    final_count INTEGER;
-BEGIN
-    -- Clear previous test results for this suite
-    DELETE FROM testing.test_execution_log WHERE test_suite = 'citizen_tests';
-
-    -- Get initial count
-    SELECT COUNT(*) INTO initial_count FROM testing.test_execution_log;
-
-    -- Run tests
-    PERFORM testing.test_citizen_registration();
-    PERFORM testing.test_citizen_status_updates();
-
-    -- Get final count and calculate results
-    SELECT COUNT(*) INTO final_count FROM testing.test_execution_log WHERE test_suite = 'manual_tests';
-
-    RETURN QUERY
-    SELECT
-        'citizen_tests'::TEXT as test_suite,
-        COUNT(*)::INTEGER as tests_run,
-        COUNT(*) FILTER (WHERE test_status = 'pass')::INTEGER as tests_passed,
-        COUNT(*) FILTER (WHERE test_status = 'fail')::INTEGER as tests_failed,
-        ROUND((COUNT(*) FILTER (WHERE test_status = 'pass')::NUMERIC / NULLIF(COUNT(*), 0)) * 100, 2) as success_rate
-    FROM testing.test_execution_log
-    WHERE test_suite = 'manual_tests'
-    AND executed_at >= NOW() - INTERVAL '1 minute';
-END;
-$$ LANGUAGE plpgsql;
-
--- Run all tests
-CREATE OR REPLACE FUNCTION testing.run_all_tests()
-RETURNS TABLE(
-    test_category TEXT,
-    test_function TEXT,
-    execution_status TEXT,
-    execution_time_ms INTEGER,
-    error_message TEXT
-) AS $$
-DECLARE
-    test_functions TEXT[] := ARRAY[
-        'testing.test_citizen_registration',
-        'testing.test_citizen_status_updates',
-        'testing.test_permit_application_workflow',
-        'testing.test_commerce_workflow',
-        'testing.test_messaging_system',
-        'testing.test_coordination_locks',
-        'testing.test_privacy_masking',
-        'testing.test_analytics_functions'
-    ];
-    func_name TEXT;
-    start_time TIMESTAMPTZ;
-    execution_time INTEGER;
-BEGIN
-    -- Clear previous test results
-    DELETE FROM testing.test_execution_log WHERE executed_at >= NOW() - INTERVAL '1 hour';
-
-    FOREACH func_name IN ARRAY test_functions LOOP
-        start_time := clock_timestamp();
-
-        BEGIN
-            EXECUTE 'SELECT ' || func_name || '()';
-            execution_time := EXTRACT(milliseconds FROM clock_timestamp() - start_time)::INTEGER;
-
-            RETURN QUERY SELECT
-                split_part(func_name, '.', 1) as test_category,
-                func_name as test_function,
-                'SUCCESS'::TEXT as execution_status,
-                execution_time as execution_time_ms,
-                NULL::TEXT as error_message;
-
-        EXCEPTION WHEN OTHERS THEN
-            execution_time := EXTRACT(milliseconds FROM clock_timestamp() - start_time)::INTEGER;
-
-            RETURN QUERY SELECT
-                split_part(func_name, '.', 1) as test_category,
-                func_name as test_function,
-                'ERROR'::TEXT as execution_status,
-                execution_time as execution_time_ms,
-                SQLERRM as error_message;
-        END;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-
--- Generate test report
-CREATE OR REPLACE FUNCTION testing.generate_test_report()
-RETURNS TABLE(
-    report_section TEXT,
-    metric_name TEXT,
-    metric_value TEXT,
-    status TEXT
-) AS $$
-BEGIN
-    -- Overall test statistics
-    RETURN QUERY
-    SELECT
-        'Test Summary'::TEXT as report_section,
-        'Total Tests Run'::TEXT as metric_name,
-        COUNT(*)::TEXT as metric_value,
-        'INFO'::TEXT as status
-    FROM testing.test_execution_log
-    WHERE executed_at >= NOW() - INTERVAL '1 hour';
-
-    RETURN QUERY
-    SELECT
-        'Test Summary'::TEXT,
-        'Success Rate'::TEXT,
-        COALESCE(
-            ROUND((COUNT(*) FILTER (WHERE test_status = 'pass')::NUMERIC /
-                   NULLIF(COUNT(*), 0)) * 100, 1)::TEXT || '%',
-            'No tests'
-        ) as metric_value,
-        CASE
-            WHEN COUNT(*) = 0 THEN 'NO DATA'
-            WHEN (COUNT(*) FILTER (WHERE test_status = 'pass')::NUMERIC / COUNT(*)) >= 0.95 THEN 'PASS'
-            WHEN (COUNT(*) FILTER (WHERE test_status = 'pass')::NUMERIC / COUNT(*)) >= 0.80 THEN 'WARNING'
-            ELSE 'FAIL'
-        END as status
-    FROM testing.test_execution_log
-    WHERE executed_at >= NOW() - INTERVAL '1 hour';
-
-    -- Failed tests
-    RETURN QUERY
-    SELECT
-        'Failed Tests'::TEXT,
-        test_name,
-        COALESCE(error_message, 'Test assertion failed'),
-        'FAIL'::TEXT
-    FROM testing.test_execution_log
-    WHERE test_status = 'fail'
-    AND executed_at >= NOW() - INTERVAL '1 hour'
-    ORDER BY executed_at DESC;
-END;
-$$ LANGUAGE plpgsql;
+\pset format aligned
+\pset tuples_only off

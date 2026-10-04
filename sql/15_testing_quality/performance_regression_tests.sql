@@ -1,676 +1,538 @@
 -- File: sql/15_testing_quality/performance_regression_tests.sql
--- Purpose: before/after plan comparisons for performance testing
+-- Purpose: query-performance regression testing inside PostgreSQL.
+--
+-- What this module teaches
+--   1. Measure, don't guess: run each benchmark query N times (after warm-up) and keep the
+--      whole sample. Report the MEDIAN (robust to one slow outlier) and the P95 (the tail
+--      users feel), never a single run or the mean alone.
+--   2. Two timing methods:
+--        'explain' - EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) -> "Execution Time".
+--                    Server-side executor time only; excludes parse/plan and sending rows.
+--        'clock'   - clock_timestamp() around EXECUTE in PL/pgSQL, wrapping the query in
+--                    SELECT count(*) so every row is produced. Includes planning.
+--   3. Plan-shape regression: store the plan's node tree (node type + index + relation) from
+--      EXPLAIN (FORMAT JSON). A changed shape is often the CAUSE of a timing regression and
+--      is deterministic, so it is a far less noisy CI signal than wall-clock time.
+--   4. A baseline table + a comparison function that flags regressions only when BOTH the
+--      relative threshold (e.g. 1.5x median) AND an absolute floor (e.g. +2 ms) are
+--      exceeded, so sub-millisecond jitter on fast queries does not page anyone.
+--   5. A controlled experiment: drop an index on a module-owned copy of commerce.orders and
+--      watch the suite flag the regression and the plan change, then restore it.
+--
+-- Standalone and idempotent. It never modifies base tables: the regression experiment runs
+-- on performance.orders_bench, a module-owned copy.
+--
+-- Fixed from the previous version of this file:
+--   * "cannot use subquery in column generation expression": a GENERATED column may only
+--     reference columns of its own row. The baseline/current ratio is now computed by the
+--     comparison function (and exposed by a view) instead of a generated column.
+--   * pg_stat_user_indexes has columns relname / indexrelname (not tablename / indexname),
+--     and the usage ratio divided by idx_tup_read without guarding against zero.
+--   * Recency filters used CURRENT_DATE against a dataset that ends at meta.as_of().
 
--- =============================================================================
--- PERFORMANCE TESTING INFRASTRUCTURE
--- =============================================================================
+\echo '== 15 / performance_regression_tests: baselines, percentiles and plan-shape checks =='
 
--- Create schema for performance monitoring
 CREATE SCHEMA IF NOT EXISTS performance;
+COMMENT ON SCHEMA performance IS 'Module 15: benchmark registry, timing baselines and regression checks.';
 
--- Query performance baseline
-CREATE TABLE performance.query_baselines (
-    baseline_id BIGSERIAL PRIMARY KEY,
-    test_name TEXT NOT NULL,
-    query_text TEXT NOT NULL,
-    baseline_execution_time_ms INTEGER NOT NULL,
-    baseline_plan_hash TEXT,
-    baseline_plan_text TEXT,
-    baseline_cost NUMERIC,
-    baseline_rows BIGINT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    created_by TEXT DEFAULT current_user,
-    is_active BOOLEAN DEFAULT TRUE
+-- =============================================================================
+-- 1. TABLES
+-- =============================================================================
+
+-- The benchmark registry: one row per query we care about.
+CREATE TABLE IF NOT EXISTS performance.benchmark_queries (
+    query_name   text PRIMARY KEY,
+    category     text NOT NULL DEFAULT 'general',
+    description  text,
+    query_text   text NOT NULL,
+    is_active    boolean NOT NULL DEFAULT true
 );
 
--- Performance test results
-CREATE TABLE performance.test_results (
-    result_id BIGSERIAL PRIMARY KEY,
-    baseline_id BIGINT REFERENCES performance.query_baselines(baseline_id),
-    test_name TEXT NOT NULL,
-    execution_time_ms INTEGER NOT NULL,
-    plan_hash TEXT,
-    plan_text TEXT,
-    estimated_cost NUMERIC,
-    actual_rows BIGINT,
-    performance_ratio NUMERIC GENERATED ALWAYS AS (
-        execution_time_ms::NUMERIC / (SELECT baseline_execution_time_ms FROM performance.query_baselines qb WHERE qb.baseline_id = test_results.baseline_id)
-    ) STORED,
-    test_status TEXT CHECK (test_status IN ('pass', 'warning', 'fail', 'error')) DEFAULT 'pass',
-    test_notes TEXT,
-    executed_at TIMESTAMPTZ DEFAULT NOW()
+-- Regression thresholds per category. Relative ratios catch proportional slowdowns; the
+-- absolute floors stop micro-second jitter on fast queries (and the naturally noisy tail
+-- of a 15-run sample) from being reported. Analytics queries get wider floors.
+CREATE TABLE IF NOT EXISTS performance.thresholds (
+    category             text PRIMARY KEY,
+    max_median_ratio     numeric NOT NULL DEFAULT 1.5,   -- current median / baseline median
+    min_median_delta_ms  numeric NOT NULL DEFAULT 2.0,   -- ... and at least this much slower
+    max_p95_ratio        numeric NOT NULL DEFAULT 2.5,
+    min_p95_delta_ms     numeric NOT NULL DEFAULT 10.0,
+    fail_on_plan_change  boolean NOT NULL DEFAULT false
 );
+INSERT INTO performance.thresholds AS t
+    (category, max_median_ratio, min_median_delta_ms, max_p95_ratio, min_p95_delta_ms, fail_on_plan_change)
+VALUES ('general',   1.5,  2.0, 2.5,  10.0, false),
+       ('lookup',    1.5,  2.0, 2.5,  10.0, true),   -- a point lookup must keep its index plan
+       ('analytics', 1.5, 25.0, 2.5, 100.0, false)
+ON CONFLICT (category) DO UPDATE
+    SET max_median_ratio = EXCLUDED.max_median_ratio, min_median_delta_ms = EXCLUDED.min_median_delta_ms,
+        max_p95_ratio = EXCLUDED.max_p95_ratio, min_p95_delta_ms = EXCLUDED.min_p95_delta_ms,
+        fail_on_plan_change = EXCLUDED.fail_on_plan_change;
 
--- Performance regression thresholds
-CREATE TABLE performance.regression_thresholds (
-    threshold_id BIGSERIAL PRIMARY KEY,
-    test_category TEXT NOT NULL,
-    warning_threshold NUMERIC DEFAULT 1.2, -- 20% slower = warning
-    failure_threshold NUMERIC DEFAULT 2.0, -- 100% slower = failure
-    created_at TIMESTAMPTZ DEFAULT NOW()
+-- Generated columns may only call IMMUTABLE functions. array_to_string() is STABLE in
+-- general (it calls element output functions), but for text[] it is deterministic, so we
+-- wrap it in a function we declare IMMUTABLE. Only do this when it is genuinely true.
+CREATE OR REPLACE FUNCTION performance.shape_hash(p_shape text[])
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$$ SELECT md5(array_to_string(p_shape, '|')) $$;
+
+-- Every measurement (baseline or check) lands here: the raw history.
+CREATE TABLE IF NOT EXISTS performance.measurements (
+    measurement_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    query_name     text NOT NULL REFERENCES performance.benchmark_queries (query_name) ON DELETE CASCADE,
+    purpose        text NOT NULL CHECK (purpose IN ('baseline', 'check')),
+    label          text,                              -- e.g. git sha, release, "after VACUUM"
+    method         text NOT NULL CHECK (method IN ('explain', 'clock')),
+    measured_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
+    n_runs         integer NOT NULL,
+    samples_ms     numeric[] NOT NULL,
+    median_ms      numeric(12,3) NOT NULL,
+    p95_ms         numeric(12,3) NOT NULL,
+    mean_ms        numeric(12,3) NOT NULL,
+    stddev_ms      numeric(12,3),
+    min_ms         numeric(12,3) NOT NULL,
+    max_ms         numeric(12,3) NOT NULL,
+    planning_ms    numeric(12,3),
+    total_cost     numeric,
+    plan_rows      numeric,
+    plan_shape     text[] NOT NULL,
+    plan_hash      text GENERATED ALWAYS AS (performance.shape_hash(plan_shape)) STORED,
+    server_version text NOT NULL DEFAULT current_setting('server_version')
+);
+-- (plan_hash IS a legal generated column: it only reads plan_shape from the same row,
+--  through an immutable function.)
+
+-- The active baseline per query: exactly one, enforced by a partial unique index.
+CREATE TABLE IF NOT EXISTS performance.baselines (
+    query_name     text NOT NULL REFERENCES performance.benchmark_queries (query_name) ON DELETE CASCADE,
+    measurement_id bigint NOT NULL REFERENCES performance.measurements (measurement_id) ON DELETE CASCADE,
+    is_active      boolean NOT NULL DEFAULT true,
+    created_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_baselines_active
+    ON performance.baselines (query_name) WHERE is_active;
+
+-- Verdicts of every comparison.
+CREATE TABLE IF NOT EXISTS performance.regression_results (
+    result_id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    query_name        text NOT NULL,
+    baseline_id       bigint NOT NULL REFERENCES performance.measurements (measurement_id) ON DELETE CASCADE,
+    check_id          bigint NOT NULL REFERENCES performance.measurements (measurement_id) ON DELETE CASCADE,
+    median_ratio      numeric(10,3),
+    p95_ratio         numeric(10,3),
+    plan_changed      boolean NOT NULL,
+    verdict           text NOT NULL,
+    checked_at        timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
 -- =============================================================================
--- PERFORMANCE TEST UTILITIES
+-- 2. HELPERS: plan shape and timing
 -- =============================================================================
 
--- Execute and measure query performance
-CREATE OR REPLACE FUNCTION performance.measure_query_performance(
-    test_name TEXT,
-    query_text TEXT,
-    iterations INTEGER DEFAULT 3
-)
-RETURNS TABLE(
-    avg_execution_time_ms INTEGER,
-    min_execution_time_ms INTEGER,
-    max_execution_time_ms INTEGER,
-    plan_hash TEXT,
-    plan_text TEXT,
-    estimated_cost NUMERIC,
-    actual_rows BIGINT
-) AS $$
+-- 2a. Flatten EXPLAIN (FORMAT JSON) into an ordered array of node labels.
+--     A recursive CTE walks "Plan" -> "Plans"[] and records each node's depth-first path,
+--     so the array order is deterministic. Each label is indented by depth.
+CREATE OR REPLACE FUNCTION performance.plan_shape(p_explain jsonb)
+RETURNS text[]
+LANGUAGE sql IMMUTABLE AS $$
+    WITH RECURSIVE node(n, path) AS (
+        SELECT p_explain -> 0 -> 'Plan', ARRAY[1]
+        UNION ALL
+        SELECT c.value, node.path || c.ord::int
+        FROM node, jsonb_array_elements(node.n -> 'Plans') WITH ORDINALITY AS c(value, ord)
+    )
+    SELECT array_agg(
+               repeat('  ', cardinality(path) - 1)
+               || (n ->> 'Node Type')
+               || coalesce(' using ' || (n ->> 'Index Name'), '')
+               || coalesce(' on ' || (n ->> 'Relation Name'), '')
+           ORDER BY path)
+    FROM node
+$$;
+COMMENT ON FUNCTION performance.plan_shape(jsonb)
+    IS 'Depth-first list of plan nodes (type, index, relation) from EXPLAIN (FORMAT JSON).';
+
+-- 2b. Run a query N times and summarise. Returns the raw sample too.
+CREATE OR REPLACE FUNCTION performance.time_query(
+    p_sql    text,
+    p_runs   integer DEFAULT 15,
+    p_warmup integer DEFAULT 2,
+    p_method text    DEFAULT 'explain')
+RETURNS TABLE (samples_ms numeric[], median_ms numeric, p95_ms numeric, mean_ms numeric,
+               stddev_ms numeric, min_ms numeric, max_ms numeric, planning_ms numeric,
+               total_cost numeric, plan_rows numeric, plan_shape text[])
+LANGUAGE plpgsql AS $$
 DECLARE
-    i INTEGER;
-    start_time TIMESTAMPTZ;
-    execution_time INTEGER;
-    execution_times INTEGER[] := '{}';
-    plan_info RECORD;
+    v_json    json;
+    v_plan    jsonb;
+    v_t0      timestamptz;
+    v_ms      numeric;
+    v_plan_ms numeric[] := '{}';
+    v_samples numeric[] := '{}';
+    v_dummy   bigint;
 BEGIN
-    -- Get query plan first
-    EXECUTE 'EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS) ' || query_text
-    INTO plan_info;
+    IF p_method NOT IN ('explain', 'clock') THEN
+        RAISE EXCEPTION 'unknown method %, use explain or clock', p_method;
+    END IF;
 
-    -- Extract plan information
-    SELECT
-        md5(query_text || plan_info::TEXT) as hash,
-        plan_info::TEXT as plan,
-        (plan_info::JSON->0->'Plan'->>'Total Cost')::NUMERIC as cost,
-        (plan_info::JSON->0->'Plan'->>'Actual Rows')::BIGINT as rows
-    INTO plan_hash, plan_text, estimated_cost, actual_rows;
+    -- The plan we store: plain EXPLAIN (no ANALYZE) is enough for the shape and cost.
+    EXECUTE 'EXPLAIN (FORMAT JSON) ' || p_sql INTO v_json;
+    v_plan := v_json::jsonb;
 
-    -- Run performance iterations
-    FOR i IN 1..iterations LOOP
-        start_time := clock_timestamp();
-        EXECUTE query_text;
-        execution_time := EXTRACT(milliseconds FROM clock_timestamp() - start_time)::INTEGER;
-        execution_times := execution_times || execution_time;
+    FOR i IN 1 .. p_warmup + p_runs LOOP
+        IF p_method = 'explain' THEN
+            -- TIMING OFF: no per-node clock calls, so the overhead stays small.
+            EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) ' || p_sql INTO v_json;
+            v_ms := (v_json::jsonb -> 0 ->> 'Execution Time')::numeric;
+            IF i > p_warmup THEN
+                v_plan_ms := v_plan_ms || (v_json::jsonb -> 0 ->> 'Planning Time')::numeric;
+            END IF;
+        ELSE
+            v_t0 := clock_timestamp();
+            EXECUTE 'SELECT count(*) FROM (' || p_sql || ') AS q' INTO v_dummy;
+            v_ms := extract(epoch FROM clock_timestamp() - v_t0) * 1000;
+        END IF;
+        IF i > p_warmup THEN                     -- warm-up runs fill the cache, then are discarded
+            v_samples := v_samples || round(v_ms, 3);
+        END IF;
     END LOOP;
 
-    -- Calculate statistics
-    RETURN QUERY SELECT
-        (SELECT AVG(unnest)::INTEGER FROM unnest(execution_times)) as avg_execution_time_ms,
-        (SELECT MIN(unnest) FROM unnest(execution_times)) as min_execution_time_ms,
-        (SELECT MAX(unnest) FROM unnest(execution_times)) as max_execution_time_ms,
-        plan_hash,
-        plan_text,
-        estimated_cost,
-        actual_rows;
+    RETURN QUERY
+    SELECT v_samples,
+           round(percentile_cont(0.50) WITHIN GROUP (ORDER BY s)::numeric, 3),
+           round(percentile_cont(0.95) WITHIN GROUP (ORDER BY s)::numeric, 3),
+           round(avg(s), 3), round(stddev_samp(s), 3), min(s), max(s),
+           (SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY p)::numeric, 3) FROM unnest(v_plan_ms) p),
+           (v_plan -> 0 -> 'Plan' ->> 'Total Cost')::numeric,
+           (v_plan -> 0 -> 'Plan' ->> 'Plan Rows')::numeric,
+           performance.plan_shape(v_plan)
+    FROM unnest(v_samples) AS s;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
--- Create performance baseline
-CREATE OR REPLACE FUNCTION performance.create_baseline(
-    test_name TEXT,
-    query_text TEXT,
-    iterations INTEGER DEFAULT 5
-)
-RETURNS BIGINT AS $$
+-- 2c. Measure a registered query and store the measurement.
+CREATE OR REPLACE FUNCTION performance.measure(
+    p_query_name text,
+    p_purpose    text    DEFAULT 'check',
+    p_runs       integer DEFAULT 15,
+    p_label      text    DEFAULT NULL,
+    p_method     text    DEFAULT 'explain')
+RETURNS bigint
+LANGUAGE plpgsql AS $$
 DECLARE
-    baseline_id BIGINT;
-    perf_result RECORD;
+    v_sql text;
+    t     record;
+    v_id  bigint;
 BEGIN
-    -- Measure current performance
-    SELECT * INTO perf_result
-    FROM performance.measure_query_performance(test_name, query_text, iterations)
-    LIMIT 1;
+    SELECT query_text INTO STRICT v_sql
+    FROM performance.benchmark_queries WHERE query_name = p_query_name;
 
-    -- Create baseline
-    INSERT INTO performance.query_baselines (
-        test_name, query_text, baseline_execution_time_ms,
-        baseline_plan_hash, baseline_plan_text,
-        baseline_cost, baseline_rows
-    ) VALUES (
-        test_name, query_text, perf_result.avg_execution_time_ms,
-        perf_result.plan_hash, perf_result.plan_text,
-        perf_result.estimated_cost, perf_result.actual_rows
-    ) RETURNING query_baselines.baseline_id INTO baseline_id;
+    SELECT * INTO t FROM performance.time_query(v_sql, p_runs, 2, p_method);
 
-    RETURN baseline_id;
+    INSERT INTO performance.measurements
+        (query_name, purpose, label, method, n_runs, samples_ms, median_ms, p95_ms, mean_ms,
+         stddev_ms, min_ms, max_ms, planning_ms, total_cost, plan_rows, plan_shape)
+    VALUES (p_query_name, p_purpose, p_label, p_method, p_runs, t.samples_ms, t.median_ms, t.p95_ms,
+            t.mean_ms, t.stddev_ms, t.min_ms, t.max_ms, t.planning_ms, t.total_cost, t.plan_rows,
+            t.plan_shape)
+    RETURNING measurement_id INTO v_id;
+    RETURN v_id;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
--- Run performance test against baseline
-CREATE OR REPLACE FUNCTION performance.run_performance_test(
-    test_name TEXT,
-    iterations INTEGER DEFAULT 3
-)
-RETURNS TABLE(
-    result_id BIGINT,
-    baseline_execution_ms INTEGER,
-    current_execution_ms INTEGER,
-    performance_ratio NUMERIC,
-    test_status TEXT,
-    plan_changed BOOLEAN
-) AS $$
+-- 2d. Capture (or replace) the baseline for one query, or for all active queries.
+CREATE OR REPLACE FUNCTION performance.capture_baselines(
+    p_query_name text DEFAULT NULL,
+    p_runs       integer DEFAULT 15,
+    p_label      text DEFAULT 'baseline')
+RETURNS TABLE (query_name text, median_ms numeric, p95_ms numeric, plan_nodes integer)
+LANGUAGE plpgsql AS $$
 DECLARE
-    baseline_record RECORD;
-    perf_result RECORD;
-    test_status TEXT;
-    plan_changed BOOLEAN;
-    warning_threshold NUMERIC := 1.2;
-    failure_threshold NUMERIC := 2.0;
-    result_id BIGINT;
+    q    record;
+    v_id bigint;
 BEGIN
-    -- Get baseline
-    SELECT * INTO baseline_record
-    FROM performance.query_baselines
-    WHERE performance.query_baselines.test_name = run_performance_test.test_name
-    AND is_active = TRUE
-    ORDER BY created_at DESC
-    LIMIT 1;
+    FOR q IN SELECT b.query_name FROM performance.benchmark_queries b
+             WHERE b.is_active AND (p_query_name IS NULL OR b.query_name = p_query_name)
+             ORDER BY b.query_name
+    LOOP
+        v_id := performance.measure(q.query_name, 'baseline', p_runs, p_label);
+        UPDATE performance.baselines b SET is_active = false
+         WHERE b.query_name = q.query_name AND b.is_active;
+        INSERT INTO performance.baselines (query_name, measurement_id) VALUES (q.query_name, v_id);
 
-    IF baseline_record IS NULL THEN
-        RAISE EXCEPTION 'No baseline found for test: %', test_name;
-    END IF;
-
-    -- Get thresholds
-    SELECT rt.warning_threshold, rt.failure_threshold
-    INTO warning_threshold, failure_threshold
-    FROM performance.regression_thresholds rt
-    WHERE rt.test_category = 'general'
-    LIMIT 1;
-
-    -- Measure current performance
-    SELECT * INTO perf_result
-    FROM performance.measure_query_performance(
-        test_name,
-        baseline_record.query_text,
-        iterations
-    ) LIMIT 1;
-
-    -- Determine test status
-    IF perf_result.avg_execution_time_ms::NUMERIC / baseline_record.baseline_execution_time_ms >= failure_threshold THEN
-        test_status := 'fail';
-    ELSIF perf_result.avg_execution_time_ms::NUMERIC / baseline_record.baseline_execution_time_ms >= warning_threshold THEN
-        test_status := 'warning';
-    ELSE
-        test_status := 'pass';
-    END IF;
-
-    -- Check if plan changed
-    plan_changed := (perf_result.plan_hash != baseline_record.baseline_plan_hash);
-
-    -- Record test result
-    INSERT INTO performance.test_results (
-        baseline_id, test_name, execution_time_ms,
-        plan_hash, plan_text, estimated_cost, actual_rows,
-        test_status, test_notes
-    ) VALUES (
-        baseline_record.baseline_id, test_name, perf_result.avg_execution_time_ms,
-        perf_result.plan_hash, perf_result.plan_text,
-        perf_result.estimated_cost, perf_result.actual_rows,
-        test_status, CASE WHEN plan_changed THEN 'Plan changed' ELSE NULL END
-    ) RETURNING test_results.result_id INTO result_id;
-
-    RETURN QUERY SELECT
-        result_id,
-        baseline_record.baseline_execution_time_ms,
-        perf_result.avg_execution_time_ms,
-        perf_result.avg_execution_time_ms::NUMERIC / baseline_record.baseline_execution_time_ms,
-        test_status,
-        plan_changed;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- PREDEFINED PERFORMANCE TESTS
--- =============================================================================
-
--- Citizen lookup performance test
-CREATE OR REPLACE FUNCTION performance.test_citizen_lookup()
-RETURNS VOID AS $$
-BEGIN
-    PERFORM performance.run_performance_test('citizen_lookup_by_email');
-END;
-$$ LANGUAGE plpgsql;
-
--- Complex analytics query test
-CREATE OR REPLACE FUNCTION performance.test_analytics_queries()
-RETURNS VOID AS $$
-BEGIN
-    PERFORM performance.run_performance_test('citizen_demographics_summary');
-    PERFORM performance.run_performance_test('permit_trend_analysis');
-    PERFORM performance.run_performance_test('commerce_performance_summary');
-END;
-$$ LANGUAGE plpgsql;
-
--- Join performance tests
-CREATE OR REPLACE FUNCTION performance.test_join_performance()
-RETURNS VOID AS $$
-BEGIN
-    PERFORM performance.run_performance_test('citizen_permit_join');
-    PERFORM performance.run_performance_test('merchant_order_join');
-    PERFORM performance.run_performance_test('multi_table_analytics_join');
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- PERFORMANCE TEST SETUP
--- =============================================================================
-
--- Setup standard performance test baselines
-CREATE OR REPLACE FUNCTION performance.setup_performance_baselines()
-RETURNS TEXT AS $$
-DECLARE
-    baseline_count INTEGER := 0;
-    result_msg TEXT;
-BEGIN
-    -- Citizen lookup by email
-    PERFORM performance.create_baseline(
-        'citizen_lookup_by_email',
-        'SELECT * FROM civics.citizens WHERE email = ''john.doe@email.com'' LIMIT 1'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Citizen demographics summary
-    PERFORM performance.create_baseline(
-        'citizen_demographics_summary',
-        'SELECT
-            city,
-            COUNT(*) as citizen_count,
-            AVG(EXTRACT(year FROM age(date_of_birth))) as avg_age,
-            COUNT(*) FILTER (WHERE status = ''active'') as active_count
-        FROM civics.citizens
-        WHERE status IN (''active'', ''inactive'')
-        GROUP BY city
-        ORDER BY citizen_count DESC'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Permit trend analysis
-    PERFORM performance.create_baseline(
-        'permit_trend_analysis',
-        'SELECT
-            DATE_TRUNC(''month'', submitted_date) as month,
-            permit_type,
-            COUNT(*) as applications,
-            COUNT(*) FILTER (WHERE status = ''approved'') as approved,
-            AVG(estimated_cost) as avg_cost
-        FROM civics.permit_applications
-        WHERE submitted_date >= CURRENT_DATE - INTERVAL ''1 year''
-        GROUP BY DATE_TRUNC(''month'', submitted_date), permit_type
-        ORDER BY month DESC, applications DESC'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Commerce performance summary
-    PERFORM performance.create_baseline(
-        'commerce_performance_summary',
-        'SELECT
-            m.business_name,
-            COUNT(o.order_id) as total_orders,
-            SUM(o.total_amount) as total_revenue,
-            AVG(o.total_amount) as avg_order_value
-        FROM commerce.merchants m
-        LEFT JOIN commerce.orders o ON m.merchant_id = o.merchant_id
-        WHERE o.order_date >= CURRENT_DATE - INTERVAL ''3 months''
-        GROUP BY m.merchant_id, m.business_name
-        ORDER BY total_revenue DESC NULLS LAST'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Citizen-permit join
-    PERFORM performance.create_baseline(
-        'citizen_permit_join',
-        'SELECT
-            c.first_name, c.last_name, c.city,
-            COUNT(pa.application_id) as permit_count,
-            SUM(pa.estimated_cost) as total_estimated_cost
-        FROM civics.citizens c
-        LEFT JOIN civics.permit_applications pa ON c.citizen_id = pa.citizen_id
-        WHERE c.status = ''active''
-        GROUP BY c.citizen_id, c.first_name, c.last_name, c.city
-        HAVING COUNT(pa.application_id) > 0
-        ORDER BY permit_count DESC'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Merchant-order join
-    PERFORM performance.create_baseline(
-        'merchant_order_join',
-        'SELECT
-            m.business_name,
-            c.first_name || '' '' || c.last_name as customer_name,
-            o.order_date,
-            o.total_amount,
-            o.order_status
-        FROM commerce.orders o
-        JOIN commerce.merchants m ON o.merchant_id = m.merchant_id
-        JOIN civics.citizens c ON o.customer_citizen_id = c.citizen_id
-        WHERE o.order_date >= CURRENT_DATE - INTERVAL ''1 month''
-        ORDER BY o.order_date DESC'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Multi-table analytics join
-    PERFORM performance.create_baseline(
-        'multi_table_analytics_join',
-        'SELECT
-            c.city,
-            COUNT(DISTINCT c.citizen_id) as citizens,
-            COUNT(DISTINCT pa.application_id) as permits,
-            COUNT(DISTINCT o.order_id) as orders,
-            SUM(o.total_amount) as total_commerce_value
-        FROM civics.citizens c
-        LEFT JOIN civics.permit_applications pa ON c.citizen_id = pa.citizen_id
-        LEFT JOIN commerce.orders o ON c.citizen_id = o.customer_citizen_id
-        WHERE c.status = ''active''
-        GROUP BY c.city
-        ORDER BY citizens DESC'
-    );
-    baseline_count := baseline_count + 1;
-
-    -- Insert default thresholds
-    INSERT INTO performance.regression_thresholds (test_category, warning_threshold, failure_threshold)
-    VALUES ('general', 1.2, 2.0)
-    ON CONFLICT DO NOTHING;
-
-    result_msg := 'Created ' || baseline_count || ' performance test baselines';
-    RETURN result_msg;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- PERFORMANCE REGRESSION MONITORING
--- =============================================================================
-
--- Run all performance regression tests
-CREATE OR REPLACE FUNCTION performance.run_regression_suite()
-RETURNS TABLE(
-    test_name TEXT,
-    baseline_time_ms INTEGER,
-    current_time_ms INTEGER,
-    performance_ratio NUMERIC,
-    status TEXT,
-    plan_changed BOOLEAN,
-    recommendation TEXT
-) AS $$
-DECLARE
-    test_names TEXT[] := ARRAY[
-        'citizen_lookup_by_email',
-        'citizen_demographics_summary',
-        'permit_trend_analysis',
-        'commerce_performance_summary',
-        'citizen_permit_join',
-        'merchant_order_join',
-        'multi_table_analytics_join'
-    ];
-    test_name_item TEXT;
-    test_result RECORD;
-BEGIN
-    FOREACH test_name_item IN ARRAY test_names LOOP
-        BEGIN
-            SELECT * INTO test_result
-            FROM performance.run_performance_test(test_name_item, 3)
-            LIMIT 1;
-
-            RETURN QUERY SELECT
-                test_name_item,
-                test_result.baseline_execution_ms,
-                test_result.current_execution_ms,
-                test_result.performance_ratio,
-                test_result.test_status,
-                test_result.plan_changed,
-                CASE
-                    WHEN test_result.test_status = 'fail' THEN 'CRITICAL: Investigate query plan and indexes'
-                    WHEN test_result.test_status = 'warning' THEN 'Monitor: Performance degraded'
-                    WHEN test_result.plan_changed THEN 'Review: Query plan changed'
-                    ELSE 'OK: Performance within acceptable range'
-                END as recommendation;
-
-        EXCEPTION WHEN OTHERS THEN
-            RETURN QUERY SELECT
-                test_name_item,
-                NULL::INTEGER,
-                NULL::INTEGER,
-                NULL::NUMERIC,
-                'error'::TEXT,
-                NULL::BOOLEAN,
-                'ERROR: ' || SQLERRM;
-        END;
+        RETURN QUERY
+        SELECT m.query_name, m.median_ms, m.p95_ms, cardinality(m.plan_shape)
+        FROM performance.measurements m WHERE m.measurement_id = v_id;
     END LOOP;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 -- =============================================================================
--- INDEX EFFECTIVENESS ANALYSIS
+-- 3. THE COMPARISON FUNCTION
 -- =============================================================================
-
--- Analyze index usage and effectiveness
-CREATE OR REPLACE FUNCTION performance.analyze_index_effectiveness()
-RETURNS TABLE(
-    schema_name NAME,
-    table_name NAME,
-    index_name NAME,
-    index_scans BIGINT,
-    tuples_read BIGINT,
-    tuples_fetched BIGINT,
-    index_size TEXT,
-    usage_ratio NUMERIC,
-    recommendation TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        schemaname::NAME,
-        tablename::NAME,
-        indexname::NAME,
-        idx_scan as index_scans,
-        idx_tup_read as tuples_read,
-        idx_tup_fetch as tuples_fetched,
-        pg_size_pretty(pg_relation_size(indexrelid)) as index_size,
-        CASE
-            WHEN idx_scan > 0 THEN ROUND((idx_tup_fetch::NUMERIC / idx_tup_read) * 100, 2)
-            ELSE 0
-        END as usage_ratio,
-        CASE
-            WHEN idx_scan = 0 THEN 'Consider dropping - unused index'
-            WHEN idx_tup_read > idx_tup_fetch * 100 THEN 'Low efficiency - review index design'
-            WHEN idx_scan < 100 THEN 'Low usage - monitor or consider dropping'
-            ELSE 'Good usage pattern'
-        END as recommendation
-    FROM pg_stat_user_indexes
-    WHERE schemaname IN ('civics', 'commerce', 'documents', 'analytics')
-    ORDER BY idx_scan DESC, pg_relation_size(indexrelid) DESC;
-END;
-$$ LANGUAGE plpgsql;
-
--- =============================================================================
--- QUERY PLAN COMPARISON
--- =============================================================================
-
--- Compare query plans between baseline and current
-CREATE OR REPLACE FUNCTION performance.compare_query_plans(
-    test_name TEXT
-)
-RETURNS TABLE(
-    comparison_aspect TEXT,
-    baseline_value TEXT,
-    current_value TEXT,
-    difference TEXT,
-    impact TEXT
-) AS $$
+-- Verdicts:
+--   REGRESSION    median or p95 ratio over threshold AND the absolute slowdown >= floor,
+--                 or (for categories with fail_on_plan_change) the plan shape changed
+--   PLAN_CHANGED  timing within limits but the plan is different: review it
+--   IMPROVED      median at least 1/ratio faster (consider re-baselining)
+--   OK            everything within limits
+CREATE OR REPLACE FUNCTION performance.check_regressions(
+    p_query_name text DEFAULT NULL,
+    p_runs       integer DEFAULT 15,
+    p_label      text DEFAULT NULL)
+RETURNS TABLE (query_name text, base_median_ms numeric, cur_median_ms numeric, median_ratio numeric,
+               base_p95_ms numeric, cur_p95_ms numeric, p95_ratio numeric,
+               plan_changed boolean, verdict text, nodes_removed text[], nodes_added text[])
+LANGUAGE plpgsql AS $$
 DECLARE
-    baseline_record RECORD;
-    current_record RECORD;
+    q       record;
+    b       performance.measurements%ROWTYPE;
+    c       performance.measurements%ROWTYPE;
+    th      performance.thresholds%ROWTYPE;
+    v_cid   bigint;
+    v_mr    numeric;
+    v_pr    numeric;
+    v_chg   boolean;
+    v_verd  text;
 BEGIN
-    -- Get baseline
-    SELECT * INTO baseline_record
-    FROM performance.query_baselines
-    WHERE performance.query_baselines.test_name = compare_query_plans.test_name
-    AND is_active = TRUE
-    ORDER BY created_at DESC
-    LIMIT 1;
+    FOR q IN SELECT bq.query_name, bq.category, bl.measurement_id
+             FROM performance.benchmark_queries bq
+             JOIN performance.baselines bl ON bl.query_name = bq.query_name AND bl.is_active
+             WHERE bq.is_active AND (p_query_name IS NULL OR bq.query_name = p_query_name)
+             ORDER BY bq.query_name
+    LOOP
+        SELECT * INTO b FROM performance.measurements m WHERE m.measurement_id = q.measurement_id;
+        SELECT * INTO th FROM performance.thresholds t WHERE t.category = q.category;
+        IF NOT FOUND THEN
+            SELECT * INTO th FROM performance.thresholds t WHERE t.category = 'general';
+        END IF;
 
-    -- Get latest test result
-    SELECT * INTO current_record
-    FROM performance.test_results tr
-    JOIN performance.query_baselines qb ON tr.baseline_id = qb.baseline_id
-    WHERE qb.test_name = compare_query_plans.test_name
-    ORDER BY tr.executed_at DESC
-    LIMIT 1;
+        v_cid := performance.measure(q.query_name, 'check', p_runs, p_label, b.method);
+        SELECT * INTO c FROM performance.measurements m WHERE m.measurement_id = v_cid;
 
-    IF baseline_record IS NULL OR current_record IS NULL THEN
-        RETURN QUERY SELECT
-            'Error'::TEXT,
-            'No data available'::TEXT,
-            'No data available'::TEXT,
-            'N/A'::TEXT,
-            'Run baseline and test first'::TEXT;
-        RETURN;
-    END IF;
+        v_mr  := round(c.median_ms / nullif(b.median_ms, 0), 3);
+        v_pr  := round(c.p95_ms / nullif(b.p95_ms, 0), 3);
+        v_chg := c.plan_hash IS DISTINCT FROM b.plan_hash;
 
-    -- Compare execution time
-    RETURN QUERY SELECT
-        'Execution Time'::TEXT,
-        baseline_record.baseline_execution_time_ms || ' ms',
-        current_record.execution_time_ms || ' ms',
-        CASE
-            WHEN current_record.execution_time_ms > baseline_record.baseline_execution_time_ms
-            THEN '+' || (current_record.execution_time_ms - baseline_record.baseline_execution_time_ms) || ' ms'
-            ELSE (current_record.execution_time_ms - baseline_record.baseline_execution_time_ms) || ' ms'
-        END,
-        CASE
-            WHEN current_record.performance_ratio > 2.0 THEN 'Critical regression'
-            WHEN current_record.performance_ratio > 1.2 THEN 'Performance warning'
-            WHEN current_record.performance_ratio < 0.8 THEN 'Performance improvement'
-            ELSE 'Acceptable'
-        END;
+        v_verd := CASE
+            WHEN (v_mr > th.max_median_ratio AND c.median_ms - b.median_ms >= th.min_median_delta_ms)
+              OR (v_pr > th.max_p95_ratio    AND c.p95_ms    - b.p95_ms    >= th.min_p95_delta_ms)
+              OR (v_chg AND th.fail_on_plan_change)            THEN 'REGRESSION'
+            WHEN v_chg                                         THEN 'PLAN_CHANGED'
+            WHEN v_mr < 1 / th.max_median_ratio
+             AND b.median_ms - c.median_ms >= th.min_median_delta_ms THEN 'IMPROVED'
+            ELSE 'OK' END;
 
-    -- Compare estimated cost
-    RETURN QUERY SELECT
-        'Estimated Cost'::TEXT,
-        COALESCE(baseline_record.baseline_cost::TEXT, 'Unknown'),
-        COALESCE(current_record.estimated_cost::TEXT, 'Unknown'),
-        CASE
-            WHEN baseline_record.baseline_cost IS NOT NULL AND current_record.estimated_cost IS NOT NULL
-            THEN (current_record.estimated_cost - baseline_record.baseline_cost)::TEXT
-            ELSE 'Cannot compare'
-        END,
-        CASE
-            WHEN baseline_record.baseline_cost IS NOT NULL AND current_record.estimated_cost IS NOT NULL
-            THEN
-                CASE
-                    WHEN current_record.estimated_cost > baseline_record.baseline_cost * 2 THEN 'Cost increased significantly'
-                    WHEN current_record.estimated_cost < baseline_record.baseline_cost * 0.5 THEN 'Cost improved significantly'
-                    ELSE 'Cost change within normal range'
-                END
-            ELSE 'No cost comparison available'
-        END;
+        INSERT INTO performance.regression_results
+            (query_name, baseline_id, check_id, median_ratio, p95_ratio, plan_changed, verdict)
+        VALUES (q.query_name, b.measurement_id, c.measurement_id, v_mr, v_pr, v_chg, v_verd);
 
-    -- Compare row counts
-    RETURN QUERY SELECT
-        'Actual Rows'::TEXT,
-        COALESCE(baseline_record.baseline_rows::TEXT, 'Unknown'),
-        COALESCE(current_record.actual_rows::TEXT, 'Unknown'),
-        CASE
-            WHEN baseline_record.baseline_rows IS NOT NULL AND current_record.actual_rows IS NOT NULL
-            THEN (current_record.actual_rows - baseline_record.baseline_rows)::TEXT
-            ELSE 'Cannot compare'
-        END,
-        'Data volume comparison';
-
-    -- Plan change status
-    RETURN QUERY SELECT
-        'Query Plan'::TEXT,
-        'Baseline plan',
-        'Current plan',
-        CASE
-            WHEN baseline_record.baseline_plan_hash = current_record.plan_hash THEN 'Unchanged'
-            ELSE 'Plan changed'
-        END,
-        CASE
-            WHEN baseline_record.baseline_plan_hash = current_record.plan_hash THEN 'Same optimization path'
-            ELSE 'Different execution strategy - review plan details'
-        END;
+        query_name := q.query_name;
+        base_median_ms := b.median_ms; cur_median_ms := c.median_ms; median_ratio := v_mr;
+        base_p95_ms := b.p95_ms;       cur_p95_ms := c.p95_ms;       p95_ratio := v_pr;
+        plan_changed := v_chg; verdict := v_verd;
+        -- shape diff, ignoring indentation: which node labels disappeared / appeared
+        nodes_removed := ARRAY(SELECT ltrim(x) FROM unnest(b.plan_shape) x
+                               EXCEPT SELECT ltrim(y) FROM unnest(c.plan_shape) y ORDER BY 1);
+        nodes_added   := ARRAY(SELECT ltrim(y) FROM unnest(c.plan_shape) y
+                               EXCEPT SELECT ltrim(x) FROM unnest(b.plan_shape) x ORDER BY 1);
+        RETURN NEXT;
+    END LOOP;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 -- =============================================================================
--- PERFORMANCE REPORTING
+-- 4. BENCHMARK QUERIES
+-- =============================================================================
+-- Recency windows use meta.as_of(), the dataset clock (the data ends 2025-12-31).
+INSERT INTO performance.benchmark_queries (query_name, category, description, query_text) VALUES
+('citizen_by_email', 'lookup',
+ 'Point lookup through the unique index on email.',
+ $q$SELECT citizen_id, first_name, last_name FROM civics.citizens
+    WHERE email = 'michelle.roberts.1@mail.polaris.example'$q$),
+('orders_last_7d', 'lookup',
+ 'Range scan on idx_orders_date for the final week of the dataset.',
+ $q$SELECT order_id, merchant_id, total_amount FROM commerce.orders
+    WHERE order_date >= meta.as_of() - interval '7 days'$q$),
+('sensor_last_day', 'lookup',
+ 'Latest 24 h of one sensor via the (sensor_code, reading_time DESC) index.',
+ $q$SELECT reading_time, reading_value FROM mobility.sensor_readings
+    WHERE sensor_code = 'TRF-001' AND reading_time >= meta.as_of() - interval '1 day'
+    ORDER BY reading_time DESC$q$),
+('pois_within_1km', 'lookup',
+ 'Geodesic radius search through geo.find_nearby_pois.',
+ $q$SELECT poi_id, distance_meters FROM geo.find_nearby_pois(32.99, -96.80, 1000)$q$),
+('merchant_revenue_90d', 'analytics',
+ 'Join + aggregate: top merchants by revenue over the last 90 days.',
+ $q$SELECT m.merchant_id, m.business_name, count(*) AS orders, sum(o.total_amount) AS revenue
+    FROM commerce.orders o JOIN commerce.merchants m USING (merchant_id)
+    WHERE o.order_date >= meta.as_of() - interval '90 days' AND o.status = 'delivered'
+    GROUP BY m.merchant_id, m.business_name
+    ORDER BY revenue DESC LIMIT 20$q$)
+ON CONFLICT (query_name) DO UPDATE
+    SET category = EXCLUDED.category, description = EXCLUDED.description,
+        query_text = EXCLUDED.query_text, is_active = true;
+
+-- =============================================================================
+-- 5. CAPTURE BASELINES, THEN CHECK AGAINST THEM
+-- =============================================================================
+-- Statistics first: plans (and therefore baselines) depend on them.
+ANALYZE civics.citizens, commerce.orders, commerce.merchants, mobility.sensor_readings, geo.points_of_interest;
+
+\echo '-- 5a. baselines (median / p95 of 15 runs after 2 warm-ups)'
+SELECT query_name, median_ms, p95_ms, plan_nodes
+FROM performance.capture_baselines(p_query_name => NULL, p_runs => 15, p_label => 'module-15 baseline')
+WHERE query_name <> 'bench_orders_by_customer'
+ORDER BY query_name;
+
+\echo '-- 5b. the stored plan shape of one baseline'
+SELECT unnest(m.plan_shape) AS plan_node
+FROM performance.baselines b JOIN performance.measurements m USING (measurement_id)
+WHERE b.query_name = 'merchant_revenue_90d' AND b.is_active;
+
+-- Nothing changed, so every verdict should be OK. On a busy machine timings still move
+-- (a 15-run p95 is especially noisy); that is exactly what the absolute floors absorb.
+\echo '-- 5c. immediate re-check: expect OK'
+SELECT query_name, base_median_ms, cur_median_ms, median_ratio, p95_ratio, plan_changed, verdict
+FROM performance.check_regressions(p_label => 'no change')
+WHERE query_name <> 'bench_orders_by_customer'
+ORDER BY query_name;
+
+-- =============================================================================
+-- 6. CONTROLLED EXPERIMENT: A MIGRATION DROPS AN INDEX
+-- =============================================================================
+-- Module-owned copy of commerce.orders so the base table is never touched.
+\echo '-- 6. regression experiment on performance.orders_bench'
+DROP TABLE IF EXISTS performance.orders_bench CASCADE;
+CREATE TABLE performance.orders_bench AS
+SELECT order_id, merchant_id, customer_citizen_id, order_date, status, total_amount
+FROM commerce.orders;
+ALTER TABLE performance.orders_bench ADD PRIMARY KEY (order_id);
+CREATE INDEX idx_orders_bench_customer ON performance.orders_bench (customer_citizen_id);
+ANALYZE performance.orders_bench;
+
+INSERT INTO performance.benchmark_queries (query_name, category, description, query_text) VALUES
+('bench_orders_by_customer', 'lookup',
+ 'All orders of one customer (index on customer_citizen_id). Category lookup: a plan change
+  alone is a regression, so the verdict does not depend on how fast this machine scans.',
+ $q$SELECT order_id, order_date, total_amount FROM performance.orders_bench
+    WHERE customer_citizen_id = 4242 ORDER BY order_date$q$)
+ON CONFLICT (query_name) DO UPDATE
+    SET category = EXCLUDED.category, description = EXCLUDED.description,
+        query_text = EXCLUDED.query_text, is_active = true;
+
+SELECT query_name, median_ms, p95_ms, plan_nodes
+FROM performance.capture_baselines('bench_orders_by_customer', 15, 'with index');
+
+-- "Release 2" drops the index (a cleanup script thought it was unused) ...
+DROP INDEX performance.idx_orders_bench_customer;
+
+\echo '-- 6a. after DROP INDEX: expect REGRESSION with Seq Scan replacing the index scan'
+SELECT query_name, base_median_ms, cur_median_ms, median_ratio, plan_changed, verdict,
+       nodes_removed, nodes_added
+FROM performance.check_regressions('bench_orders_by_customer', 15, 'index dropped');
+
+-- ... and the fix restores it.
+CREATE INDEX idx_orders_bench_customer ON performance.orders_bench (customer_citizen_id);
+ANALYZE performance.orders_bench;
+
+\echo '-- 6b. after re-creating the index: expect OK again'
+SELECT query_name, base_median_ms, cur_median_ms, median_ratio, plan_changed, verdict
+FROM performance.check_regressions('bench_orders_by_customer', 15, 'index restored');
+
+-- Same experiment without DDL: planner switches simulate "the index became unusable".
+-- SET only affects this session; RESET puts it back.
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+\echo '-- 6c. index scans disabled by planner settings: the lookup category fails on plan change alone'
+SELECT query_name, median_ratio, plan_changed, verdict, nodes_added
+FROM performance.check_regressions('citizen_by_email', 15, 'enable_indexscan=off');
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- =============================================================================
+-- 7. TIMING METHODS COMPARED
+-- =============================================================================
+-- clock_timestamp() includes planning and PL/pgSQL overhead; EXPLAIN ANALYZE reports only
+-- executor time. Compare both on the same query; never mix methods within one baseline
+-- (check_regressions re-measures with the baseline's method for that reason).
+\echo '-- 7. explain vs clock timing for the same query'
+SELECT 'explain' AS method, median_ms, p95_ms, planning_ms
+FROM performance.time_query((SELECT query_text FROM performance.benchmark_queries
+                             WHERE query_name = 'merchant_revenue_90d'), 10, 2, 'explain')
+UNION ALL
+SELECT 'clock', median_ms, p95_ms, NULL
+FROM performance.time_query((SELECT query_text FROM performance.benchmark_queries
+                             WHERE query_name = 'merchant_revenue_90d'), 10, 2, 'clock');
+
+-- =============================================================================
+-- 8. REPORTING VIEWS
 -- =============================================================================
 
--- Generate comprehensive performance report
-CREATE OR REPLACE FUNCTION performance.generate_performance_report()
-RETURNS TABLE(
-    report_section TEXT,
-    metric_name TEXT,
-    metric_value TEXT,
-    status TEXT,
-    details TEXT
-) AS $$
-BEGIN
-    -- Test suite summary
-    RETURN QUERY
-    SELECT
-        'Test Suite Summary'::TEXT as report_section,
-        'Total Tests'::TEXT as metric_name,
-        COUNT(DISTINCT test_name)::TEXT as metric_value,
-        'INFO'::TEXT as status,
-        'Performance regression tests configured' as details
-    FROM performance.query_baselines WHERE is_active = TRUE;
+-- Latest verdict per query with ratios computed at read time (the replacement for the old
+-- generated column that tried to use a subquery).
+CREATE OR REPLACE VIEW performance.latest_verdicts AS
+SELECT DISTINCT ON (r.query_name)
+       r.query_name, r.checked_at, r.verdict, r.median_ratio, r.p95_ratio, r.plan_changed,
+       b.median_ms AS base_median_ms, c.median_ms AS cur_median_ms,
+       b.p95_ms    AS base_p95_ms,    c.p95_ms    AS cur_p95_ms, c.label
+FROM performance.regression_results r
+JOIN performance.measurements b ON b.measurement_id = r.baseline_id
+JOIN performance.measurements c ON c.measurement_id = r.check_id
+ORDER BY r.query_name, r.checked_at DESC, r.result_id DESC;
 
-    -- Recent test results
-    RETURN QUERY
-    SELECT
-        'Recent Results'::TEXT,
-        'Tests Run (24h)'::TEXT,
-        COUNT(*)::TEXT,
-        'INFO'::TEXT,
-        'Performance tests executed in last 24 hours'
-    FROM performance.test_results
-    WHERE executed_at >= NOW() - INTERVAL '24 hours';
+-- Trend of medians per query across all measurements.
+CREATE OR REPLACE VIEW performance.median_trend AS
+SELECT query_name, measured_at, purpose, label, method, median_ms, p95_ms, plan_hash,
+       median_ms / nullif(lag(median_ms) OVER w, 0) AS ratio_vs_previous
+FROM performance.measurements
+WINDOW w AS (PARTITION BY query_name, method ORDER BY measured_at, measurement_id);
 
-    -- Performance regression summary
-    RETURN QUERY
-    SELECT
-        'Regression Analysis'::TEXT,
-        test_status || ' Tests' as metric_name,
-        COUNT(*)::TEXT,
-        CASE test_status
-            WHEN 'fail' THEN 'CRITICAL'
-            WHEN 'warning' THEN 'WARNING'
-            ELSE 'OK'
-        END,
-        'Tests with ' || test_status || ' status in last 24h'
-    FROM performance.test_results
-    WHERE executed_at >= NOW() - INTERVAL '24 hours'
-    GROUP BY test_status;
+-- Index usage from the cumulative statistics system (columns are relname / indexrelname).
+CREATE OR REPLACE VIEW performance.index_usage AS
+SELECT s.schemaname, s.relname AS table_name, s.indexrelname AS index_name,
+       s.idx_scan, s.idx_tup_read, s.idx_tup_fetch,
+       pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size,
+       i.indisunique OR i.indisprimary AS enforces_constraint,
+       CASE
+           WHEN i.indisunique OR i.indisprimary THEN 'keep: enforces a constraint'
+           WHEN s.idx_scan = 0 THEN 'unused since stats reset: candidate to drop (verify on replicas first)'
+           WHEN s.idx_tup_read > 100 * greatest(s.idx_tup_fetch, 1) THEN 'reads many entries per fetched row: review selectivity'
+           ELSE 'in use'
+       END AS assessment
+FROM pg_stat_user_indexes s
+JOIN pg_index i ON i.indexrelid = s.indexrelid
+WHERE s.schemaname IN ('civics', 'commerce', 'mobility', 'geo', 'documents');
 
-    -- Index effectiveness
-    RETURN QUERY
-    SELECT
-        'Index Analysis'::TEXT,
-        'Unused Indexes'::TEXT,
-        COUNT(*)::TEXT,
-        CASE WHEN COUNT(*) > 0 THEN 'WARNING' ELSE 'OK' END,
-        'Indexes with zero scans - consider for removal'
-    FROM pg_stat_user_indexes
-    WHERE schemaname IN ('civics', 'commerce', 'documents')
-    AND idx_scan = 0;
+\echo '-- 8. latest verdicts'
+SELECT query_name, verdict, median_ratio, p95_ratio, plan_changed, label
+FROM performance.latest_verdicts ORDER BY query_name;
 
-    -- Worst performing tests
-    RETURN QUERY
-    SELECT
-        'Performance Issues'::TEXT,
-        test_name,
-        'Ratio: ' || ROUND(performance_ratio, 2)::TEXT,
-        'WARNING'::TEXT,
-        'Slowest performing test in recent runs'
-    FROM performance.test_results
-    WHERE executed_at >= NOW() - INTERVAL '7 days'
-    AND test_status IN ('warning', 'fail')
-    ORDER BY performance_ratio DESC
-    LIMIT 5;
-END;
-$$ LANGUAGE plpgsql;
+\echo '-- 8b. largest never-scanned, non-constraint indexes (cumulative stats; varies by history)'
+SELECT schemaname, table_name, index_name, index_size, assessment
+FROM performance.index_usage
+WHERE idx_scan = 0 AND NOT enforces_constraint
+ORDER BY pg_relation_size((quote_ident(schemaname) || '.' || quote_ident(index_name))::regclass) DESC, index_name
+LIMIT 5;
+
+-- =============================================================================
+-- 9. USAGE CHEAT-SHEET
+-- =============================================================================
+/*
+-- Before a release: baseline everything (re-run after intentional changes).
+SELECT * FROM performance.capture_baselines(p_label => 'v1.4.0');
+
+-- After deploying: compare. Wire this into CI and fail the job on any REGRESSION.
+SELECT * FROM performance.check_regressions(p_label => 'v1.5.0-rc1')
+WHERE verdict = 'REGRESSION';
+
+-- Inspect a plan change:
+SELECT purpose, label, unnest(plan_shape) FROM performance.measurements
+WHERE query_name = 'orders_last_7d' ORDER BY measurement_id DESC LIMIT 20;
+
+-- Complementary production view: pg_stat_statements (preloaded in this image) aggregates
+-- mean_exec_time / stddev_exec_time per normalised query across ALL sessions:
+--   SELECT query, calls, mean_exec_time, stddev_exec_time FROM pg_stat_statements
+--   ORDER BY total_exec_time DESC LIMIT 10;
+-- (requires CREATE EXTENSION pg_stat_statements in the database you query from)
+*/
