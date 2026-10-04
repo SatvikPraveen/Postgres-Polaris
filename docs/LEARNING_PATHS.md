@@ -1,456 +1,130 @@
-# Learning Paths - PostgreSQL Polaris
+# Learning Paths
 
-**Location**: `/docs/LEARNING_PATHS.md`
+The curriculum has 16 module directories, `sql/01_schema_design` to `sql/16_capstones`. Every file from module 02 onwards needs only the base dataset and can be re-run safely, so you can follow any order. This page suggests orders by role.
 
-Different routes through the curriculum based on your background and goals.
+Run any file with `make module F=<path>`, or open it in `make psql` and work through it statement by statement. Each file starts with a comment block describing what it teaches. Setup is covered in [HOWTO_SETUP.md](HOWTO_SETUP.md).
 
-## 🎯 Choose Your Adventure
+Times are rough estimates for reading the file, running it and changing a few queries. They are not measured.
 
-### Quick Path Assessment
+## Module map
 
-**Answer these questions to find your optimal path:**
+| Module | Files | Topic |
+|---|---|---|
+| `01_schema_design` | `civics`, `commerce`, `mobility`, `geo`, `documents` | The five domain schemas of Polaris City (read only; `make build` runs them) |
+| `02_constraints_indexes` | `constraints`, `indexing_basics`, `specialist_indexes` | Constraints; B-tree, GIN, GiST, BRIN, partial, covering and Bloom indexes; HypoPG |
+| `03_dml_queries` | `practice_selects`, `window_cts_recursion`, `seed_data` | Joins, aggregates, grouping sets, window functions, CTEs, recursion; the data generator |
+| `04_views_matviews` | `views`, `materialized_views` | View layers, materialized views, `REFRESH ... CONCURRENTLY` |
+| `05_functions_triggers` | `plpgsql_basics`, `triggers_auditing`, `event_triggers` | Functions, volatility, error handling, row and statement triggers, JSONB audit trail, DDL guards |
+| `06_jsonb_fulltext` | `jsonb_modeling_validation`, `fulltext_search_ranking` | JSONB modelling and validation, `JSON_TABLE`, full-text search, ranking, trigram matching |
+| `07_geospatial` | `postgis_basics`, `spatial_indexes_queries`, `routing_nearest` | SRIDs, geometry vs geography, GiST, KNN, routing in SQL |
+| `08_partitioning_timeseries` | `declarative_partitioning`, `time_bucketing_retention` | Range/list/hash partitioning, pruning, pg_partman, time buckets, retention |
+| `09_data_movement` | `copy_bulk_operations`, `postgres_fdw_federation` | `COPY`, `ON_ERROR`, `MERGE` upserts, file_fdw, postgres_fdw push-down |
+| `10_tx_mvcc_locks` | `transactions_isolation`, `mvcc_visibility_demos`, `lock_scenarios` | Isolation levels and anomalies, tuple visibility, VACUUM, lock conflicts, deadlocks |
+| `11_perf_tuning` | `explain_analyze_playbook`, `index_advisor_patterns`, `stats_and_autovacuum` | Reading plans, pg_stat_statements, index advice, extended statistics, autovacuum |
+| `12_security_rls` | `rls_policies`, `column_privacy_masks` | Row-level security for tenants, column grants, masking views, pgcrypto |
+| `13_backup_replication` | `backup_restore_playbook`, `point_in_time_recovery`, `logical_replication_demo` | pg_dump/pg_restore, WAL and PITR, publications, slots, logical decoding |
+| `14_async_patterns` | `listen_notify_pubsub`, `advisory_locks_coordination`, `pg_cron_scheduled_jobs` | LISTEN/NOTIFY, advisory locks, `SKIP LOCKED` queues, pg_cron |
+| `15_testing_quality` | `data_quality_checks`, `pgtap_unit_tests`, `performance_regression_tests` | Rule-driven data quality, pgTAP, query performance regression tests |
+| `16_capstones` | `citywide_analytics_dashboard`, `geo_accessibility_study`, `anomaly_detection_patterns`, `real_time_monitoring_views` | End-to-end projects |
 
-1. **PostgreSQL Experience?**
+## Shared foundation (all roles)
 
-   - Never used: → **Beginner Path**
-   - Basic SELECT/INSERT: → **Intermediate Path**
-   - Used indexes, joins: → **Advanced Path**
-   - Production experience: → **Expert Path**
+**Time:** 2-3 hours. **Prerequisites:** basic SQL (`SELECT`, `JOIN`, `GROUP BY`).
 
-2. **Primary Goal?**
+1. `examples/quick_demo.sql`: a tour of the dataset.
+2. Skim `sql/01_schema_design/*.sql` to learn the five schemas and how they relate.
+3. `sql/03_dml_queries/practice_selects.sql`
+4. `sql/03_dml_queries/window_cts_recursion.sql`
 
-   - Learn database basics: → **Foundation Focus**
-   - Build web applications: → **Developer Path**
-   - Data analysis/BI: → **Analytics Path**
-   - Database administration: → **DBA Path**
+**You can now** navigate the `civics`, `commerce`, `mobility`, `geo` and `documents` schemas, write window functions and recursive CTEs against them, and anchor time windows on `meta.as_of()` rather than `now()`.
 
-3. **Time Available?**
-   - 4-6 hours: → **Weekend Intensive**
-   - 2-3 hours/week: → **Evening Course**
-   - 1 hour/day: → **Daily Practice**
-   - Self-paced: → **Comprehensive Journey**
+## Application developer
 
-## 🚀 Path Definitions
+**Time:** 12-16 hours. **Prerequisites:** the shared foundation; experience writing an application against a SQL database.
 
-### 🟢 Beginner Path (4-6 hours)
+| Order | File | Focus |
+|---|---|---|
+| 1 | `sql/02_constraints_indexes/constraints.sql`, `indexing_basics.sql` | Let the database enforce rules; pick an index type |
+| 2 | `sql/05_functions_triggers/plpgsql_basics.sql`, `triggers_auditing.sql` | Business logic and auditing in the database |
+| 3 | `sql/06_jsonb_fulltext/jsonb_modeling_validation.sql`, `fulltext_search_ranking.sql` | Flexible documents and search without another service |
+| 4 | `sql/09_data_movement/copy_bulk_operations.sql` | Bulk loads and `MERGE` upserts |
+| 5 | `sql/10_tx_mvcc_locks/transactions_isolation.sql`, `lock_scenarios.sql` | Lost updates, write skew, retries, deadlocks |
+| 6 | `sql/12_security_rls/rls_policies.sql` | Tenant isolation with `SET ROLE` and session settings |
+| 7 | `sql/14_async_patterns/listen_notify_pubsub.sql`, `advisory_locks_coordination.sql` | Events and job queues inside PostgreSQL |
+| 8 | `sql/15_testing_quality/pgtap_unit_tests.sql` | Unit tests for schema and functions |
 
-**Perfect for**: First-time database users, developers new to SQL
+**You can now** choose an isolation level and handle serialization failures, build a `SKIP LOCKED` job queue, enforce tenant boundaries with RLS, and cover your schema with pgTAP tests that run in CI.
 
-**Learning Sequence**:
+## Data analyst
 
-1. **Setup & Basics** (30 min)
+**Time:** 10-14 hours. **Prerequisites:** the shared foundation.
 
-   - `make bootstrap && make up`
-   - Explore Adminer interface
-   - `examples/quick_demo.sql`
+| Order | File | Focus |
+|---|---|---|
+| 1 | `sql/04_views_matviews/views.sql`, `materialized_views.sql` | A reusable reporting layer |
+| 2 | `sql/06_jsonb_fulltext/jsonb_modeling_validation.sql` | Querying semi-structured fields with SQL/JSON and `JSON_TABLE` |
+| 3 | `sql/07_geospatial/postgis_basics.sql`, `spatial_indexes_queries.sql` | Distances, containment and neighbourhood joins |
+| 4 | `sql/08_partitioning_timeseries/time_bucketing_retention.sql` | Time buckets, gap filling, roll-ups |
+| 5 | `sql/15_testing_quality/data_quality_checks.sql` | Checking the data before reporting on it |
+| 6 | `examples/analytics_showcase.sql` | Worked analytical queries |
+| 7 | `sql/16_capstones/citywide_analytics_dashboard.sql` | Capstone: KPIs, period-over-period, cohorts, `ROLLUP` |
 
-2. **Data Modeling** (90 min)
+**You can now** build a KPI layer with materialized views that refresh without blocking readers, compute period-over-period and cohort metrics, answer spatial questions with PostGIS, and back a number with a data-quality check.
 
-   - `sql/01_schema_design/civics.sql`
-   - `sql/01_schema_design/commerce.sql`
-   - Practice: Design a simple blog schema
+## DBA / SRE
 
-3. **Query Fundamentals** (90 min)
+**Time:** 16-20 hours. **Prerequisites:** the shared foundation; comfort with a shell and Docker.
 
-   - `sql/03_dml_queries/seed_data.sql`
-   - `sql/03_dml_queries/practice_selects.sql`
-   - Practice: Customer analysis queries
+| Order | File | Focus |
+|---|---|---|
+| 1 | `sql/02_constraints_indexes/indexing_basics.sql`, `specialist_indexes.sql` | Index types and their costs |
+| 2 | `sql/10_tx_mvcc_locks/mvcc_visibility_demos.sql`, `lock_scenarios.sql` | Dead tuples, VACUUM, freezing, lock monitoring |
+| 3 | `sql/11_perf_tuning/explain_analyze_playbook.sql` | Reading `EXPLAIN (ANALYZE, BUFFERS)`, pg_stat_statements |
+| 4 | `sql/11_perf_tuning/index_advisor_patterns.sql`, `stats_and_autovacuum.sql` | Unused and missing indexes, HypoPG, statistics, autovacuum settings |
+| 5 | `sql/08_partitioning_timeseries/declarative_partitioning.sql` | Partition maintenance with pg_partman |
+| 6 | `sql/12_security_rls/column_privacy_masks.sql` | Least privilege and PII handling |
+| 7 | `sql/13_backup_replication/*.sql`, then `make backup` | Logical backups, PITR concepts, logical replication |
+| 8 | `sql/14_async_patterns/pg_cron_scheduled_jobs.sql` | Scheduled maintenance |
+| 9 | `sql/15_testing_quality/performance_regression_tests.sql`, `make bench` | Detecting slowdowns with measurements |
+| 10 | `sql/16_capstones/real_time_monitoring_views.sql` | Capstone: a health view over the statistics views |
 
-4. **Performance Basics** (60 min)
+[EXPLAIN_PLAN_LIBRARY.md](EXPLAIN_PLAN_LIBRARY.md) is a useful companion for steps 3 and 4.
 
-   - `sql/02_constraints_indexes/indexing_basics.sql`
-   - Learn to read EXPLAIN plans
-   - Practice: Speed up slow queries
+**You can now** diagnose a slow query from its plan and pg_stat_statements, decide whether an index is worth building before building it, tune autovacuum per table, take and verify a backup, set up a logical replication slot and monitor its lag, and build a dashboard of blocking sessions, bloat and wraparound risk.
 
-5. **Views & Abstraction** (45 min)
-   - `sql/04_views_matviews/views.sql`
-   - Create reporting views
-   - Practice: Customer dashboard view
+## Data / ML researcher
 
-**Milestones**:
+**Time:** 12-18 hours. **Prerequisites:** the shared foundation; basic statistics (regression, precision and recall).
 
-- ✅ Can design normalized tables
-- ✅ Write JOIN queries confidently
-- ✅ Understand when to add indexes
-- ✅ Create views for common reports
+The dataset is synthetic with known structure, so analyses can be checked against the truth:
 
-**Next Steps**: → Intermediate Path or specialize in Developer/Analytics paths
-
----
-
-### 🟡 Intermediate Path (8-12 hours)
-
-**Perfect for**: Developers with basic SQL knowledge, data analysts
-
-**Prerequisites**: Comfortable with basic SQL, understands primary/foreign keys
-
-**Learning Sequence**:
-
-1. **Foundation Review** (60 min)
-
-   - Quick review: Beginner Path key concepts
-   - `examples/analytics_showcase.sql`
-   - Self-assessment quiz
-
-2. **Advanced Queries** (2 hours)
-
-   - `sql/03_dml_queries/window_cte_recursion.sql`
-   - Window functions mastery
-   - Complex aggregations (ROLLUP, CUBE)
-   - Recursive CTEs for hierarchical data
-
-3. **Business Logic** (90 min)
-
-   - `sql/05_functions_triggers/plpgsql_basics.sql`
-   - `sql/05_functions_triggers/triggers_auditing.sql`
-   - Practice: Order processing system
-
-4. **Modern Data Patterns** (2 hours)
-
-   - `sql/06_jsonb_fulltext/jsonb_modeling_validation.sql`
-   - `sql/06_jsonb_fulltext/fulltext_search_ranking.sql`
-   - Practice: Document management system
-
-5. **Concurrency & Transactions** (90 min)
-
-   - `sql/10_tx_mvcc_locks/transactions_isolation.sql`
-   - `sql/10_tx_mvcc_locks/lock_scenarios.sql`
-   - Practice: Handle concurrent order processing
-
-6. **Performance Tuning** (2 hours)
-   - `sql/11_perf_tuning/explain_analyze_playbook.sql`
-   - `sql/11_perf_tuning/stats_and_autovacuum.sql`
-   - Practice: Optimize slow dashboard queries
-
-**Milestones**:
-
-- ✅ Master window functions and CTEs
-- ✅ Build stored procedures and triggers
-- ✅ Work with JSONB data effectively
-- ✅ Understand transaction isolation
-- ✅ Optimize queries using EXPLAIN
-
-**Next Steps**: → Advanced Path or choose specialization
-
----
-
-### 🔴 Advanced Path (15+ hours)
-
-**Perfect for**: Experienced developers, aspiring DBAs, architects
-
-**Prerequisites**: Solid SQL skills, some PostgreSQL experience
-
-**Learning Sequence**:
-
-1. **Geospatial Analysis** (2.5 hours)
-
-   - `sql/07_geospatial/postgis_basics.sql`
-   - `sql/07_geospatial/spatial_indexes_queries.sql`
-   - `sql/07_geospatial/routing_nearest.sql`
-   - Practice: Location-based analytics
-
-2. **Scale Strategies** (2 hours)
-
-   - `sql/08_partitioning_timeseries/declarative_partitioning.sql`
-   - `sql/08_partitioning_timeseries/time_bucketing_retention.sql`
-   - Practice: Time-series sensor data system
-
-3. **Data Integration** (1.5 hours)
-
-   - `sql/09_data_movement/copy_bulk_operations.sql`
-   - `sql/09_data_movement/postgres_fdw_federation.sql`
-   - Practice: Multi-database reporting
-
-4. **Security & Multi-tenancy** (1.5 hours)
-
-   - `sql/12_security_rls/rls_policies.sql`
-   - `sql/12_security_rls/column_privacy_masks.sql`
-   - Practice: SaaS data isolation
-
-5. **High Availability** (1.5 hours)
-
-   - `sql/13_backup_replication/logical_replication_demo.sql`
-   - `sql/13_backup_replication/backup_restore_playbook.sql`
-   - Practice: Disaster recovery planning
-
-6. **Event-Driven Architecture** (1.5 hours)
-
-   - `sql/14_async_patterns/listen_notify_pubsub.sql`
-   - `sql/14_async_patterns/pg_cron_scheduled_jobs.sql`
-   - Practice: Real-time notification system
-
-7. **Capstone Project** (4+ hours)
-   - Choose from `sql/99_capstones/`
-   - Build complete system
-   - Performance benchmarking
-   - Documentation and presentation
-
-**Milestones**:
-
-- ✅ Implement geospatial analysis
-- ✅ Design partitioning strategies
-- ✅ Secure multi-tenant applications
-- ✅ Plan backup and replication
-- ✅ Build event-driven systems
-- ✅ Complete real-world project
-
-**Next Steps**: → Expert Path or industry specialization
-
----
-
-### ⚫ Expert Path (20+ hours)
-
-**Perfect for**: Database professionals, performance specialists
-
-**Prerequisites**: All Advanced Path concepts, production PostgreSQL experience
-
-**Focus Areas**:
-
-1. **Deep Performance Engineering** (6 hours)
-
-   - Advanced query optimization techniques
-   - Custom index strategies
-   - Memory and I/O tuning
-   - Benchmarking methodologies
-   - Custom extensions and operators
-
-2. **Advanced Administration** (4 hours)
-
-   - Connection pooling and scaling
-   - Monitoring and alerting systems
-   - Capacity planning
-   - Advanced backup strategies
-   - Point-in-time recovery scenarios
-
-3. **Specialized Features** (4 hours)
-
-   - Custom data types and operators
-   - Advanced PostGIS applications
-   - Foreign data wrapper development
-   - Logical replication customization
-   - Advanced security patterns
-
-4. **Teaching & Mentoring** (6+ hours)
-   - Create new learning modules
-   - Develop assessment criteria
-   - Build real-world case studies
-   - Contribute to open source
-   - Lead workshops or training
-
-**Deliverables**:
-
-- Comprehensive capstone project
-- Performance optimization case study
-- Teaching module contribution
-- Conference talk or blog post series
-
----
-
-## 🎓 Specialization Tracks
-
-### 👨‍💻 Developer Path
-
-**Focus**: Building web applications with PostgreSQL
-
-**Key Modules**:
-
-- Schema design for applications
-- JSONB for API responses
-- Connection pooling and ORMs
-- Migration strategies
-- Testing patterns
-
-**Technologies**: Node.js, Python, Ruby integrations
-**Time**: 8-10 hours
-**Project**: Build a full-stack application
-
-### 📊 Analytics Path
-
-**Focus**: Data analysis and business intelligence
-
-**Key Modules**:
-
-- Window functions and advanced aggregation
-- Time-series analysis
-- Geospatial analytics
-- Data warehousing patterns
-- ETL processes
-
-**Technologies**: R, Python, BI tools integration
-**Time**: 10-12 hours
-**Project**: Build comprehensive analytics dashboard
-
-### 🛡️ DBA Path
-
-**Focus**: Database administration and operations
-
-**Key Modules**:
-
-- Performance tuning and monitoring
-- Backup and recovery procedures
-- Replication and high availability
-- Security and compliance
-- Automation and monitoring
-
-**Technologies**: Ansible, Monitoring tools, Cloud platforms
-**Time**: 12-15 hours
-**Project**: Design complete production deployment
-
-### 🌍 GIS Path
-
-**Focus**: Geographic information systems
-
-**Key Modules**:
-
-- Advanced PostGIS features
-- Spatial analysis and modeling
-- Performance optimization for spatial queries
-- Integration with mapping tools
-- Routing and network analysis
-
-**Technologies**: QGIS, Leaflet, MapBox
-**Time**: 8-10 hours
-**Project**: Build location-based service
-
-## ⏰ Time-Based Learning Plans
-
-### 🏃 Weekend Intensive (6 hours)
-
-**Saturday Morning**: Beginner Path (3 hours)
-**Saturday Afternoon**: Choose specialization focus (3 hours)
-**Outcome**: Functional PostgreSQL knowledge
-
-### 🌙 Evening Course (3 hours/week × 4 weeks)
-
-**Week 1**: Foundation (Modules 00-02)
-**Week 2**: Queries and Logic (Modules 03-05)
-**Week 3**: Modern Features (Modules 06-08)
-**Week 4**: Advanced Topics (Modules 09-12)
-**Outcome**: Intermediate to Advanced level
-
-### ☕ Daily Practice (1 hour/day × 2 weeks)
-
-**Days 1-3**: Schema Design & Basics
-**Days 4-6**: Queries & Performance
-**Days 7-9**: Advanced SQL & JSONB
-**Days 10-12**: Geospatial & Scaling
-**Days 13-14**: Capstone Project
-**Outcome**: Comprehensive knowledge
-
-### 🚶 Self-Paced Journey
-
-**Flexible timeline based on interest and availability**
-
-- Complete assessments to track progress
-- Skip familiar concepts, deep-dive on interests
-- Build multiple projects in different domains
-- Contribute back to the community
-
-## 🏆 Assessment & Certification
-
-### Skill Checkpoints
-
-**Beginner Certification**:
-
-- [ ] Design normalized database schema
-- [ ] Write queries with JOINs and aggregation
-- [ ] Create appropriate indexes
-- [ ] Build views for reporting
-- [ ] Pass practical coding assessment
-
-**Intermediate Certification**:
-
-- [ ] Master window functions and CTEs
-- [ ] Build functions and triggers
-- [ ] Work effectively with JSONB
-- [ ] Handle concurrent transactions
-- [ ] Optimize queries using EXPLAIN plans
-
-**Advanced Certification**:
-
-- [ ] Implement geospatial analysis
-- [ ] Design partitioning strategies
-- [ ] Build secure multi-tenant systems
-- [ ] Plan backup and replication
-- [ ] Complete comprehensive capstone project
-
-### Practical Assessments
-
-- **Code Reviews**: SQL code quality evaluation
-- **Performance Challenges**: Optimize provided slow queries
-- **Design Exercises**: Schema design for given requirements
-- **Debugging Scenarios**: Fix broken database systems
-- **Architecture Reviews**: Design scalable database systems
-
-## 🎯 Success Metrics
-
-### Knowledge Retention
-
-- Can explain concepts to others
-- Successfully applies techniques to new problems
-- Recognizes patterns and anti-patterns
-- Makes appropriate technology choices
-
-### Practical Skills
-
-- Writes efficient, maintainable SQL
-- Designs well-normalized schemas
-- Optimizes query performance systematically
-- Implements appropriate security measures
-
-### Career Readiness
-
-- Confident in technical interviews
-- Can contribute to database projects immediately
-- Understands trade-offs and best practices
-- Ready for database-focused roles
-
----
-
-## 🚀 Getting Started
-
-1. **Take the assessment quiz** (5 minutes)
-2. **Choose your path** based on results
-3. **Set up your environment**: `make bootstrap && make up`
-4. **Start your first module**
-5. **Track progress** using built-in checkpoints
-6. **Join the community** for support and discussion
-
-### Quick Assessment Quiz
-
-**Rate your experience (1-5 scale):**
-
-- SQL Basics (SELECT, WHERE, JOIN): \_\_\_/5
-- Database Design (normalization, keys): \_\_\_/5
-- PostgreSQL Specifics (extensions, JSONB): \_\_\_/5
-- Performance Tuning (indexes, EXPLAIN): \_\_\_/5
-- Advanced Features (triggers, partitioning): \_\_\_/5
-
-**Total Score Mapping:**
-
-- 5-10: Beginner Path
-- 11-15: Intermediate Path
-- 16-20: Advanced Path
-- 21-25: Expert Path
-
-### Path Selection Helper
-
-**I want to...**
-
-- "Learn databases from scratch" → **Beginner Path**
-- "Build better web applications" → **Developer Path**
-- "Analyze data more effectively" → **Analytics Path**
-- "Become a database expert" → **Advanced → Expert Path**
-- "Add GIS to my toolkit" → **GIS Specialization**
-- "Manage production databases" → **DBA Path**
-
-**I have...**
-
-- "A few hours this weekend" → **Weekend Intensive**
-- "Evenings free for a month" → **Evening Course**
-- "30 minutes daily" → **Daily Practice**
-- "Flexible schedule" → **Self-Paced Journey**
-
----
-
-**Ready to begin?** Choose your path and start with Module 00!
+- `meta.planted_effects` lists each planted effect with its true parameter, for example `complaint_resolution_income_gradient` (-0.25), `peak_hour_bus_delay_ratio` (3.0), `turnout_age_slope` (0.035) and `merchant_popularity_zipf_exponent` (1.10).
+- `meta.ground_truth` labels every injected anomaly by `entity`, `entity_id` and `label`: sensor `spike`, `dropout` and `level_shift`, and `order_amount_outlier`.
+- `meta.dataset` records scale, seed and generator version; `meta.fingerprint()` hashes every table. The same `(scale, seed)` always produces the same data (`make reproduce` checks this).
+
+```sql
+SELECT effect, parameter, true_value FROM meta.planted_effects ORDER BY domain;
+SELECT entity, label, count(*) FROM meta.ground_truth GROUP BY 1, 2;
+```
+
+| Order | File | What you verify |
+|---|---|---|
+| 1 | `sql/03_dml_queries/seed_data.sql` (read the header and section 0) | How the counter-based generator and the effects are defined |
+| 2 | `sql/03_dml_queries/practice_selects.sql`, `examples/analytics_showcase.sql` | Recover the peak delay ratio and the Zipf exponent |
+| 3 | `sql/08_partitioning_timeseries/time_bucketing_retention.sql` | A simple bucket-level detector scored against `meta.ground_truth` |
+| 4 | `sql/15_testing_quality/data_quality_checks.sql` | Data-quality rules scored for precision, recall and F1 |
+| 5 | `sql/16_capstones/citywide_analytics_dashboard.sql` | Fixed-effects OLS estimate of the income gradient, with standard error and 95% CI, against the true -0.25 |
+| 6 | `sql/16_capstones/anomaly_detection_patterns.sql` | Z-score, robust MAD, seasonal and CUSUM detectors, compared per label |
+| 7 | `sql/16_capstones/geo_accessibility_study.sql` | An equity study whose correct answer is a null result: no access-income effect was planted |
+
+Open exercises with no reference solution in the repo:
+
+- Estimate `turnout_age_slope` and `turnout_income_slope` from `civics` and compare them with the planted logit coefficients.
+- Recover `peak_hour_road_speed_factor` (0.70) and `order_growth_exponent` (0.85).
+- Rebuild a scratch database at another seed (`scripts/build_db.sh -s 1 -r 7 -d seed7`) and check whether your estimator is stable across seeds or whether you tuned it to seed 42.
+
+**You can now** estimate an effect in SQL and report it with an interval, score an anomaly detector honestly against labels, recognise when a null result is the right answer, and make a result reproducible by citing `(scale, seed, generator_version)`.
+
+## Combining paths
+
+The paths overlap. A full-stack route is the shared foundation, the application developer path, then the DBA/SRE steps you have not done. Everyone should finish with at least one file from `sql/16_capstones`. `make build-all` runs all modules in order if you want every object in place to explore.

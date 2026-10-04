@@ -10,8 +10,15 @@ CONTAINER := polaris-db
 PG_USER   := polaris
 PG_DB     := polaris
 
-SCALE ?= 1
-SEED  ?= 42
+# Settings come from docker/.env and .env (KEY=VALUE lines are valid make
+# syntax); command-line values such as `make build SCALE=5` override them.
+-include docker/.env
+-include .env
+
+POSTGRES_PORT ?= 5432
+PG_MAJOR      ?= 17
+SCALE ?= $(or $(POLARIS_SCALE),1)
+SEED  ?= $(or $(POLARIS_SEED),42)
 
 .PHONY: help bootstrap up ui down restart status logs psql shell \
         build build-all module reset check reproduce test test-modules \
@@ -31,7 +38,7 @@ bootstrap: ## Create .env files and build the database image
 
 up: ## Start PostgreSQL (first start builds the dataset, ~30 s)
 	@$(COMPOSE) up -d --wait db
-	@echo "PostgreSQL ready on localhost:$${POSTGRES_PORT:-5432} (db=$(PG_DB) user=$(PG_USER)). Try: make psql"
+	@echo "PostgreSQL $(PG_MAJOR) ready on localhost:$(POSTGRES_PORT) (db=$(PG_DB) user=$(PG_USER)). Try: make psql"
 
 ui: ## Start Adminer (:8080) and pgAdmin (:8081) as well
 	@$(COMPOSE) --profile ui up -d --wait
@@ -100,5 +107,5 @@ clean: ## Stop containers and delete the data volume
 	@$(COMPOSE) --profile ui down -v
 
 nuke: clean ## Also remove built images and check logs
-	@docker image rm -f polaris-db:$${PG_MAJOR:-17} 2>/dev/null || true
+	@docker image rm -f polaris-db:$(PG_MAJOR) 2>/dev/null || true
 	@rm -rf .check_logs

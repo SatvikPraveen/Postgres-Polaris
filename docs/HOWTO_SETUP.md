@@ -1,366 +1,139 @@
-# Setup Guide - PostgreSQL Polaris
+# Setup
 
-**Location**: `/docs/HOWTO_SETUP.md`
+Polaris runs as a single PostgreSQL container with the curriculum and a synthetic city dataset built in. Everything is driven by `make`; run `make help` for the full target list.
 
-Complete setup instructions for getting PostgreSQL Polaris running locally.
+## Prerequisites
 
-## 🚀 Quick Setup (5 minutes)
+| Requirement | Notes |
+|---|---|
+| Docker 24+ with Compose v2 | `docker compose version` must work (the plugin, not legacy `docker-compose`). |
+| 4 GB RAM for Docker | Docker Desktop: Settings > Resources. |
+| About 3 GB free disk | Image is about 1 GB; the data volume at scale 1 is about 1.5 GB. |
+| GNU Make and bash | macOS's bash 3.2 is supported. |
+| OS | Linux, macOS (Intel or Apple Silicon), Windows with WSL2. On Windows, clone and run inside the WSL2 filesystem. |
 
-### Prerequisites
+No local PostgreSQL install is needed: `psql`, `pg_prove` and `pg_dump` run inside the container.
 
-- Docker & Docker Compose
-- Git
-- Make (optional but recommended)
-
-### One-Command Setup
-
-```bash
-git clone <your-repo> && cd postgres-polaris
-make bootstrap && make up
-```
-
-That's it! Your environment is ready:
-
-- **Database**: `localhost:5432`
-- **Adminer UI**: http://localhost:8080
-- **Connect**: `make psql`
-
-## 📋 Detailed Setup Instructions
-
-### Step 1: Clone Repository
+## Quick start
 
 ```bash
-git clone <your-repository-url>
-cd postgres-polaris
+git clone https://github.com/SatvikPraveen/Postgres-Polaris.git
+cd Postgres-Polaris
+make bootstrap   # copies docker/.env and .env from the examples, builds the image
+make up          # starts PostgreSQL and waits until it is healthy
+make psql        # opens psql in database polaris
 ```
 
-### Step 2: Environment Configuration
-
-```bash
-# Copy environment templates
-cp .env.example .env
-cp docker/.env.example docker/.env
-
-# Optional: Customize settings
-nano .env  # or your preferred editor
-```
-
-### Step 3: Docker Setup
-
-```bash
-# Pull required images
-docker-compose -f docker/docker-compose.yml pull
-
-# Start services
-docker-compose -f docker/docker-compose.yml up -d
-
-# Wait for initialization (first startup takes ~30 seconds)
-docker logs polaris-db -f  # Watch startup logs
-```
-
-### Step 4: Verify Installation
-
-```bash
-# Check container status
-docker ps
-
-# Test database connection
-docker exec -it polaris-db psql -U polaris -d polaris -c "SELECT version();"
-
-# Access web interface
-open http://localhost:8080  # macOS
-xdg-open http://localhost:8080  # Linux
-```
-
-## 🔧 Connection Details
-
-### Database Connection
-
-```
-Host: localhost
-Port: 5432
-Database: polaris
-Username: polaris
-Password: polar_star_2024
-```
-
-### Adminer Web Interface
-
-- **URL**: http://localhost:8080
-- **System**: PostgreSQL
-- **Server**: polaris-db
-- **Username**: polaris
-- **Password**: polar_star_2024
-- **Database**: polaris
-
-### Direct psql Connection
-
-```bash
-# Via Docker
-docker exec -it polaris-db psql -U polaris -d polaris
-
-# Via local psql (if installed)
-psql -h localhost -p 5432 -U polaris -d polaris
-```
-
-## 📊 Loading Sample Data
-
-### Automatic Data Loading
-
-```bash
-# Load all sample datasets
-make load-data
-
-# Or manually
-./scripts/load_sample_data.sh
-```
-
-### Manual Data Loading
-
-```bash
-# Connect to database
-make psql
-
-# Load specific datasets
-\i sql/03_dml_queries/seed_data.sql
-
-# Verify data loaded
-SELECT COUNT(*) FROM citizens;
-SELECT COUNT(*) FROM merchants;
-SELECT COUNT(*) FROM orders;
-```
-
-## 🏃 First Steps
-
-### 1. Run Quick Demo
-
-```bash
-make run-examples
-# Or via Adminer: Copy/paste from examples/quick_demo.sql
-```
-
-### 2. Explore Schema
+Try a first query:
 
 ```sql
--- List all tables
-\dt
-
--- Describe table structure
-\d citizens
-\d orders
-\d spatial_features
+SELECT generator_version, scale, seed, as_of FROM meta.dataset;
+SELECT count(*) FROM commerce.orders WHERE order_date > meta.as_of() - interval '30 days';
 ```
 
-### 3. Try Sample Queries
+The dataset ends at `meta.as_of()` (2025-12-31 23:59:59 UTC). Every recency query in the curriculum uses `meta.as_of()` instead of `now()`, and yours should too.
 
-```sql
--- Simple query
-SELECT name, city FROM citizens LIMIT 5;
+## What the first boot does
 
--- Join query
-SELECT c.name, COUNT(o.*) as order_count
-FROM citizens c
-LEFT JOIN orders o ON c.citizen_id = o.customer_id
-GROUP BY c.citizen_id, c.name
-ORDER BY order_count DESC;
-```
+The scripts in `docker/initdb/` run only when the data volume is empty:
 
-## 🗂️ Project Structure Tour
+1. `000_databases.sql` creates the scratch database `polaris_test` and sets the `search_path` to the domain schemas.
+2. `010_extensions.sql` installs the extensions (PostGIS, pg_cron, pg_partman, pgTAP, HypoPG, pgvector, pg_stat_statements and others).
+3. `020_roles.sql` creates the group roles and the login roles `polaris_app_user` and `polaris_readonly_user`.
+4. `100_bootstrap_curriculum.sh` runs `sql/build.sql`: schemas, tables, constraints and the synthetic data for `POLARIS_SCALE` and `POLARIS_SEED`.
 
-### Key Directories
+This takes about 30 seconds at scale 1. `make up` returns only when the build has finished. Later starts reuse the volume and are fast.
 
-```
-postgres-polaris/
-├── sql/              # 15 learning modules (start here)
-├── data/             # Sample urban dataset
-├── docs/             # Guides and documentation
-├── docker/           # Container configuration
-├── scripts/          # Helper tools
-├── tests/            # Validation tests
-└── examples/         # Ready-to-run demos
-```
+## Configuration
 
-### Learning Path
+`docker/.env` (created from `docker/.env.example`) controls the container. `.env` at the repo root holds client settings (`PGHOST`, `PGPORT`, ...) for tools on the host.
 
-1. **Start**: `sql/01_schema_design/` - Data modeling basics
-2. **Practice**: `sql/03_dml_queries/` - Query fundamentals
-3. **Optimize**: `sql/02_constraints_indexes/` - Performance basics
-4. **Advanced**: `sql/06_jsonb_fulltext/` - Modern PostgreSQL
+| Variable | Default | Effect |
+|---|---|---|
+| `PG_MAJOR` | `17` | PostgreSQL major version, `17` or `18`. Builds image `polaris-db:<PG_MAJOR>`. |
+| `POSTGRES_PORT` | `5432` | Host port for PostgreSQL. |
+| `ADMINER_PORT` / `PGADMIN_PORT` | `8080` / `8081` | Host ports for the optional web UIs. |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | `polaris` / `polaris` / `polaris_dev_only` | Database and superuser. Local use only. |
+| `POLARIS_SCALE` | `1` | Dataset size multiplier for the first-boot build. |
+| `POLARIS_SEED` | `42` | Generator seed for the first-boot build. |
+| `POLARIS_SKIP_BOOTSTRAP` | `0` | `1` leaves the database empty (extensions and roles only). |
 
-## 🛠️ Available Commands
+`PG_MAJOR`, `POLARIS_*` and the credentials take effect only on a fresh volume. After changing them run `make clean && make up`. If you change `POSTGRES_PORT`, change `PGPORT` in `.env` to match.
 
-### Core Operations
+## Connecting from host tools
+
+| Setting | Value |
+|---|---|
+| Host / port | `localhost` / `5432` (or `POSTGRES_PORT`) |
+| Database | `polaris` |
+| User / password | `polaris` / `polaris_dev_only` |
+| URI | `postgresql://polaris:polaris_dev_only@localhost:5432/polaris` |
+
+This works for a local `psql`, DBeaver, DataGrip or a desktop pgAdmin. For browser UIs in containers:
 
 ```bash
-make up              # Start environment
-make down            # Stop environment
-make restart         # Restart all services
-make psql            # Connect to database
-make logs            # View container logs
-make status          # Check container status
+make ui   # Adminer on http://localhost:8080, pgAdmin on http://localhost:8081
 ```
 
-### Data Management
+- Adminer: system PostgreSQL, server `db`, user `polaris`, password `polaris_dev_only`, database `polaris`.
+- pgAdmin runs in desktop mode (no login) with a preconfigured server "Polaris"; enter the password when prompted.
+
+## Running modules
+
+Modules live in `sql/02_*` to `sql/16_*`. Each file is standalone (it needs only the base dataset) and idempotent (safe to re-run).
 
 ```bash
-make reset           # Reset database (destroys data!)
-make load-data       # Load sample data
-make backup          # Create backup
+make module F=sql/03_dml_queries/practice_selects.sql   # run one file
+make build-all                                          # rebuild base data, then run every module in order
 ```
 
-### Module Execution
+For options such as per-statement timing or a different target database, use the script directly:
 
 ```bash
-make run-module MODULE=01_schema_design/civics.sql
-make run-init        # Run initialization scripts
-make run-examples    # Run demo examples
+scripts/run_sql.sh -t sql/11_perf_tuning/explain_analyze_playbook.sql
+scripts/run_sql.sh examples/quick_demo.sql
 ```
 
-### Testing
+Files must live under `sql/`, `tests/`, `examples/`, `data/` or `benchmarks/`, which are mounted read-only in the container. See [MODULE_MAP_EXERCISES.md](MODULE_MAP_EXERCISES.md) for what each module covers and [LEARNING_PATHS.md](LEARNING_PATHS.md) for suggested orders.
+
+## Scaling the dataset
 
 ```bash
-make test            # Run all validation tests
-make test-schema     # Validate table structure
-make test-data       # Check data integrity
-make bench           # Performance benchmarks
+make build SCALE=5 SEED=7   # rebuild polaris in place at scale 5, seed 7
 ```
 
-## 🐛 Troubleshooting
+`make build` recreates every curriculum schema, so objects created by modules are dropped. Row counts for people, orders, trips and readings scale linearly; geography (neighbourhoods, roads, stations) does not. Scale 1 is about 420k rows.
 
-### Common Issues
-
-#### Port Already in Use
+To keep `polaris` unchanged and build a separate database:
 
 ```bash
-# Check what's using port 5432
-lsof -i :5432
-netstat -tulpn | grep 5432
-
-# Solution: Change port in docker/.env
-POSTGRES_PORT=5433
-ADMINER_PORT=8081
+scripts/build_db.sh -s 5 -r 7 -d city5
 ```
 
-#### Container Won't Start
+`make reset` regenerates only the base data in place (using `POLARIS_SCALE` and `POLARIS_SEED` from the env files) and keeps module objects. It asks for confirmation; `scripts/reset_db.sh -y` skips the prompt.
 
-```bash
-# Check Docker daemon
-docker info
+## Verification
 
-# Clean up old containers/volumes
-docker system prune -a
-docker volume prune
+| Command | What it checks |
+|---|---|
+| `make test` | 361 pgTAP tests via `pg_prove` (schema, constraints, data invariants, regressions). |
+| `make test-modules` | All 39 module files run twice, each on a fresh copy of the base dataset. Logs go to `.check_logs/`. |
+| `make reproduce` | Builds the same seed twice under different planner settings and compares `meta.fingerprint()`. |
+| `make backup` | `pg_dump`, restore into a scratch database, fingerprint comparison. Dumps go to `backups/`. |
+| `make bench` | pgbench workload suite; see [benchmarks/README.md](../benchmarks/README.md). |
+| `make check` | `lint`, `test`, `test-modules` and `reproduce`, as in CI. `lint` needs `shellcheck` on the host. |
 
-# Rebuild from scratch
-make clean && make bootstrap && make up
-```
+CI runs these against PostgreSQL 17 and 18 on every push.
 
-#### Database Connection Failed
+## Stopping, resetting, uninstalling
 
-```bash
-# Check container logs
-docker logs polaris-db
+| Command | Effect |
+|---|---|
+| `make down` | Stop containers. Data is kept. |
+| `make restart` | `down` then `up`. |
+| `make clean` | Stop containers and delete the data and pgAdmin volumes. The next `make up` rebuilds from scratch. |
+| `make nuke` | `clean`, plus remove the `polaris-db` image for the current `PG_MAJOR` and `.check_logs/`. |
 
-# Verify container is running
-docker ps | grep polaris
+To remove everything, run `make nuke`, delete the repository directory, and optionally remove the pulled `postgres`, `adminer` and `dpage/pgadmin4` base images.
 
-# Test network connectivity
-docker exec -it polaris-db ping polaris-adminer
-```
-
-#### Permission Errors
-
-```bash
-# Fix file permissions
-sudo chown -R $USER:$USER .
-chmod +x scripts/*.sh
-
-# Docker socket permissions (Linux)
-sudo usermod -a -G docker $USER
-# Log out and back in
-```
-
-### Getting Help
-
-#### Check Logs
-
-```bash
-# Database logs
-docker logs polaris-db -f
-
-# All services
-docker-compose -f docker/docker-compose.yml logs -f
-
-# Specific timeframe
-docker logs polaris-db --since=10m
-```
-
-#### Database Diagnostics
-
-```sql
--- Check database status
-SELECT version();
-SELECT current_database();
-SELECT current_user;
-
--- Check loaded extensions
-SELECT * FROM pg_extension;
-
--- Monitor connections
-SELECT * FROM pg_stat_activity;
-```
-
-## 🔄 Updating and Maintenance
-
-### Update Project
-
-```bash
-git pull origin main
-make down
-docker-compose -f docker/docker-compose.yml pull
-make up
-```
-
-### Regular Maintenance
-
-```bash
-# Weekly cleanup
-make clean
-
-# Monthly full reset (lose all data)
-make reset
-
-# Backup before major changes
-make backup
-```
-
-### Performance Tuning
-
-```bash
-# Monitor resource usage
-docker stats polaris-db
-
-# Check database performance
-make psql
-\x
-SELECT * FROM pg_stat_database WHERE datname='polaris';
-```
-
-## 🎯 Next Steps
-
-1. **Start Learning**: Visit [Learning Paths](LEARNING_PATHS.md)
-2. **Explore Modules**: Check [Module Exercises](MODULE_MAP_EXERCISES.md)
-3. **Run Examples**: Try the showcase demos in `examples/`
-4. **Build Projects**: Work on capstone projects in `sql/99_capstones/`
-
-## 💡 Pro Tips
-
-- **Use Adminer** for visual query building and data exploration
-- **Bookmark queries** in Adminer for repeated use
-- **Enable query logging** to see all executed SQL
-- **Use transactions** when experimenting with data changes
-- **Save interesting queries** in personal files for reference
-
----
-
-**Need Help?** Check [Troubleshooting Guide](TROUBLESHOOTING.md) or open an issue on GitHub.
+If something fails, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
