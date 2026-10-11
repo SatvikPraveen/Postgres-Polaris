@@ -48,7 +48,7 @@ services:
       start_period: 30s
 
   adminer:
-    image: adminer:4.8.1
+    image: adminer:6.1.1
     container_name: polaris-adminer
     profiles: ["ui"]
     restart: unless-stopped
@@ -61,7 +61,7 @@ services:
         condition: service_healthy
 
   pgadmin:
-    image: dpage/pgadmin4:8.14
+    image: dpage/pgadmin4:9.18
     container_name: polaris-pgadmin
     profiles: ["ui"]
     restart: unless-stopped
