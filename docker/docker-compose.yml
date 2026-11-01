@@ -48,7 +48,7 @@ services:
       start_period: 30s
 
   adminer:
-    image: adminer:6.1.1
+    image: adminer:6.1.2
     container_name: polaris-adminer
     profiles: ["ui"]
     restart: unless-stopped
